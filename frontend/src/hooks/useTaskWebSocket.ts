@@ -5,7 +5,7 @@ import type { WSEvent, ChatMessage } from '../types'
 export function useTaskWebSocket(todoId: string | null) {
   const ws = useRef<WebSocket | null>(null)
   const [reconnectCount, setReconnectCount] = useState(0)
-  const { updateTodoState, appendChatMessage, updateSubTaskProgress, fetchTodo } = useTodoStore()
+  const { updateTodoState, appendChatMessage, updateSubTaskProgress, appendActivity, fetchTodo } = useTodoStore()
 
   useEffect(() => {
     if (!todoId) return
@@ -28,7 +28,7 @@ export function useTaskWebSocket(todoId: string | null) {
             break
 
           case 'chat_message':
-            if (data.message) {
+            if (data.message && typeof data.message === 'object') {
               appendChatMessage(todoId, {
                 id: data.message.id || crypto.randomUUID(),
                 todo_id: todoId,
@@ -41,12 +41,16 @@ export function useTaskWebSocket(todoId: string | null) {
 
           case 'progress':
             if (data.sub_task_id && data.progress_pct !== undefined) {
-              updateSubTaskProgress(
-                todoId,
-                data.sub_task_id,
-                data.progress_pct,
-                data.message?.content || ''
-              )
+              const msg = typeof data.message === 'string'
+                ? data.message
+                : (data.message?.content || '')
+              updateSubTaskProgress(todoId, data.sub_task_id, data.progress_pct, msg)
+            }
+            break
+
+          case 'activity':
+            if (data.sub_task_id && data.activity) {
+              appendActivity(data.sub_task_id, data.activity)
             }
             break
 
@@ -71,5 +75,5 @@ export function useTaskWebSocket(todoId: string | null) {
       ws.current?.close()
       ws.current = null
     }
-  }, [todoId, reconnectCount, updateTodoState, appendChatMessage, updateSubTaskProgress, fetchTodo])
+  }, [todoId, reconnectCount, updateTodoState, appendChatMessage, updateSubTaskProgress, appendActivity, fetchTodo])
 }

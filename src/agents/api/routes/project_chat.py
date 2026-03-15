@@ -10,7 +10,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from agents.api.chat_actions import execute_action, get_actions_as_tools, is_action_tool
-from agents.api.deps import DB, CurrentUser, EventBusDep, check_project_access
+from agents.api.deps import DB, CurrentUser, EventBusDep, Redis, check_project_access
 from agents.utils.json_helpers import safe_json
 
 logger = logging.getLogger(__name__)
@@ -135,6 +135,7 @@ async def send_session_message(
     user: CurrentUser,
     db: DB,
     event_bus: EventBusDep,
+    redis: Redis,
 ):
     """Send a message in a session."""
     session = await _load_session(session_id, project_id, user, db)
@@ -177,6 +178,7 @@ async def send_session_message(
                 session=dict(session),
                 db=db,
                 event_bus=event_bus,
+                redis=redis,
             )
         else:
             assistant_msg = await _generate_project_response(
@@ -188,6 +190,7 @@ async def send_session_message(
                 project=dict(project),
                 db=db,
                 event_bus=event_bus,
+                redis=redis,
             )
 
         # Update session timestamp
@@ -392,8 +395,10 @@ async def _generate_project_response(
     project: dict,
     db,
     event_bus=None,
+    redis=None,
 ) -> dict:
     """Generate an AI response for a project-level chat message."""
+    from agents.agents.registry import get_builtin_tool_schemas
     from agents.providers.mcp_executor import McpToolExecutor
     from agents.providers.registry import ProviderRegistry
     from agents.providers.tools_registry import ToolsRegistry
@@ -416,6 +421,11 @@ async def _generate_project_response(
 
     # Scoped action tools for project chat (create_task, delete_task only)
     action_tools = get_actions_as_tools("project")
+
+    # Builtin workspace tools (read_file, list_directory, search_files) for
+    # codebase exploration — same pattern the coordinator uses for agents.
+    workspace_path = project.get("workspace_path") or ""
+    builtin_tools = get_builtin_tool_schemas(workspace_path, "planner") if workspace_path else []
 
     # Fetch recent chat history
     if session_id:
@@ -471,18 +481,36 @@ async def _generate_project_response(
         from agents.agents.registry import get_default_system_prompt
         base_prompt = get_default_system_prompt("planner")
 
+    # Build dynamic tools documentation for the system prompt
+    tools_doc = """
+You have the following actions available:
+- **action__create_task** — Create a new tracked task. Use when the user describes work they want done. \
+You can include sub_tasks to send work directly to execution, or omit them for the intake/planning pipeline. \
+IMPORTANT: Always create ONE task with ALL sub_tasks inside it. Never create multiple separate tasks for related work.
+- **action__delete_task** — Delete a task. ALWAYS ask for user confirmation before calling this."""
+
+    if builtin_tools:
+        tools_doc += """
+
+You ALSO have workspace tools to explore the codebase — USE THEM to research before planning:
+- **read_file** — Read a file's contents (path relative to repo root)
+- **list_directory** — List files and directories (path relative to repo root, empty for root)
+- **search_files** — Search for a text pattern across files (grep)
+
+IMPORTANT: Always explore the codebase with these tools before creating tasks. \
+Read relevant files, understand the existing code structure, and then plan accordingly. \
+Do NOT guess or assume what the codebase looks like — read it first."""
+    else:
+        tools_doc += "\n\nNote: No workspace is configured for this project, so codebase exploration tools are not available."
+
+    tools_doc += "\n\nDo NOT directly make code changes — create tasks instead."
+
     system_prompt = f"""{base_prompt}
 
 Project: "{project['name']}"
 {f"Description: {project['description']}" if project.get("description") else ""}
 {f"Repository: {project['repo_url']}" if project.get("repo_url") else ""}{project_ctx}{tasks_ctx}
-
-You have exactly two actions available:
-- **action__create_task** — Create a new tracked task. Use when the user describes work they want done. \
-You can include sub_tasks to send work directly to execution, or omit them for the intake/planning pipeline.
-- **action__delete_task** — Delete a task. ALWAYS ask for user confirmation before calling this.
-
-You MAY use MCP tools to read files and explore the codebase for research. Do NOT directly make code changes — create tasks instead."""
+{tools_doc}"""
 
     if skills_ctx:
         system_prompt += skills_ctx
@@ -494,8 +522,9 @@ You MAY use MCP tools to read files and explore the codebase for research. Do NO
 
     from agents.providers.base import run_tool_loop
 
-    # Only action tools (create_task, delete_task) — NO MCP write tools in project chat
-    tools_arg = action_tools if action_tools else None
+    # Combine: action tools + builtin workspace tools + MCP tools
+    all_tools = (action_tools or []) + builtin_tools + (mcp_tools or [])
+    tools_arg = all_tools if all_tools else None
 
     # Build a tool executor that routes to action handlers or MCP
     action_context = {
@@ -522,7 +551,16 @@ You MAY use MCP tools to read files and explore the codebase for research. Do NO
             except (json.JSONDecodeError, KeyError):
                 pass
             return result_text
-        return await mcp_exec.execute_tool(name, arguments, mcp_tools)
+        return await mcp_exec.execute_tool(name, arguments, builtin_tools + (mcp_tools or []))
+
+    # Build on_activity callback to stream tool execution updates via Redis
+    on_activity = None
+    if redis and session_id:
+        async def on_activity(msg: str) -> None:
+            await redis.publish(
+                f"chat:session:{session_id}:activity",
+                json.dumps({"type": "activity", "activity": msg}),
+            )
 
     send_kwargs: dict = {}
     if planner_config and planner_config.get("model_preference"):
@@ -533,6 +571,7 @@ You MAY use MCP tools to read files and explore the codebase for research. Do NO
         tools=tools_arg,
         tool_executor=_execute_tool,
         max_rounds=5,
+        on_activity=on_activity,
         **send_kwargs,
     )
 
@@ -561,25 +600,35 @@ You are a project planning assistant for "{project_name}".
 You are in PLANNING MODE. Your job is to:
 1. Discuss the project scope, requirements, and technical approach with the user
 2. Ask clarifying questions to understand the full picture
-3. Progressively build a structured plan with tasks and subtasks
+3. Progressively build a structured plan with subtasks
 
-When you and the user agree on a plan, output it as a structured JSON block:
+When you and the user agree on a plan, output it as a structured JSON block.
+CRITICAL: Always create exactly ONE task with ALL subtasks inside it. \
+Dependencies between separate tasks are NOT supported — only depends_on between subtasks within the SAME task works.
+
 ```json
 {{
   "action": "create_plan",
   "plan_title": "...",
   "tasks": [
     {{
-      "title": "...",
-      "description": "...",
+      "title": "Overall task title",
+      "description": "Full description of the entire scope of work",
       "priority": "medium",
       "task_type": "code",
       "subtasks": [
         {{
-          "title": "...",
+          "title": "First subtask",
           "description": "...",
           "agent_role": "coder",
           "depends_on": [],
+          "parallel": false
+        }},
+        {{
+          "title": "Second subtask (depends on first)",
+          "description": "...",
+          "agent_role": "coder",
+          "depends_on": [0],
           "parallel": false
         }}
       ]
@@ -589,10 +638,10 @@ When you and the user agree on a plan, output it as a structured JSON block:
 ```
 
 Guidelines:
-- Break the project into logical phases/tasks
-- Each task can have subtasks with dependencies
-- Use `depends_on` (list of subtask indices within same task) to express ordering
-- Mark subtasks as `parallel: true` if they can run concurrently
+- The `tasks` array should contain exactly ONE task — put ALL work as subtasks with depends_on
+- Each subtask should be a focused unit of work (one file, one feature, one concern)
+- Use `depends_on` (list of 0-based subtask indexes) to express ordering between subtasks
+- Subtasks with no dependencies and `parallel: true` can run concurrently
 - Valid agent roles: coder, tester, reviewer, pr_creator, report_writer
 - Valid task types: code, research, document, general
 - Valid priorities: critical, high, medium, low
@@ -611,6 +660,7 @@ async def _generate_plan_response(
     session: dict,
     db,
     event_bus=None,
+    redis=None,
 ) -> dict:
     """Generate an AI response in plan mode."""
     from agents.providers.registry import ProviderRegistry
@@ -670,6 +720,12 @@ async def _generate_plan_response(
     plan_send_kwargs: dict = {}
     if planner_config and planner_config.get("model_preference"):
         plan_send_kwargs["model"] = planner_config["model_preference"]
+
+    if redis and session_id:
+        await redis.publish(
+            f"chat:session:{session_id}:activity",
+            json.dumps({"type": "activity", "activity": "Generating plan response..."}),
+        )
 
     response = await provider.send_message(messages, **plan_send_kwargs)
     content = response.content  # already sanitized by LLMResponse

@@ -187,10 +187,52 @@ class McpToolExecutor:
                 command = tool_input.get("command", "")
                 if not command:
                     return json.dumps({"error": "No command provided"})
-                logger.info("builtin[run_command]: cmd=%s cwd=%s", command[:200], repo_dir)
+
+                # The LLM only knows about relative paths inside the repo.
+                # Handle cd prefixes so the LLM doesn't get stuck in a loop.
+                effective_cwd = repo_dir
+                actual_command = command.strip()
+
+                import re as _re
+
+                # Intercept bare "cd <path>" (no &&/;) — useless in subprocess
+                bare_cd = _re.match(r'^cd(\s+\S+)?\s*$', actual_command)
+                if bare_cd:
+                    logger.info("builtin[run_command]: intercepted bare cd")
+                    return json.dumps({
+                        "exit_code": 0,
+                        "output": "Your working directory is already the repo root. "
+                                  "Do not use 'cd' alone. To run in a subdirectory: cd subdir && your_command",
+                    })
+
+                # Handle "cd <path> && <rest>" — resolve relative path as cwd
+                cd_prefix = _re.match(r'^cd\s+([^\s;&]+)\s*&&\s*(.+)$', actual_command, _re.DOTALL)
+                if cd_prefix:
+                    cd_target = cd_prefix.group(1)
+                    actual_command = cd_prefix.group(2).strip()
+                    # Only allow relative paths within the repo
+                    if os.path.isabs(cd_target):
+                        logger.warning("builtin[run_command]: blocked absolute cd path: %s", cd_target)
+                        return json.dumps({
+                            "exit_code": 1,
+                            "output": "Absolute paths are not allowed. Use relative paths from the repo root.",
+                        })
+                    resolved = os.path.realpath(os.path.join(repo_dir, cd_target))
+                    real_repo = os.path.realpath(repo_dir)
+                    if not resolved.startswith(real_repo):
+                        logger.warning("builtin[run_command]: cd traversal blocked: %s", cd_target)
+                        return json.dumps({
+                            "exit_code": 1,
+                            "output": "Path traversal not allowed. Stay within the repo directory.",
+                        })
+                    if os.path.isdir(resolved):
+                        effective_cwd = resolved
+                    logger.info("builtin[run_command]: cd to subdir=%s cmd=%s", cd_target, actual_command[:100])
+
+                logger.info("builtin[run_command]: cmd=%s cwd=%s", actual_command[:200], effective_cwd)
                 proc = await asyncio.create_subprocess_shell(
-                    command,
-                    cwd=repo_dir,
+                    actual_command,
+                    cwd=effective_cwd,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.STDOUT,
                 )
@@ -200,15 +242,18 @@ class McpToolExecutor:
                     if len(output) > 50_000:
                         logger.info("builtin[run_command]: output truncated from %d to 50000 chars", len(output))
                         output = output[:50_000] + "\n... (truncated)"
+                    # Strip absolute repo path from output so LLM never sees it
+                    if repo_dir:
+                        output = output.replace(repo_dir + "/", "").replace(repo_dir, ".")
                     logger.info("builtin[run_command]: exit_code=%d output_len=%d cmd=%s",
-                                proc.returncode, len(output), command[:100])
+                                proc.returncode, len(output), actual_command[:100])
                     return json.dumps({
                         "exit_code": proc.returncode,
                         "output": output,
                     })
                 except asyncio.TimeoutError:
                     proc.kill()
-                    logger.warning("builtin[run_command]: timed out after 120s cmd=%s", command[:200])
+                    logger.warning("builtin[run_command]: timed out after 120s cmd=%s", actual_command[:200])
                     return json.dumps({"error": "Command timed out after 120s"})
 
             else:

@@ -41,10 +41,10 @@ const VERDICT_COLORS: Record<string, string> = {
 export default function TodoDetailPage() {
   const { todoId } = useParams<{ todoId: string }>()
   const {
-    todos, chatMessages, deliverablesByTodo,
+    todos, chatMessages, deliverablesByTodo, activityLogs,
     fetchTodo, fetchChat, fetchDeliverables, sendChat,
     cancelTodo, retryTodo, acceptDeliverables, requestChanges,
-    approvePlan, rejectPlan,
+    approvePlan, rejectPlan, appendActivity,
   } = useTodoStore()
 
   useTaskWebSocket(todoId || null)
@@ -54,6 +54,8 @@ export default function TodoDetailPage() {
   const [rejectFeedback, setRejectFeedback] = useState('')
   const [showRejectForm, setShowRejectForm] = useState(false)
   const [expandedSubTasks, setExpandedSubTasks] = useState<Set<string>>(new Set())
+  const [expandedActivity, setExpandedActivity] = useState<Set<string>>(new Set())
+  const activityEndRefs = useRef<Record<string, HTMLDivElement | null>>({})
   const chatEndRef = useRef<HTMLDivElement>(null)
 
   const toggleSubTask = (id: string) => {
@@ -76,9 +78,42 @@ export default function TodoDetailPage() {
   const messages = todoId ? chatMessages[todoId] || [] : []
   const taskDeliverables = todoId ? deliverablesByTodo[todoId] || []  : []
 
+  // Previous-run detection: when a todo is retried, items from before the last
+  // state change are considered "previous run" and greyed out.
+  const todoActive = todo ? !['completed', 'failed', 'cancelled'].includes(todo.state) : false
+  const stateChangedAt = todo?.state_changed_at ? new Date(todo.state_changed_at).getTime() : 0
+  const hasPreviousRun = todoActive && stateChangedAt > 0
+
+  const isSubTaskPreviousRun = (st: SubTask) =>
+    hasPreviousRun &&
+    new Date(st.created_at).getTime() < stateChangedAt &&
+    (st.status === 'completed' || st.status === 'failed')
+
+  const isTimestampPreviousRun = (createdAt: string) =>
+    hasPreviousRun && new Date(createdAt).getTime() < stateChangedAt
+
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [messages.length])
+
+  // Seed activity log from persisted progress_message on load/refresh
+  useEffect(() => {
+    if (!todo?.sub_tasks) return
+    for (const st of todo.sub_tasks) {
+      if (st.status === 'running' && st.progress_message && (!activityLogs[st.id] || activityLogs[st.id].length === 0)) {
+        appendActivity(st.id, st.progress_message)
+      }
+    }
+  }, [todo?.sub_tasks]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Auto-scroll activity logs when new entries arrive
+  useEffect(() => {
+    for (const [stId, entries] of Object.entries(activityLogs)) {
+      if (entries.length > 0 && expandedActivity.has(stId)) {
+        activityEndRefs.current[stId]?.scrollIntoView({ behavior: 'smooth', block: 'end' })
+      }
+    }
+  }, [activityLogs, expandedActivity])
 
   const handleSendChat = async () => {
     if (!todoId || !chatInput.trim()) return
@@ -318,44 +353,68 @@ export default function TodoDetailPage() {
             }
           }
           if (chains.size === 0) return null
+
+          // Separate current vs previous-run chains
+          const currentChains: [string, SubTask[]][] = []
+          const previousChains: [string, SubTask[]][] = []
+          for (const entry of chains.entries()) {
+            const allPrevious = entry[1].every((st) => isSubTaskPreviousRun(st))
+            if (allPrevious) previousChains.push(entry)
+            else currentChains.push(entry)
+          }
+
+          const renderChain = ([chainId, chainTasks]: [string, SubTask[]]) => (
+            <div key={chainId} className="p-3 bg-gray-900 rounded-lg border border-gray-800/50">
+              <div className="flex items-center gap-1.5 flex-wrap">
+                {chainTasks
+                  .sort((a, b) => (a.execution_order || 0) - (b.execution_order || 0))
+                  .map((st, i) => (
+                    <div key={st.id} className="flex items-center gap-1.5">
+                      {i > 0 && <span className="text-gray-700 text-xs">{'\u2192'}</span>}
+                      <span className={`px-2 py-0.5 rounded text-[11px] font-medium flex items-center gap-1 ${
+                        st.status === 'completed' ? 'bg-emerald-500/10 text-emerald-400/80 border border-emerald-500/20' :
+                        st.status === 'running' ? 'bg-amber-500/10 text-amber-400/80 border border-amber-500/20' :
+                        st.status === 'failed' ? 'bg-red-500/10 text-red-400/80 border border-red-500/20' :
+                        'bg-gray-800 text-gray-400 border border-gray-700'
+                      }`}>
+                        <span>{ROLE_LABELS[st.agent_role] || st.agent_role}</span>
+                        {st.review_verdict === 'approved' && <span className="text-emerald-400">{'\u2713'}</span>}
+                        {st.review_verdict === 'needs_changes' && <span className="text-amber-400">{'\u2717'}</span>}
+                      </span>
+                    </div>
+                  ))}
+              </div>
+            </div>
+          )
+
           return (
             <div className="mb-6">
               <h2 className="text-sm font-medium text-gray-300 mb-3 uppercase tracking-wider">Review Chains</h2>
               <div className="space-y-3">
-                {Array.from(chains.entries()).map(([chainId, chainTasks]) => (
-                  <div key={chainId} className="p-3 bg-gray-900 rounded-lg border border-gray-800/50">
-                    <div className="flex items-center gap-1.5 flex-wrap">
-                      {chainTasks
-                        .sort((a, b) => (a.execution_order || 0) - (b.execution_order || 0))
-                        .map((st, i) => (
-                          <div key={st.id} className="flex items-center gap-1.5">
-                            {i > 0 && <span className="text-gray-700 text-xs">→</span>}
-                            <span className={`px-2 py-0.5 rounded text-[11px] font-medium flex items-center gap-1 ${
-                              st.status === 'completed' ? 'bg-emerald-500/10 text-emerald-400/80 border border-emerald-500/20' :
-                              st.status === 'running' ? 'bg-amber-500/10 text-amber-400/80 border border-amber-500/20' :
-                              st.status === 'failed' ? 'bg-red-500/10 text-red-400/80 border border-red-500/20' :
-                              'bg-gray-800 text-gray-400 border border-gray-700'
-                            }`}>
-                              <span>{ROLE_LABELS[st.agent_role] || st.agent_role}</span>
-                              {st.review_verdict === 'approved' && <span className="text-emerald-400">✓</span>}
-                              {st.review_verdict === 'needs_changes' && <span className="text-amber-400">✗</span>}
-                            </span>
-                          </div>
-                        ))}
-                    </div>
-                  </div>
-                ))}
+                {currentChains.map(renderChain)}
               </div>
+              {previousChains.length > 0 && (
+                <div className="mt-3">
+                  <div className="text-[10px] text-gray-600 uppercase tracking-wider mb-1.5">Previous Run</div>
+                  <div className="space-y-3 opacity-40">
+                    {previousChains.map(renderChain)}
+                  </div>
+                </div>
+              )}
             </div>
           )
         })()}
 
         {/* Sub-tasks with RALPH iteration details */}
-        {todo.sub_tasks && todo.sub_tasks.length > 0 && (
+        {todo.sub_tasks && todo.sub_tasks.length > 0 && (() => {
+          const currentTasks = todo.sub_tasks.filter((st: SubTask) => !isSubTaskPreviousRun(st))
+          const previousTasks = todo.sub_tasks.filter((st: SubTask) => isSubTaskPreviousRun(st))
+
+          return (
           <div className="mb-6">
             <h2 className="text-sm font-medium text-gray-300 mb-3 uppercase tracking-wider">Sub-tasks</h2>
             <div className="space-y-1.5">
-              {todo.sub_tasks.map((st: SubTask) => {
+              {currentTasks.map((st: SubTask) => {
                 const iterLog = st.iteration_log || []
                 const hasIterations = iterLog.length > 0
                 const isExpanded = expandedSubTasks.has(st.id)
@@ -411,6 +470,43 @@ export default function TodoDetailPage() {
                           {st.progress_message && (
                             <div className="text-[11px] text-gray-600 mt-1">{st.progress_message}</div>
                           )}
+                          {/* Activity log */}
+                          {(() => {
+                            const logs = activityLogs[st.id]
+                            if (!logs || logs.length === 0) return null
+                            const isOpen = expandedActivity.has(st.id)
+                            const latest = logs[logs.length - 1]
+                            return (
+                              <div className="mt-2">
+                                <button
+                                  type="button"
+                                  className="flex items-center gap-1.5 text-[11px] text-gray-500 hover:text-gray-400 transition-colors"
+                                  onClick={(e) => {
+                                    e.stopPropagation()
+                                    setExpandedActivity((prev) => {
+                                      const next = new Set(prev)
+                                      if (next.has(st.id)) next.delete(st.id); else next.add(st.id)
+                                      return next
+                                    })
+                                  }}
+                                >
+                                  <span className="w-3">{isOpen ? '\u25BC' : '\u25B6'}</span>
+                                  <span className="font-mono truncate max-w-xs">{latest}</span>
+                                  <span className="text-gray-700 shrink-0">({logs.length})</span>
+                                </button>
+                                {isOpen && (
+                                  <div className="mt-1.5 max-h-40 overflow-y-auto bg-gray-950 border border-gray-800/50 rounded px-2.5 py-1.5 space-y-0.5">
+                                    {logs.map((entry, i) => (
+                                      <div key={i} className="text-[11px] font-mono text-gray-600 leading-relaxed">
+                                        <span className="text-gray-700 mr-1.5 select-none">{'\u203A'}</span>{entry}
+                                      </div>
+                                    ))}
+                                    <div ref={(el) => { activityEndRefs.current[st.id] = el }} />
+                                  </div>
+                                )}
+                              </div>
+                            )
+                          })()}
                         </div>
                       )}
                       {st.error_message && (
@@ -514,90 +610,148 @@ export default function TodoDetailPage() {
                 )
               })}
             </div>
+
+            {/* Previous run sub-tasks (greyed out) */}
+            {previousTasks.length > 0 && (
+              <div className="mt-4">
+                <div className="text-[10px] text-gray-600 uppercase tracking-wider mb-1.5">Previous Run</div>
+                <div className="space-y-1 opacity-40">
+                  {previousTasks.map((st: SubTask) => (
+                    <div key={st.id} className="px-3 py-2 bg-gray-900/50 rounded-lg border border-gray-800/30">
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <span className={`px-1.5 py-0.5 rounded text-[11px] font-medium text-white ${SUBTASK_COLORS[st.status]}`}>
+                          {st.status}
+                        </span>
+                        <span className="text-[11px] text-indigo-400/70">{ROLE_LABELS[st.agent_role] || st.agent_role}</span>
+                        <span className="text-sm text-gray-400">{st.title}</span>
+                        {st.error_message && (
+                          <span className="ml-auto text-[11px] text-red-400/60 font-mono truncate max-w-xs">{st.error_message}</span>
+                        )}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
           </div>
-        )}
+          )
+        })()}
 
         {/* Progress Log (RALPH learnings) */}
-        {todo.progress_log && todo.progress_log.length > 0 && (
-          <div className="mb-6">
-            <h2 className="text-sm font-medium text-gray-300 mb-3 uppercase tracking-wider">Progress Log</h2>
-            <div className="space-y-1.5">
-              {todo.progress_log.map((entry: ProgressLogEntry, i: number) => (
-                <div key={i} className="p-3 bg-gray-900 rounded-lg border border-gray-800/50">
-                  <div className="flex items-center gap-2 mb-1">
-                    <span className={`px-1.5 py-0.5 rounded text-[11px] font-medium ${
-                      entry.outcome === 'completed'
-                        ? 'bg-emerald-500/10 text-emerald-400/80'
-                        : 'bg-red-500/10 text-red-400/80'
-                    }`}>
-                      {entry.outcome}
-                    </span>
-                    <span className="text-sm text-gray-300">{entry.sub_task_title}</span>
-                    <span className="ml-auto text-[11px] text-gray-600 font-mono">
-                      {entry.iterations_used} iter{entry.iterations_used !== 1 ? 's' : ''}
-                    </span>
-                  </div>
-                  {entry.key_learnings.length > 0 && (
-                    <div className="mt-1.5 space-y-0.5">
-                      {entry.key_learnings.map((l, li) => (
-                        <div key={li} className="text-[11px] text-gray-500 flex items-start gap-1.5">
-                          <span className="w-1 h-1 rounded-full bg-gray-700 mt-1.5 shrink-0" />
-                          {l}
-                        </div>
-                      ))}
+        {todo.progress_log && todo.progress_log.length > 0 && (() => {
+          const currentLog = todo.progress_log.filter((e: ProgressLogEntry) => !isTimestampPreviousRun(e.completed_at))
+          const previousLog = todo.progress_log.filter((e: ProgressLogEntry) => isTimestampPreviousRun(e.completed_at))
+
+          const renderLogEntry = (entry: ProgressLogEntry, i: number) => (
+            <div key={i} className="p-3 bg-gray-900 rounded-lg border border-gray-800/50">
+              <div className="flex items-center gap-2 mb-1">
+                <span className={`px-1.5 py-0.5 rounded text-[11px] font-medium ${
+                  entry.outcome === 'completed'
+                    ? 'bg-emerald-500/10 text-emerald-400/80'
+                    : 'bg-red-500/10 text-red-400/80'
+                }`}>
+                  {entry.outcome}
+                </span>
+                <span className="text-sm text-gray-300">{entry.sub_task_title}</span>
+                <span className="ml-auto text-[11px] text-gray-600 font-mono">
+                  {entry.iterations_used} iter{entry.iterations_used !== 1 ? 's' : ''}
+                </span>
+              </div>
+              {entry.key_learnings.length > 0 && (
+                <div className="mt-1.5 space-y-0.5">
+                  {entry.key_learnings.map((l, li) => (
+                    <div key={li} className="text-[11px] text-gray-500 flex items-start gap-1.5">
+                      <span className="w-1 h-1 rounded-full bg-gray-700 mt-1.5 shrink-0" />
+                      {l}
                     </div>
-                  )}
+                  ))}
                 </div>
-              ))}
+              )}
             </div>
-          </div>
-        )}
+          )
+
+          return (
+            <div className="mb-6">
+              <h2 className="text-sm font-medium text-gray-300 mb-3 uppercase tracking-wider">Progress Log</h2>
+              {currentLog.length > 0 && (
+                <div className="space-y-1.5">
+                  {currentLog.map(renderLogEntry)}
+                </div>
+              )}
+              {previousLog.length > 0 && (
+                <div className={currentLog.length > 0 ? 'mt-3' : ''}>
+                  <div className="text-[10px] text-gray-600 uppercase tracking-wider mb-1.5">Previous Run</div>
+                  <div className="space-y-1.5 opacity-40">
+                    {previousLog.map(renderLogEntry)}
+                  </div>
+                </div>
+              )}
+            </div>
+          )
+        })()}
 
         {/* Deliverables */}
-        {taskDeliverables.length > 0 && (
-          <div className="mb-6">
-            <h2 className="text-sm font-medium text-gray-300 mb-3 uppercase tracking-wider">Deliverables</h2>
-            <div className="space-y-1.5">
-              {taskDeliverables.map((d: Deliverable) => (
-                <div key={d.id} className="p-3 bg-gray-900 rounded-lg border border-gray-800/50">
-                  <div className="flex items-center gap-2 mb-1">
-                    <span className="px-1.5 py-0.5 bg-indigo-600/30 border border-indigo-500/20 rounded text-[11px] text-indigo-300">{d.type.replace('_', ' ')}</span>
-                    <span className="text-sm text-gray-300">{d.title}</span>
-                    {d.merged_at && (
-                      <span className="px-1.5 py-0.5 bg-emerald-500/10 border border-emerald-500/20 rounded text-[10px] text-emerald-400/80">
-                        merged{d.merge_method ? ` (${d.merge_method})` : ''}
-                      </span>
-                    )}
-                    {d.pr_state && d.pr_state !== 'merged' && (
-                      <span className="px-1.5 py-0.5 bg-gray-800 rounded text-[10px] text-gray-400">
-                        {d.pr_state}
-                      </span>
-                    )}
-                    {d.target_repo_name && (
-                      <span className="px-1.5 py-0.5 bg-purple-500/10 border border-purple-500/20 rounded text-[10px] text-purple-400/80 font-mono">
-                        {d.target_repo_name}
-                      </span>
-                    )}
-                  </div>
-                  {d.pr_url && (
-                    <a href={d.pr_url} target="_blank" rel="noreferrer" className="text-[11px] text-indigo-400 hover:underline">{d.pr_url}</a>
-                  )}
-                  {d.type === 'code_diff' && d.content_json && (d.content_json as Record<string, unknown>).diff ? (
-                    <DiffViewer
-                      diff={(d.content_json as Record<string, unknown>).diff as string}
-                      stats={(d.content_json as Record<string, unknown>).stats as string}
-                      files={(d.content_json as Record<string, unknown>).files as Array<{status: string; path: string}>}
-                    />
-                  ) : d.content_md ? (
-                    <pre className="mt-2 text-[11px] text-gray-500 whitespace-pre-wrap max-h-40 overflow-y-auto font-mono leading-relaxed">
-                      {d.content_md}
-                    </pre>
-                  ) : null}
-                </div>
-              ))}
+        {taskDeliverables.length > 0 && (() => {
+          const currentDeliverables = taskDeliverables.filter((d: Deliverable) => !isTimestampPreviousRun(d.created_at))
+          const previousDeliverables = taskDeliverables.filter((d: Deliverable) => isTimestampPreviousRun(d.created_at))
+
+          const renderDeliverable = (d: Deliverable) => (
+            <div key={d.id} className="p-3 bg-gray-900 rounded-lg border border-gray-800/50">
+              <div className="flex items-center gap-2 mb-1">
+                <span className="px-1.5 py-0.5 bg-indigo-600/30 border border-indigo-500/20 rounded text-[11px] text-indigo-300">{d.type.replace('_', ' ')}</span>
+                <span className="text-sm text-gray-300">{d.title}</span>
+                {d.merged_at && (
+                  <span className="px-1.5 py-0.5 bg-emerald-500/10 border border-emerald-500/20 rounded text-[10px] text-emerald-400/80">
+                    merged{d.merge_method ? ` (${d.merge_method})` : ''}
+                  </span>
+                )}
+                {d.pr_state && d.pr_state !== 'merged' && (
+                  <span className="px-1.5 py-0.5 bg-gray-800 rounded text-[10px] text-gray-400">
+                    {d.pr_state}
+                  </span>
+                )}
+                {d.target_repo_name && (
+                  <span className="px-1.5 py-0.5 bg-purple-500/10 border border-purple-500/20 rounded text-[10px] text-purple-400/80 font-mono">
+                    {d.target_repo_name}
+                  </span>
+                )}
+              </div>
+              {d.pr_url && (
+                <a href={d.pr_url} target="_blank" rel="noreferrer" className="text-[11px] text-indigo-400 hover:underline">{d.pr_url}</a>
+              )}
+              {d.type === 'code_diff' && d.content_json && (d.content_json as Record<string, unknown>).diff ? (
+                <DiffViewer
+                  diff={(d.content_json as Record<string, unknown>).diff as string}
+                  stats={(d.content_json as Record<string, unknown>).stats as string}
+                  files={(d.content_json as Record<string, unknown>).files as Array<{status: string; path: string}>}
+                />
+              ) : d.content_md ? (
+                <pre className="mt-2 text-[11px] text-gray-500 whitespace-pre-wrap max-h-40 overflow-y-auto font-mono leading-relaxed">
+                  {d.content_md}
+                </pre>
+              ) : null}
             </div>
-          </div>
-        )}
+          )
+
+          return (
+            <div className="mb-6">
+              <h2 className="text-sm font-medium text-gray-300 mb-3 uppercase tracking-wider">Deliverables</h2>
+              {currentDeliverables.length > 0 && (
+                <div className="space-y-1.5">
+                  {currentDeliverables.map(renderDeliverable)}
+                </div>
+              )}
+              {previousDeliverables.length > 0 && (
+                <div className={currentDeliverables.length > 0 ? 'mt-3' : ''}>
+                  <div className="text-[10px] text-gray-600 uppercase tracking-wider mb-1.5">Previous Run</div>
+                  <div className="space-y-1.5 opacity-40">
+                    {previousDeliverables.map(renderDeliverable)}
+                  </div>
+                </div>
+              )}
+            </div>
+          )
+        })()}
 
         {/* Metrics */}
         <div className="flex gap-4 text-[11px] text-gray-600 font-mono border-t border-gray-900 pt-4">
@@ -614,23 +768,40 @@ export default function TodoDetailPage() {
         </div>
 
         <div className="flex-1 overflow-y-auto px-4 py-3 space-y-2.5">
-          {messages.map((msg: ChatMessage) => (
-            <div
-              key={msg.id}
-              className={`text-sm rounded-lg p-3 ${
-                msg.role === 'user'
-                  ? 'ml-6 bg-indigo-600/10 border border-indigo-500/15'
-                  : msg.role === 'system'
-                  ? 'bg-gray-900 border border-gray-800/50'
-                  : 'mr-6 bg-gray-900 border border-gray-800/50'
-              }`}
-            >
-              <div className="text-[11px] text-gray-600 mb-1">
-                {msg.role === 'user' ? 'You' : msg.role === 'system' ? 'System' : 'Agent'}
+          {(() => {
+            const previousMessages = messages.filter((msg: ChatMessage) => isTimestampPreviousRun(msg.created_at))
+            const currentMessages = messages.filter((msg: ChatMessage) => !isTimestampPreviousRun(msg.created_at))
+
+            const renderMessage = (msg: ChatMessage) => (
+              <div
+                key={msg.id}
+                className={`text-sm rounded-lg p-3 ${
+                  msg.role === 'user'
+                    ? 'ml-6 bg-indigo-600/10 border border-indigo-500/15'
+                    : msg.role === 'system'
+                    ? 'bg-gray-900 border border-gray-800/50'
+                    : 'mr-6 bg-gray-900 border border-gray-800/50'
+                }`}
+              >
+                <div className="text-[11px] text-gray-600 mb-1">
+                  {msg.role === 'user' ? 'You' : msg.role === 'system' ? 'System' : 'Agent'}
+                </div>
+                <div className="text-gray-300 whitespace-pre-wrap text-[13px] leading-relaxed">{msg.content}</div>
               </div>
-              <div className="text-gray-300 whitespace-pre-wrap text-[13px] leading-relaxed">{msg.content}</div>
-            </div>
-          ))}
+            )
+
+            return (
+              <>
+                {previousMessages.length > 0 && (
+                  <div className="opacity-40 space-y-2.5 pb-2 mb-2 border-b border-gray-800/50">
+                    <div className="text-[10px] text-gray-600 uppercase tracking-wider">Previous Run</div>
+                    {previousMessages.map(renderMessage)}
+                  </div>
+                )}
+                {currentMessages.map(renderMessage)}
+              </>
+            )
+          })()}
           <div ref={chatEndRef} />
         </div>
 

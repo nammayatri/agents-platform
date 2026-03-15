@@ -788,6 +788,7 @@ class AgentCoordinator:
                     tools=tools_arg,
                     tool_executor=lambda name, args: self.mcp_executor.execute_tool(name, args, mcp_tools),
                     max_rounds=10,
+                    on_activity=lambda msg: self._report_activity(st_id, msg),
                     **send_kwargs,
                 )
 
@@ -975,7 +976,7 @@ class AgentCoordinator:
         if workspace_path:
             file_tree = self.workspace_mgr.get_file_tree(workspace_path, max_depth=4)
             workspace_context = (
-                f"\n\nYou have access to the project workspace at: {workspace_path}/repo\n"
+                f"\n\nYou are working inside the project repository root directory.\n"
                 f"Project file structure:\n{file_tree}\n"
             )
             # Git diff of current changes
@@ -1215,8 +1216,8 @@ class AgentCoordinator:
             return
 
         if role == "coder":
-            # Coder finished → finalize their workspace (commit/push/PR) then create reviewer sub-task
-            await self._finalize_subtask_workspace(st, workspace_path)
+            # Coder finished → create reviewer to review the workspace changes.
+            # Commit/push/PR happens later, after reviewer approval.
             await self._create_reviewer_subtask(st, chain_id)
 
         elif role == "reviewer":
@@ -1237,7 +1238,25 @@ class AgentCoordinator:
                 )
 
             if verdict == "approved":
-                await self._create_merge_subtask(st, chain_id)
+                # Deterministically commit, push, and create PR — no LLM needed.
+                # Find the latest coder sub-task in this chain for commit context.
+                coder_st = await self.db.fetchrow(
+                    "SELECT * FROM sub_tasks WHERE review_chain_id = $1 "
+                    "AND agent_role = 'coder' ORDER BY created_at DESC LIMIT 1",
+                    chain_id,
+                )
+                commit_st = coder_st or st
+                pr_info = await self._finalize_subtask_workspace(commit_st, workspace_path)
+                if pr_info:
+                    pr_url = pr_info.get("url", "N/A")
+                    await self._post_system_message(
+                        f"**Review approved.** Committed, pushed, and created PR: {pr_url}"
+                    )
+                    await self._create_merge_subtask(st, chain_id)
+                else:
+                    await self._post_system_message(
+                        "**Review approved.** No changes to commit or PR creation failed."
+                    )
             else:
                 # needs_changes → create a new coder fix sub-task
                 reviewer_feedback = (
@@ -1354,8 +1373,14 @@ class AgentCoordinator:
     async def _finalize_subtask_workspace(
         self, sub_task: dict, workspace_path: str | None,
     ) -> dict | None:
-        """Commit and create a PR for a single sub-task's changes (within review loop)."""
+        """Deterministic commit → push → PR for a sub-task's workspace changes.
+
+        Called after reviewer approval (not after coder completion) so that
+        only reviewed code gets a PR.
+        """
         if not workspace_path:
+            logger.warning("[%s] Cannot finalize: no workspace_path", self.todo_id)
+            await self._post_system_message("**PR creation skipped:** no workspace path available.")
             return None
 
         try:
@@ -1377,6 +1402,8 @@ class AgentCoordinator:
                     todo["project_id"],
                 )
                 if not project or not project.get("repo_url"):
+                    logger.warning("[%s] Cannot finalize: no repo_url on project", self.todo_id)
+                    await self._post_system_message("**PR creation skipped:** no repository URL configured on the project.")
                     return None
                 branch_name = f"task/{short_id}"
                 base_branch = project.get("default_branch") or "main"
@@ -1385,25 +1412,31 @@ class AgentCoordinator:
                         self.todo_id, branch_name, base_branch,
                         bool(target_repo), workspace_path)
 
+            # Step 1: commit and push
             pushed = await self.workspace_mgr.commit_and_push(
                 workspace_path,
                 message=f"[agents] {sub_task['title']}",
                 branch=branch_name,
             )
             if not pushed:
+                logger.error("[%s] commit_and_push failed for branch %s", self.todo_id, branch_name)
+                await self._post_system_message(f"**PR creation failed:** could not push to branch `{branch_name}`.")
                 return None
 
-            # Check if PR already exists for this branch
+            logger.info("[%s] Pushed to branch %s", self.todo_id, branch_name)
+
+            # Step 2: check if PR already exists for this branch
             existing_pr = await self.db.fetchrow(
-                "SELECT id, pr_number FROM deliverables "
+                "SELECT id, pr_number, pr_url FROM deliverables "
                 "WHERE todo_id = $1 AND type = 'pull_request' AND branch_name = $2",
                 self.todo_id,
                 branch_name,
             )
             if existing_pr:
-                return {"number": existing_pr["pr_number"]}
+                logger.info("[%s] PR already exists: #%s", self.todo_id, existing_pr["pr_number"])
+                return {"number": existing_pr["pr_number"], "url": existing_pr.get("pr_url")}
 
-            # Create PR — use dependency repo or project repo
+            # Step 3: create PR
             if target_repo and target_repo.get("repo_url"):
                 pr_info = await self.workspace_mgr.create_pr_for_repo(
                     repo_url=target_repo["repo_url"],
@@ -1422,7 +1455,9 @@ class AgentCoordinator:
                     body=f"## {sub_task['title']}\n\n*Created by AI Agent*",
                 )
 
+            # Step 4: record deliverable
             if pr_info:
+                logger.info("[%s] PR created: %s", self.todo_id, pr_info.get("url"))
                 await self.db.execute(
                     """
                     INSERT INTO deliverables (
@@ -1438,9 +1473,14 @@ class AgentCoordinator:
                     pr_info.get("number"),
                     branch_name,
                 )
+            else:
+                logger.warning("[%s] create_pr returned empty result", self.todo_id)
+                await self._post_system_message("**PR creation failed:** git provider returned no PR data.")
+
             return pr_info
         except Exception:
-            logger.warning("Failed to finalize subtask workspace", exc_info=True)
+            logger.error("[%s] Failed to finalize subtask workspace", self.todo_id, exc_info=True)
+            await self._post_system_message("**PR creation failed:** unexpected error. Check server logs.")
             return None
 
     def _extract_review_verdict(self, content: str) -> str:
@@ -1796,6 +1836,7 @@ class AgentCoordinator:
                 tool_executor=lambda name, args: self.mcp_executor.execute_tool(name, args, mcp_tools),
                 max_rounds=10,
                 on_tool_round=_on_tool_round,
+                on_activity=lambda msg: self._report_activity(st_id, msg),
                 **send_kwargs,
             )
             logger.info("[%s] st=%s Tool loop done: content_len=%d stop=%s",
@@ -2215,6 +2256,11 @@ class AgentCoordinator:
 
     async def _report_progress(self, subtask_id: str, pct: int, message: str) -> None:
         logger.info("[%s] st=%s progress=%d%% %s", self.todo_id, subtask_id[:8], pct, message)
+        # Persist to DB so it survives page refreshes
+        await self.db.execute(
+            "UPDATE sub_tasks SET progress_pct = $2, progress_message = $3 WHERE id = $1",
+            subtask_id, pct, message,
+        )
         await self.redis.publish(
             f"task:{self.todo_id}:progress",
             json.dumps({
@@ -2222,6 +2268,22 @@ class AgentCoordinator:
                 "sub_task_id": subtask_id,
                 "progress_pct": pct,
                 "message": message,
+            }),
+        )
+
+    async def _report_activity(self, subtask_id: str, activity: str) -> None:
+        """Publish a granular activity event for live UI display."""
+        # Persist latest activity as progress_message so it shows on refresh
+        await self.db.execute(
+            "UPDATE sub_tasks SET progress_message = $2 WHERE id = $1",
+            subtask_id, activity,
+        )
+        await self.redis.publish(
+            f"task:{self.todo_id}:progress",
+            json.dumps({
+                "type": "activity",
+                "sub_task_id": subtask_id,
+                "activity": activity,
             }),
         )
 
@@ -2344,7 +2406,7 @@ class AgentCoordinator:
         if workspace_path:
             file_tree = self.workspace_mgr.get_file_tree(workspace_path, max_depth=4)
             workspace_context = (
-                f"\n\nYou have access to the project workspace at: {workspace_path}/repo\n"
+                f"\n\nYou are working inside the project repository root directory.\n"
                 f"Project file structure:\n{file_tree}\n"
             )
 

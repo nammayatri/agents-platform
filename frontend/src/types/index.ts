@@ -406,11 +406,12 @@ export interface ProjectChatMessage {
 }
 
 export interface WSEvent {
-  type: 'state_change' | 'chat_message' | 'progress' | 'deliverable_created' | 'ping'
+  type: 'state_change' | 'chat_message' | 'progress' | 'activity' | 'deliverable_created' | 'ping'
   state?: TodoState
-  message?: { role: string; content: string; id?: string }
+  message?: string | { role: string; content: string; id?: string }
   sub_task_id?: string
   progress_pct?: number
+  activity?: string
 }
 
 // ── API Payload Types ──────────────────────────────────────────────

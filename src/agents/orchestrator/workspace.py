@@ -271,10 +271,32 @@ class WorkspaceManager:
         message: str,
         branch: str,
     ) -> bool:
-        """Stage all changes, commit, and push to remote."""
+        """Stage all changes, commit, and push to remote.
+
+        Returns True if the branch was successfully pushed (even if there
+        were no new changes to commit — the branch itself still gets pushed).
+        """
         repo_dir = os.path.join(workspace_path, "repo")
         if not os.path.isdir(repo_dir):
             repo_dir = workspace_path
+
+        if not os.path.isdir(os.path.join(repo_dir, ".git")):
+            logger.error("commit_and_push: no .git directory in %s", repo_dir)
+            return False
+
+        # Ensure we're on the right branch
+        rc, current_branch = await self._run_git("rev-parse", "--abbrev-ref", "HEAD", cwd=repo_dir)
+        if rc == 0:
+            current_branch = current_branch.strip()
+            if current_branch != branch:
+                logger.info("Switching from %s to %s", current_branch, branch)
+                # Try checkout; create if it doesn't exist
+                rc, out = await self._run_git("checkout", branch, cwd=repo_dir)
+                if rc != 0:
+                    rc, out = await self._run_git("checkout", "-b", branch, cwd=repo_dir)
+                    if rc != 0:
+                        logger.error("git checkout -b %s failed: %s", branch, out)
+                        return False
 
         # Stage all changes
         rc, out = await self._run_git("add", "-A", cwd=repo_dir)
@@ -285,19 +307,19 @@ class WorkspaceManager:
         # Check if there's anything to commit
         rc, out = await self._run_git("diff", "--cached", "--quiet", cwd=repo_dir)
         if rc == 0:
-            logger.info("No changes to commit")
-            return True  # nothing to commit is not a failure
+            logger.info("No new changes to commit — checking if branch has unpushed commits")
+        else:
+            # Commit
+            rc, out = await self._run_git(
+                "commit", "-m", message,
+                cwd=repo_dir,
+            )
+            if rc != 0:
+                logger.error("git commit failed: %s", out)
+                return False
+            logger.info("Committed changes on branch %s", branch)
 
-        # Commit
-        rc, out = await self._run_git(
-            "commit", "-m", message,
-            cwd=repo_dir,
-        )
-        if rc != 0:
-            logger.error("git commit failed: %s", out)
-            return False
-
-        # Push
+        # Push (always push — branch may have unpushed commits from earlier)
         rc, out = await self._run_git(
             "push", "-u", "origin", branch,
             cwd=repo_dir,
@@ -306,6 +328,7 @@ class WorkspaceManager:
             logger.error("git push failed: %s", out)
             return False
 
+        logger.info("Pushed branch %s to origin", branch)
         return True
 
     async def create_pr(

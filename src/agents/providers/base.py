@@ -79,6 +79,9 @@ class AIProvider(ABC):
 ToolExecutor = Callable[[str, dict], Awaitable[str]]
 
 
+ActivityCallback = Callable[[str], Awaitable[None]]
+
+
 async def run_tool_loop(
     provider: AIProvider,
     messages: list[LLMMessage],
@@ -87,6 +90,7 @@ async def run_tool_loop(
     tool_executor: ToolExecutor,
     max_rounds: int = 10,
     on_tool_round: Callable[[int, LLMResponse], Awaitable[None]] | None = None,
+    on_activity: ActivityCallback | None = None,
     **send_kwargs: Any,
 ) -> tuple[str, LLMResponse]:
     """Standard tool-call loop with content accumulation.
@@ -101,6 +105,7 @@ async def run_tool_loop(
         tool_executor: ``async (name, arguments) -> result_text`` callback.
         max_rounds: Hard cap on tool-call iterations.
         on_tool_round: Optional ``async (round, response)`` hook (e.g. progress).
+        on_activity: Optional callback for granular activity events (UI live log).
         **send_kwargs: Forwarded to ``provider.send_message`` (temperature, model…).
 
     Returns:
@@ -114,6 +119,9 @@ async def run_tool_loop(
     n_tools = len(tools) if tools else 0
     logger.info("tool_loop: starting (tools=%d, max_rounds=%d)", n_tools, max_rounds)
 
+    if on_activity:
+        await on_activity("Waiting for LLM response...")
+
     response = await provider.send_message(messages, **send_kwargs)
 
     logger.info(
@@ -123,6 +131,12 @@ async def run_tool_loop(
         response.tokens_input,
         response.tokens_output,
     )
+
+    if on_activity:
+        n_tc = len(response.tool_calls) if response.tool_calls else 0
+        await on_activity(
+            f"LLM responded ({response.tokens_output} tokens, {n_tc} tool calls)"
+        )
 
     content_parts: list[str] = []
     loop_count = 0
@@ -151,12 +165,22 @@ async def run_tool_loop(
             tc_name = tc["name"]
             tc_args = tc.get("arguments", {})
             logger.info("tool_loop: round %d — exec %s args_keys=%s", loop_count, tc_name, list(tc_args.keys()))
+
+            # Report tool execution activity
+            if on_activity:
+                tool_detail = _tool_activity_summary(tc_name, tc_args)
+                await on_activity(f"Executing: {tool_detail}")
+
             result_text = await tool_executor(tc_name, tc_args)
             result_preview = (result_text[:200] + "...") if len(result_text) > 200 else result_text
             logger.debug("tool_loop: round %d — %s result (%d chars): %s", loop_count, tc_name, len(result_text), result_preview)
             tool_results.append({"tool_use_id": tc["id"], "content": result_text})
 
         messages.append(LLMMessage(role="user", content="", tool_results=tool_results))
+
+        if on_activity:
+            await on_activity(f"Waiting for LLM response (round {loop_count + 1})...")
+
         response = await provider.send_message(messages, **send_kwargs)
 
         logger.info(
@@ -165,10 +189,19 @@ async def run_tool_loop(
             len(response.tool_calls) if response.tool_calls else 0,
         )
 
+        if on_activity:
+            n_tc = len(response.tool_calls) if response.tool_calls else 0
+            await on_activity(
+                f"LLM responded ({response.tokens_output} tokens, {n_tc} tool calls)"
+            )
+
     if loop_count >= max_rounds and response.stop_reason == "tool_use":
         logger.warning("tool_loop: hit max_rounds=%d, stopping with pending tool calls", max_rounds)
 
     logger.info("tool_loop: finished after %d rounds, final content_len=%d", loop_count, len(response.content or ""))
+
+    if on_activity:
+        await on_activity(f"Completed after {loop_count} tool rounds")
 
     # Combine pre-tool text with the final response
     if content_parts:
@@ -178,3 +211,24 @@ async def run_tool_loop(
         content = response.content
 
     return content, response
+
+
+def _tool_activity_summary(name: str, args: dict) -> str:
+    """One-line human-readable summary of a tool call for the activity log."""
+    if name == "write_file":
+        path = args.get("path", "?")
+        size = len(args.get("content", ""))
+        return f"write_file → {path} ({size:,} chars)"
+    if name == "read_file":
+        return f"read_file → {args.get('path', '?')}"
+    if name == "list_directory":
+        return f"list_directory → {args.get('path', '?')}"
+    if name == "search_files":
+        return f"search_files → pattern={args.get('pattern', '?')} glob={args.get('file_glob', '*')}"
+    if name == "run_command":
+        cmd = args.get("command", "?")
+        if len(cmd) > 80:
+            cmd = cmd[:77] + "..."
+        return f"run_command → {cmd}"
+    # Generic fallback
+    return name

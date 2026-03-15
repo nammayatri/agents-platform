@@ -105,15 +105,20 @@ _register_tool(BuiltinToolDef(
 
 _register_tool(BuiltinToolDef(
     name="run_command",
-    description="Run a shell command in the repo directory. Use for builds, tests, linting, git, gh CLI, etc.",
+    description=(
+        "Run a shell command. The working directory is ALREADY set to the repo root — "
+        "do NOT use bare 'cd' commands (they have no effect since each call is a fresh process). "
+        "Use for builds, tests, linting, git, etc. "
+        "To run in a subdirectory: 'cd subdir && command'."
+    ),
     input_schema={
         "type": "object",
         "properties": {
-            "command": {"type": "string", "description": "Shell command to execute"},
+            "command": {"type": "string", "description": "Shell command to execute (cwd is already the repo root)"},
         },
         "required": ["command"],
     },
-    prompt_hint="Run a shell command in the repo directory. Args: command",
+    prompt_hint="Run a shell command (cwd is already repo root, no cd needed). Args: command",
     example='run_command(command="npm test")',
 ))
 
@@ -311,11 +316,21 @@ TASK CREATION RULES:
 — it will go through the intake and planning pipeline.
 4. When deleting a task, ALWAYS ask for confirmation first.
 
-PLANNING GUIDELINES:
-- Break work into focused sub-tasks: one for coding, one for testing, one for review
+CRITICAL — ONE TASK PER REQUEST:
+- ALWAYS create ONE single task with ALL sub_tasks inside it.
+- NEVER create multiple separate tasks for related work. Dependencies between tasks are NOT supported \
+— only dependencies between sub_tasks within the SAME task work correctly.
+- If work has many parts, put them ALL as sub_tasks of one task. Use depends_on (0-based sub_task indexes) \
+to express ordering between sub_tasks.
+- Example: for "build a TUI app", create ONE task titled "Build interactive TUI app" with sub_tasks for \
+setup, API client, each screen, config, error handling, tests, etc. — NOT 7 separate tasks.
+
+SUB-TASK GUIDELINES:
+- Each sub_task should be a focused unit of work (one file/feature/concern)
 - Use agent roles: coder (implements), tester (writes tests), reviewer (reviews), pr_creator (creates PR)
 - Set execution_order for sequential work (0 = parallel)
-- Use depends_on (0-based indexes) for dependencies between sub-tasks
+- Use depends_on (0-based indexes) for dependencies between sub_tasks within the task
+- Sub_tasks with no dependencies can run in parallel
 
 You also help with:
 - Answering questions about the project, codebase, and architecture
@@ -329,6 +344,6 @@ _register(AgentDefinition(
     display_name="Planner",
     description="Project chat agent — plans work, creates tasks, answers project questions",
     system_prompt=PLANNER_CHAT_PROMPT,
-    default_tools=[],
+    default_tools=["read_file", "list_directory", "search_files"],
     tool_rule_categories=["general"],
 ))

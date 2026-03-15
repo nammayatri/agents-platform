@@ -11,6 +11,8 @@ interface TodoState {
   isLoading: boolean
   isCreating: boolean
   createError: string | null
+  /** Per-subtask activity log: subtaskId → recent activity strings */
+  activityLogs: Record<string, string[]>
 
   fetchProviders: () => Promise<void>
   fetchTodos: (projectId: string) => Promise<void>
@@ -32,8 +34,12 @@ interface TodoState {
 
   updateTodoState: (todoId: string, state: string) => void
   updateSubTaskProgress: (todoId: string, subTaskId: string, pct: number, message: string) => void
+  appendActivity: (subTaskId: string, activity: string) => void
+  clearActivity: (subTaskId: string) => void
   setActiveTodo: (todoId: string | null) => void
 }
+
+const MAX_ACTIVITY_ENTRIES = 50
 
 export const useTodoStore = create<TodoState>((set, get) => ({
   todos: {},
@@ -44,6 +50,7 @@ export const useTodoStore = create<TodoState>((set, get) => ({
   isLoading: false,
   isCreating: false,
   createError: null,
+  activityLogs: {},
 
   fetchProviders: async () => {
     const items = await providersApi.list() as ProviderConfig[]
@@ -164,6 +171,19 @@ export const useTodoStore = create<TodoState>((set, get) => ({
       st.id === subTaskId ? { ...st, progress_pct: pct, progress_message: message } : st
     )
     set({ todos: { ...todos, [todoId]: { ...todo, sub_tasks: updated } } })
+  },
+
+  appendActivity: (subTaskId, activity) => {
+    const { activityLogs } = get()
+    const current = activityLogs[subTaskId] || []
+    const updated = [...current, activity].slice(-MAX_ACTIVITY_ENTRIES)
+    set({ activityLogs: { ...activityLogs, [subTaskId]: updated } })
+  },
+
+  clearActivity: (subTaskId) => {
+    const { activityLogs } = get()
+    const { [subTaskId]: _, ...rest } = activityLogs
+    set({ activityLogs: rest })
   },
 
   setActiveTodo: (todoId) => set({ activeTodoId: todoId }),

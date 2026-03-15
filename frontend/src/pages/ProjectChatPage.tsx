@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import { projectChat, projects as projectsApi } from '../services/api'
 import PlanReviewCard from '../components/chat/PlanReviewCard'
+import { useChatSessionWebSocket } from '../hooks/useChatSessionWebSocket'
 import type { Project, ChatSession, ProjectChatMessage } from '../types'
 
 const intents = [
@@ -25,6 +26,9 @@ export default function ProjectChatPage() {
   const [creatingSession, setCreatingSession] = useState(false)
   const messagesEnd = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLTextAreaElement>(null)
+  const { activity, clearActivity } = useChatSessionWebSocket(activeSessionId)
+  const [showFeedbackFor, setShowFeedbackFor] = useState<string | null>(null)
+  const [feedbackInput, setFeedbackInput] = useState('')
 
   useEffect(() => {
     if (!projectId) return
@@ -191,6 +195,9 @@ export default function ProjectChatPage() {
     } finally {
       setSending(false)
       setSelectedIntent(null)
+      setShowFeedbackFor(null)
+      setFeedbackInput('')
+      clearActivity()
       inputRef.current?.focus()
     }
   }
@@ -501,6 +508,75 @@ export default function ProjectChatPage() {
                             </span>
                           </div>
                         )}
+                        {/* Quick-action buttons on last assistant message (regular chat only, no action metadata) */}
+                        {!isPlanMode &&
+                          msg.id === messages.filter((m) => m.role === 'assistant').at(-1)?.id &&
+                          !msg.metadata_json?.action &&
+                          !msg.metadata_json?.tasks_created &&
+                          !sending && (
+                          <div className="mt-2 pt-2 border-t border-gray-800">
+                            {showFeedbackFor === msg.id ? (
+                              <div className="flex items-center gap-2">
+                                <input
+                                  type="text"
+                                  value={feedbackInput}
+                                  onChange={(e) => setFeedbackInput(e.target.value)}
+                                  onKeyDown={(e) => {
+                                    if (e.key === 'Enter' && feedbackInput.trim()) {
+                                      handleSend(feedbackInput.trim())
+                                      setFeedbackInput('')
+                                      setShowFeedbackFor(null)
+                                    }
+                                    if (e.key === 'Escape') {
+                                      setShowFeedbackFor(null)
+                                      setFeedbackInput('')
+                                    }
+                                  }}
+                                  placeholder="What should change?"
+                                  className="flex-1 px-3 py-1.5 bg-gray-950 border border-gray-800 rounded-lg text-xs text-white focus:outline-none focus:border-indigo-500/50 transition-colors"
+                                  autoFocus
+                                />
+                                <button
+                                  onClick={() => {
+                                    if (feedbackInput.trim()) {
+                                      handleSend(feedbackInput.trim())
+                                      setFeedbackInput('')
+                                      setShowFeedbackFor(null)
+                                    }
+                                  }}
+                                  disabled={!feedbackInput.trim()}
+                                  className="px-2.5 py-1.5 bg-gray-800 hover:bg-gray-700 disabled:opacity-40 rounded-lg text-xs text-gray-300 transition-colors"
+                                >
+                                  Send
+                                </button>
+                                <button
+                                  onClick={() => {
+                                    setShowFeedbackFor(null)
+                                    setFeedbackInput('')
+                                  }}
+                                  className="text-[11px] text-gray-600 hover:text-gray-400 transition-colors"
+                                >
+                                  Cancel
+                                </button>
+                              </div>
+                            ) : (
+                              <div className="flex items-center gap-2">
+                                <button
+                                  onClick={() => handleSend('Looks good, go ahead and create the tasks.')}
+                                  className="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-500 rounded-lg text-xs font-medium text-white transition-colors"
+                                >
+                                  Create Tasks
+                                </button>
+                                <button
+                                  onClick={() => setShowFeedbackFor(msg.id)}
+                                  className="px-3 py-1.5 bg-gray-800 hover:bg-gray-700 rounded-lg text-xs text-gray-400 transition-colors"
+                                >
+                                  Suggest Changes
+                                </button>
+                              </div>
+                            )}
+                          </div>
+                        )}
                       </div>
                     ) : (
                       <div className="whitespace-pre-wrap">{msg.content}</div>
@@ -511,12 +587,22 @@ export default function ProjectChatPage() {
               {sending && (
                 <div className="flex justify-start">
                   <div className="bg-gray-900 border border-gray-800 rounded-xl px-4 py-2.5 text-sm text-gray-500">
-                    <span className="inline-flex gap-1">
-                      <span className="animate-pulse">Thinking</span>
-                      <span className="animate-bounce" style={{ animationDelay: '0.1s' }}>.</span>
-                      <span className="animate-bounce" style={{ animationDelay: '0.2s' }}>.</span>
-                      <span className="animate-bounce" style={{ animationDelay: '0.3s' }}>.</span>
-                    </span>
+                    {activity ? (
+                      <span className="inline-flex items-center gap-2">
+                        <svg className="w-3 h-3 animate-spin text-indigo-400" fill="none" viewBox="0 0 24 24">
+                          <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                          <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+                        </svg>
+                        <span className="text-gray-400">{activity}</span>
+                      </span>
+                    ) : (
+                      <span className="inline-flex gap-1">
+                        <span className="animate-pulse">Thinking</span>
+                        <span className="animate-bounce" style={{ animationDelay: '0.1s' }}>.</span>
+                        <span className="animate-bounce" style={{ animationDelay: '0.2s' }}>.</span>
+                        <span className="animate-bounce" style={{ animationDelay: '0.3s' }}>.</span>
+                      </span>
+                    )}
                   </div>
                 </div>
               )}
