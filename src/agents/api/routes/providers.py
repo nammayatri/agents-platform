@@ -1,0 +1,167 @@
+from fastapi import APIRouter, HTTPException, status
+
+from agents.api.deps import DB, CurrentUser
+from agents.infra.crypto import encrypt
+from agents.schemas.provider import (
+    NotificationChannelInput,
+    ProviderConfigInput,
+)
+
+router = APIRouter()
+
+
+# --- AI Provider Config ---
+
+
+@router.get("")
+async def list_providers(user: CurrentUser, db: DB):
+    rows = await db.fetch(
+        """
+        SELECT id, owner_id, provider_type, display_name, api_base_url,
+               default_model, fast_model, max_tokens, temperature, is_active
+        FROM ai_provider_configs
+        WHERE owner_id = $1 OR owner_id IS NULL
+        ORDER BY created_at DESC
+        """,
+        user["id"],
+    )
+    return [dict(r) for r in rows]
+
+
+@router.post("", status_code=status.HTTP_201_CREATED)
+async def create_provider(body: ProviderConfigInput, user: CurrentUser, db: DB):
+    api_key_enc = encrypt(body.api_key) if body.api_key else None
+    import json
+
+    row = await db.fetchrow(
+        """
+        INSERT INTO ai_provider_configs (
+            owner_id, provider_type, display_name, api_base_url,
+            api_key_enc, default_model, fast_model, max_tokens,
+            temperature, extra_config
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb)
+        RETURNING id, owner_id, provider_type, display_name, api_base_url,
+                  default_model, fast_model, max_tokens, temperature, is_active
+        """,
+        user["id"],
+        body.provider_type,
+        body.display_name,
+        body.api_base_url,
+        api_key_enc,
+        body.default_model,
+        body.fast_model,
+        body.max_tokens,
+        body.temperature,
+        json.dumps(body.extra_config),
+    )
+    return dict(row)
+
+
+@router.put("/{provider_id}")
+async def update_provider(provider_id: str, body: ProviderConfigInput, user: CurrentUser, db: DB):
+    existing = await db.fetchrow(
+        "SELECT owner_id FROM ai_provider_configs WHERE id = $1", provider_id
+    )
+    if not existing:
+        raise HTTPException(status_code=404)
+    if existing["owner_id"] and str(existing["owner_id"]) != str(user["id"]):
+        raise HTTPException(status_code=403)
+
+    api_key_enc = encrypt(body.api_key) if body.api_key else None
+    import json
+
+    row = await db.fetchrow(
+        """
+        UPDATE ai_provider_configs
+        SET provider_type = $2, display_name = $3, api_base_url = $4,
+            api_key_enc = COALESCE($5, api_key_enc), default_model = $6,
+            fast_model = $7, max_tokens = $8, temperature = $9,
+            extra_config = $10::jsonb
+        WHERE id = $1
+        RETURNING id, owner_id, provider_type, display_name, api_base_url,
+                  default_model, fast_model, max_tokens, temperature, is_active
+        """,
+        provider_id,
+        body.provider_type,
+        body.display_name,
+        body.api_base_url,
+        api_key_enc,
+        body.default_model,
+        body.fast_model,
+        body.max_tokens,
+        body.temperature,
+        json.dumps(body.extra_config),
+    )
+    return dict(row)
+
+
+@router.delete("/{provider_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_provider(provider_id: str, user: CurrentUser, db: DB):
+    existing = await db.fetchrow(
+        "SELECT owner_id FROM ai_provider_configs WHERE id = $1", provider_id
+    )
+    if not existing:
+        raise HTTPException(status_code=404)
+    if existing["owner_id"] and str(existing["owner_id"]) != str(user["id"]):
+        raise HTTPException(status_code=403)
+    await db.execute("DELETE FROM ai_provider_configs WHERE id = $1", provider_id)
+
+
+@router.post("/{provider_id}/test")
+async def test_provider(provider_id: str, user: CurrentUser, db: DB):
+    from agents.providers.registry import ProviderRegistry
+
+    registry = ProviderRegistry(db)
+    try:
+        provider = await registry.instantiate(provider_id)
+    except Exception as e:
+        return {"status": "error", "detail": f"Configuration error: {e}"}
+
+    try:
+        healthy = await provider.health_check_detailed()
+        return {"status": "ok" if healthy else "failed", "provider_id": provider_id}
+    except Exception as e:
+        return {"status": "error", "detail": str(e)}
+
+
+# --- Notification Channels ---
+
+
+@router.get("/notifications")
+async def list_notification_channels(user: CurrentUser, db: DB):
+    rows = await db.fetch(
+        "SELECT * FROM notification_channels WHERE user_id = $1 ORDER BY created_at DESC",
+        user["id"],
+    )
+    return [dict(r) for r in rows]
+
+
+@router.post("/notifications", status_code=status.HTTP_201_CREATED)
+async def create_notification_channel(body: NotificationChannelInput, user: CurrentUser, db: DB):
+    import json
+
+    row = await db.fetchrow(
+        """
+        INSERT INTO notification_channels
+            (user_id, channel_type, display_name, config_json, notify_on)
+        VALUES ($1, $2, $3, $4::jsonb, $5)
+        RETURNING *
+        """,
+        user["id"],
+        body.channel_type,
+        body.display_name,
+        json.dumps(body.config_json),
+        body.notify_on,
+    )
+    return dict(row)
+
+
+@router.delete("/notifications/{channel_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_notification_channel(channel_id: str, user: CurrentUser, db: DB):
+    existing = await db.fetchrow(
+        "SELECT user_id FROM notification_channels WHERE id = $1", channel_id
+    )
+    if not existing or str(existing["user_id"]) != str(user["id"]):
+        raise HTTPException(status_code=404)
+    await db.execute("DELETE FROM notification_channels WHERE id = $1", channel_id)

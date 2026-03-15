@@ -1,0 +1,128 @@
+"""Pydantic schemas for structured agent output validation.
+
+Each agent role defines the fields it MUST produce. The ``raw_content`` field
+preserves the full LLM response text for deliverables / display. The structured
+fields are what downstream logic (review loops, merge decisions, reports) relies on.
+"""
+
+from __future__ import annotations
+
+from typing import Literal
+
+from pydantic import BaseModel, Field
+
+
+# ── Base ────────────────────────────────────────────────────────────
+
+
+class BaseAgentOutput(BaseModel):
+    """Every agent output carries the full LLM text (auto-injected by the
+    validator, *not* produced by the agent itself)."""
+
+    raw_content: str = Field(
+        default="",
+        description="Full LLM response text, preserved for deliverables",
+    )
+
+
+# ── Coder ───────────────────────────────────────────────────────────
+
+
+class CoderOutput(BaseAgentOutput):
+    approach: str = Field(description="Implementation approach taken")
+    files_changed: list[str] = Field(
+        default_factory=list,
+        description="File paths created or modified",
+    )
+    setup_steps: list[str] = Field(
+        default_factory=list,
+        description="Setup/migration/config steps needed",
+    )
+
+
+# ── Tester ──────────────────────────────────────────────────────────
+
+
+class TesterOutput(BaseAgentOutput):
+    test_files: list[str] = Field(
+        default_factory=list,
+        description="Test file paths created",
+    )
+    test_summary: str = Field(description="What tests cover")
+    bug_reproduced_before_fix: bool = Field(
+        default=False,
+        description="Bug reproduced before fix",
+    )
+    bug_resolved_after_fix: bool = Field(
+        default=False,
+        description="Bug resolved after fix",
+    )
+
+
+# ── Reviewer ────────────────────────────────────────────────────────
+
+
+class ReviewIssue(BaseModel):
+    severity: Literal["critical", "major", "minor", "nit"] = Field(
+        description="Issue severity",
+    )
+    description: str = Field(description="What the issue is")
+    suggestion: str = Field(default="", description="How to fix it")
+
+
+class ReviewerOutput(BaseAgentOutput):
+    verdict: Literal["approved", "needs_changes"] = Field(
+        description="Review verdict",
+    )
+    approved: bool = Field(description="True if code is acceptable")
+    matches_plan: bool = Field(
+        default=True,
+        description="Implementation matches planned approach",
+    )
+    issues: list[ReviewIssue] = Field(default_factory=list)
+    summary: str = Field(description="Brief overall assessment")
+    needs_human_review: bool = Field(
+        default=False,
+        description="True only when uncertain",
+    )
+
+
+# ── PR Creator ──────────────────────────────────────────────────────
+
+
+class PRCreatorOutput(BaseAgentOutput):
+    pr_title: str = Field(description="PR title")
+    pr_body: str = Field(description="PR description in markdown")
+    breaking_changes: list[str] = Field(default_factory=list)
+
+
+# ── Report Writer ───────────────────────────────────────────────────
+
+
+class ReportWriterOutput(BaseAgentOutput):
+    title: str = Field(description="Report title")
+    executive_summary: str = Field(description="1-3 sentence summary")
+    report_body: str = Field(description="Full report in markdown")
+
+
+# ── Merge Agent ─────────────────────────────────────────────────────
+
+
+class MergeAgentOutput(BaseAgentOutput):
+    merge_decision: Literal["merge", "block", "skip"] = Field(
+        description="Merge decision",
+    )
+    reason: str = Field(description="Why this decision was made")
+    ci_passed: bool = Field(default=False)
+
+
+# ── Registry ────────────────────────────────────────────────────────
+
+ROLE_OUTPUT_SCHEMAS: dict[str, type[BaseAgentOutput]] = {
+    "coder": CoderOutput,
+    "tester": TesterOutput,
+    "reviewer": ReviewerOutput,
+    "pr_creator": PRCreatorOutput,
+    "report_writer": ReportWriterOutput,
+    "merge_agent": MergeAgentOutput,
+}

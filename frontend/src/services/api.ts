@@ -1,0 +1,329 @@
+import type {
+  Project, TodoItem, ChatMessage, Deliverable, AgentRun,
+  ProviderConfig, GitProviderConfig, Skill, McpServer,
+  NotificationChannel, AgentConfig, DefaultAgentInfo, AvailableTool,
+  ChatSession, ProjectEnablement, AgentChatMessage, ProjectChatMessage,
+  ProjectCreatePayload, ProjectUpdatePayload,
+  TodoCreatePayload, TodoUpdatePayload,
+  ProviderCreatePayload, ProviderUpdatePayload,
+  GitProviderPayload, SkillPayload, McpServerPayload,
+  NotificationChannelPayload, AgentCreatePayload, AgentUpdatePayload,
+  ProjectMember,
+} from '../types'
+
+const API_BASE = '/api'
+
+function getToken(): string | null {
+  return localStorage.getItem('token')
+}
+
+async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
+  const token = getToken()
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+    ...(options.headers as Record<string, string> || {}),
+  }
+  if (token) {
+    headers['Authorization'] = `Bearer ${token}`
+  }
+
+  const response = await fetch(`${API_BASE}${path}`, {
+    ...options,
+    headers,
+  })
+
+  if (response.status === 401) {
+    localStorage.removeItem('token')
+    window.location.href = '/login'
+    throw new Error('Unauthorized')
+  }
+
+  if (!response.ok) {
+    const error = await response.json().catch(() => ({ detail: 'Request failed' }))
+    throw new Error(error.detail || `HTTP ${response.status}`)
+  }
+
+  if (response.status === 204) return undefined as T
+  return response.json()
+}
+
+// Auth
+export const auth = {
+  login: (email: string, password: string) =>
+    request<{ access_token: string }>('/auth/login', {
+      method: 'POST',
+      body: JSON.stringify({ email, password }),
+    }),
+  register: (email: string, display_name: string, password: string) =>
+    request<{ access_token: string }>('/auth/register', {
+      method: 'POST',
+      body: JSON.stringify({ email, display_name, password }),
+    }),
+  me: () => request<{ id: string; email: string; display_name: string; role: string }>('/auth/me'),
+}
+
+// Projects
+export const projects = {
+  list: () => request<Project[]>('/projects'),
+  create: (data: ProjectCreatePayload) =>
+    request<Project>('/projects', { method: 'POST', body: JSON.stringify(data) }),
+  get: (id: string) => request<Project>(`/projects/${id}`),
+  update: (id: string, data: ProjectUpdatePayload) =>
+    request<Project>(`/projects/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
+  delete: (id: string) => request<void>(`/projects/${id}`, { method: 'DELETE' }),
+  analyze: (id: string) => request<{ status: string }>(`/projects/${id}/analyze`, { method: 'POST' }),
+  rules: {
+    get: (projectId: string) =>
+      request<Record<string, string[]>>(`/projects/${projectId}/rules`),
+    update: (projectId: string, rules: Record<string, string[]>) =>
+      request<Record<string, string[]>>(`/projects/${projectId}/rules`, {
+        method: 'PUT',
+        body: JSON.stringify(rules),
+      }),
+  },
+  members: {
+    list: (projectId: string) =>
+      request<{ owner: ProjectMember; members: ProjectMember[] }>(
+        `/projects/${projectId}/members`
+      ),
+    add: (projectId: string, email: string) =>
+      request<ProjectMember>(
+        `/projects/${projectId}/members`,
+        { method: 'POST', body: JSON.stringify({ email }) },
+      ),
+    remove: (projectId: string, userId: string) =>
+      request<void>(`/projects/${projectId}/members/${userId}`, { method: 'DELETE' }),
+  },
+}
+
+// Todos
+export const todos = {
+  list: (projectId: string, params?: { state?: string; priority?: string }) => {
+    const search = new URLSearchParams()
+    if (params?.state) search.set('state', params.state)
+    if (params?.priority) search.set('priority', params.priority)
+    const qs = search.toString()
+    return request<TodoItem[]>(`/projects/${projectId}/todos${qs ? `?${qs}` : ''}`)
+  },
+  create: (projectId: string, data: TodoCreatePayload) =>
+    request<TodoItem>(`/projects/${projectId}/todos`, { method: 'POST', body: JSON.stringify(data) }),
+  get: (id: string) => request<TodoItem>(`/todos/${id}`),
+  update: (id: string, data: TodoUpdatePayload) =>
+    request<TodoItem>(`/todos/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
+  cancel: (id: string) => request<TodoItem>(`/todos/${id}/cancel`, { method: 'POST' }),
+  retry: (id: string, withContext?: boolean) =>
+    request<TodoItem>(`/todos/${id}/retry`, {
+      method: 'POST',
+      body: JSON.stringify({ with_context: withContext ?? false }),
+    }),
+  acceptDeliverables: (id: string) =>
+    request<TodoItem>(`/todos/${id}/accept-deliverables`, { method: 'POST' }),
+  requestChanges: (id: string, feedback: string) =>
+    request<TodoItem>(`/todos/${id}/request-changes`, {
+      method: 'POST',
+      body: JSON.stringify({ feedback }),
+    }),
+  approvePlan: (id: string) =>
+    request<TodoItem>(`/todos/${id}/approve-plan`, { method: 'POST' }),
+  rejectPlan: (id: string, feedback: string) =>
+    request<TodoItem>(`/todos/${id}/reject-plan`, {
+      method: 'POST',
+      body: JSON.stringify({ feedback }),
+    }),
+}
+
+// Chat (todo-level)
+export const chat = {
+  history: (todoId: string) => request<ChatMessage[]>(`/todos/${todoId}/chat`),
+  send: (todoId: string, content: string) =>
+    request<ChatMessage>(`/todos/${todoId}/chat`, {
+      method: 'POST',
+      body: JSON.stringify({ content }),
+    }),
+}
+
+// Project-level chat
+export const projectChat = {
+  // Legacy (no-session) endpoints
+  history: (projectId: string) => request<ProjectChatMessage[]>(`/projects/${projectId}/chat`),
+  send: (projectId: string, content: string, intent?: string) =>
+    request<{
+      user_message: ProjectChatMessage
+      assistant_message: ProjectChatMessage
+    }>(`/projects/${projectId}/chat`, {
+      method: 'POST',
+      body: JSON.stringify({ content, intent }),
+    }),
+  clear: (projectId: string) =>
+    request<{ status: string }>(`/projects/${projectId}/chat`, { method: 'DELETE' }),
+  deleteMessage: (projectId: string, messageId: string) =>
+    request<{ status: string }>(`/projects/${projectId}/chat/${messageId}`, { method: 'DELETE' }),
+
+  // Session endpoints
+  sessions: {
+    list: (projectId: string) =>
+      request<ChatSession[]>(`/projects/${projectId}/chat/sessions`),
+    create: (projectId: string, data: { title?: string; mode?: 'chat' | 'plan' }) =>
+      request<ChatSession>(`/projects/${projectId}/chat/sessions`, {
+        method: 'POST',
+        body: JSON.stringify(data),
+      }),
+    togglePlanMode: (projectId: string, sessionId: string) =>
+      request<{ plan_mode: boolean }>(
+        `/projects/${projectId}/chat/sessions/${sessionId}/toggle-plan`,
+        { method: 'POST' },
+      ),
+    get: (projectId: string, sessionId: string) =>
+      request<ChatSession & { messages: ProjectChatMessage[] }>(`/projects/${projectId}/chat/sessions/${sessionId}`),
+    update: (projectId: string, sessionId: string, data: { title: string }) =>
+      request<ChatSession>(`/projects/${projectId}/chat/sessions/${sessionId}`, {
+        method: 'PUT',
+        body: JSON.stringify(data),
+      }),
+    delete: (projectId: string, sessionId: string) =>
+      request<void>(`/projects/${projectId}/chat/sessions/${sessionId}`, { method: 'DELETE' }),
+  },
+  sendInSession: (projectId: string, sessionId: string, content: string, intent?: string) =>
+    request<{ user_message: ProjectChatMessage; assistant_message: ProjectChatMessage }>(
+      `/projects/${projectId}/chat/sessions/${sessionId}/messages`,
+      { method: 'POST', body: JSON.stringify({ content, intent }) },
+    ),
+  deleteSessionMessage: (projectId: string, sessionId: string, messageId: string) =>
+    request<{ status: string }>(
+      `/projects/${projectId}/chat/sessions/${sessionId}/messages/${messageId}`,
+      { method: 'DELETE' },
+    ),
+}
+
+// Deliverables
+export const deliverables = {
+  list: (todoId: string) => request<Deliverable[]>(`/todos/${todoId}/deliverables`),
+  get: (id: string) => request<Deliverable>(`/deliverables/${id}`),
+  getDiff: (id: string) =>
+    request<{ diff: string; stats: string; files: Array<{ status: string; path: string }> }>(
+      `/deliverables/${id}/diff`
+    ),
+}
+
+// Agent runs
+export const agentRuns = {
+  list: (todoId: string) => request<AgentRun[]>(`/todos/${todoId}/runs`),
+}
+
+// Providers
+export const providers = {
+  list: () => request<ProviderConfig[]>('/providers'),
+  create: (data: ProviderCreatePayload) =>
+    request<ProviderConfig>('/providers', { method: 'POST', body: JSON.stringify(data) }),
+  update: (id: string, data: ProviderUpdatePayload) =>
+    request<ProviderConfig>(`/providers/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
+  delete: (id: string) => request<void>(`/providers/${id}`, { method: 'DELETE' }),
+  test: (id: string) => request<{ status: string; detail?: string }>(`/providers/${id}/test`, { method: 'POST' }),
+}
+
+// Git Providers
+export const gitProviders = {
+  list: () => request<GitProviderConfig[]>('/config/git-providers'),
+  create: (data: GitProviderPayload) =>
+    request<GitProviderConfig>('/config/git-providers', { method: 'POST', body: JSON.stringify(data) }),
+  update: (id: string, data: Partial<GitProviderPayload>) =>
+    request<GitProviderConfig>(`/config/git-providers/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
+  delete: (id: string) => request<void>(`/config/git-providers/${id}`, { method: 'DELETE' }),
+}
+
+// Skills
+export const skills = {
+  list: () => request<Skill[]>('/config/skills'),
+  create: (data: SkillPayload) =>
+    request<Skill>('/config/skills', { method: 'POST', body: JSON.stringify(data) }),
+  update: (id: string, data: Partial<SkillPayload>) =>
+    request<Skill>(`/config/skills/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
+  delete: (id: string) => request<void>(`/config/skills/${id}`, { method: 'DELETE' }),
+}
+
+// MCP Servers
+export const mcpServers = {
+  list: () => request<McpServer[]>('/config/mcp-servers'),
+  create: (data: McpServerPayload) =>
+    request<McpServer>('/config/mcp-servers', { method: 'POST', body: JSON.stringify(data) }),
+  update: (id: string, data: Partial<McpServerPayload>) =>
+    request<McpServer>(`/config/mcp-servers/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
+  delete: (id: string) => request<void>(`/config/mcp-servers/${id}`, { method: 'DELETE' }),
+  discoverTools: (id: string) =>
+    request<{ status: string; detail?: string; tools: { name: string; description: string }[] }>(
+      `/config/mcp-servers/${id}/discover-tools`, { method: 'POST' }
+    ),
+}
+
+// Project enablement
+export const projectConfig = {
+  getEnablement: (projectId: string) =>
+    request<ProjectEnablement>(`/config/projects/${projectId}/enabled`),
+  updateEnablement: (projectId: string, data: ProjectEnablement) =>
+    request<ProjectEnablement>(`/config/projects/${projectId}/enabled`, { method: 'PUT', body: JSON.stringify(data) }),
+}
+
+// Agents
+export const agents = {
+  list: () =>
+    request<{
+      defaults: DefaultAgentInfo[]
+      overrides: Record<string, AgentConfig>
+      custom: AgentConfig[]
+    }>('/config/agents'),
+  listTools: () =>
+    request<{
+      builtin: AvailableTool[]
+      mcp: AvailableTool[]
+    }>('/config/agents/tools'),
+  create: (data: AgentCreatePayload) =>
+    request<AgentConfig>('/config/agents', { method: 'POST', body: JSON.stringify(data) }),
+  createOverride: (role: string, data: AgentUpdatePayload) =>
+    request<AgentConfig>(`/config/agents/defaults/${role}/override`, {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+  update: (id: string, data: AgentUpdatePayload) =>
+    request<AgentConfig>(`/config/agents/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
+  delete: (id: string) =>
+    request<void>(`/config/agents/${id}`, { method: 'DELETE' }),
+  chatHistory: () =>
+    request<AgentChatMessage[]>('/config/agents/chat'),
+  chatSend: (content: string) =>
+    request<{ user_message: AgentChatMessage; assistant_message: AgentChatMessage }>('/config/agents/chat', {
+      method: 'POST',
+      body: JSON.stringify({ content }),
+    }),
+  chatClear: () =>
+    request<{ status: string }>('/config/agents/chat', { method: 'DELETE' }),
+}
+
+// Notifications
+export const notifications = {
+  list: () => request<NotificationChannel[]>('/notifications/channels'),
+  create: (data: NotificationChannelPayload) =>
+    request<NotificationChannel>('/notifications/channels', { method: 'POST', body: JSON.stringify(data) }),
+  update: (id: string, data: Partial<NotificationChannelPayload> & { is_active?: boolean }) =>
+    request<NotificationChannel>(`/notifications/channels/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
+  delete: (id: string) => request<void>(`/notifications/channels/${id}`, { method: 'DELETE' }),
+  test: (id: string) => request<{ status: string; detail?: string }>(`/notifications/channels/${id}/test`, { method: 'POST' }),
+}
+
+// Admin
+export const admin = {
+  todos: (state?: string) => {
+    const qs = state ? `?state=${state}` : ''
+    return request<TodoItem[]>(`/admin/todos${qs}`)
+  },
+  users: () => request<{ id: string; email: string; display_name: string; role: string; created_at: string }[]>('/admin/users'),
+  updateUserRole: (userId: string, role: string) =>
+    request<{ id: string; email: string; display_name: string; role: string }>(
+      `/admin/users/${userId}/role`,
+      { method: 'PUT', body: JSON.stringify({ role }) },
+    ),
+  stats: () => request<Record<string, number>>('/admin/stats'),
+  auditLog: (limit = 100) => request<Record<string, unknown>[]>(`/admin/audit-log?limit=${limit}`),
+  getSetting: (key: string) => request<Record<string, unknown>>(`/admin/settings/${key}`),
+  putSetting: (key: string, value: Record<string, string>) =>
+    request<Record<string, unknown>>(`/admin/settings/${key}`, { method: 'PUT', body: JSON.stringify({ value_json: value }) }),
+}
