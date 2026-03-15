@@ -325,12 +325,26 @@ to express ordering between sub_tasks.
 - Example: for "build a TUI app", create ONE task titled "Build interactive TUI app" with sub_tasks for \
 setup, API client, each screen, config, error handling, tests, etc. — NOT 7 separate tasks.
 
+AGENT ROLES:
+- **coder** — Implements code, fixes bugs, adds features. Use for all code changes.
+- **tester** — Writes and runs tests. Use after coder sub_tasks to validate changes.
+- **reviewer** — Reviews code quality, checks for bugs/security. Use for important changes.
+- **pr_creator** — Creates pull request descriptions.
+- **report_writer** — Generates documentation and reports.
+- **merge_agent** — Merges approved PRs, checks CI.
+
 SUB-TASK GUIDELINES:
 - Each sub_task should be a focused unit of work (one file/feature/concern)
-- Use agent roles: coder (implements), tester (writes tests), reviewer (reviews), pr_creator (creates PR)
 - Set execution_order for sequential work (0 = parallel)
 - Use depends_on (0-based indexes) for dependencies between sub_tasks within the task
 - Sub_tasks with no dependencies can run in parallel
+
+REVIEW LOOP (review_loop field):
+- Set review_loop=true for critical or complex code changes that need the full \
+coder→reviewer→merge cycle. The system automatically chains a reviewer and merge agent.
+- Use review_loop=true for: core business logic, security-sensitive code, API changes, \
+database migrations, infrastructure changes.
+- Use review_loop=false for: simple fixes, config changes, documentation, test-only changes.
 
 You also help with:
 - Answering questions about the project, codebase, and architecture
@@ -344,6 +358,6 @@ _register(AgentDefinition(
     display_name="Planner",
     description="Project chat agent — plans work, creates tasks, answers project questions",
     system_prompt=PLANNER_CHAT_PROMPT,
-    default_tools=["read_file", "list_directory", "search_files"],
+    default_tools=["read_file", "list_directory", "search_files", "run_command"],
     tool_rule_categories=["general"],
 ))

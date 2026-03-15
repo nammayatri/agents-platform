@@ -34,6 +34,9 @@ class Settings(BaseSettings):
     # Admin seed — first user with this email gets promoted to admin on startup
     admin_seed_email: str = ""
 
+    # CORS
+    cors_origins: str = "http://localhost:5173"  # comma-separated
+
     # Logging
     log_level: str = "INFO"
 

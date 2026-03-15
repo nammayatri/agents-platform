@@ -23,39 +23,48 @@ async def _init_connection(conn: asyncpg.Connection) -> None:
 
 
 async def _run_migrations(pool: asyncpg.Pool) -> None:
-    """Auto-apply any SQL migrations that haven't been run yet."""
+    """Auto-apply any SQL migrations that haven't been run yet.
+
+    Uses pg_advisory_lock to ensure only one pod runs migrations at a time
+    in a multi-replica deployment.
+    """
     async with pool.acquire() as conn:
-        # Ensure tracking table exists
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS _migrations (
-                filename TEXT PRIMARY KEY,
-                applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            )
-        """)
-
-        # Get already-applied migrations
-        rows = await conn.fetch("SELECT filename FROM _migrations")
-        applied = {r["filename"] for r in rows}
-
-        # Discover and sort migration files
-        if not MIGRATIONS_DIR.is_dir():
-            return
-        sql_files = sorted(MIGRATIONS_DIR.glob("*.sql"))
-
-        for sql_file in sql_files:
-            if sql_file.name in applied:
-                continue
-            sql = sql_file.read_text()
-            try:
-                await conn.execute(sql)
-                await conn.execute(
-                    "INSERT INTO _migrations (filename) VALUES ($1)",
-                    sql_file.name,
+        # Acquire cluster-wide advisory lock (only one pod runs migrations)
+        await conn.execute("SELECT pg_advisory_lock(42)")
+        try:
+            # Ensure tracking table exists
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS _migrations (
+                    filename TEXT PRIMARY KEY,
+                    applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 )
-                logger.info("Applied migration: %s", sql_file.name)
-            except Exception:
-                logger.exception("Migration failed: %s", sql_file.name)
-                raise
+            """)
+
+            # Get already-applied migrations
+            rows = await conn.fetch("SELECT filename FROM _migrations")
+            applied = {r["filename"] for r in rows}
+
+            # Discover and sort migration files
+            if not MIGRATIONS_DIR.is_dir():
+                return
+            sql_files = sorted(MIGRATIONS_DIR.glob("*.sql"))
+
+            for sql_file in sql_files:
+                if sql_file.name in applied:
+                    continue
+                sql = sql_file.read_text()
+                try:
+                    await conn.execute(sql)
+                    await conn.execute(
+                        "INSERT INTO _migrations (filename) VALUES ($1)",
+                        sql_file.name,
+                    )
+                    logger.info("Applied migration: %s", sql_file.name)
+                except Exception:
+                    logger.exception("Migration failed: %s", sql_file.name)
+                    raise
+        finally:
+            await conn.execute("SELECT pg_advisory_unlock(42)")
 
 
 async def init_db() -> asyncpg.Pool:

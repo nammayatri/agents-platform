@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useRef, useState, useCallback } from 'react'
 import { useTodoStore } from '../stores/todoStore'
 import type { WSEvent, ChatMessage } from '../types'
 
@@ -6,6 +6,16 @@ export function useTaskWebSocket(todoId: string | null) {
   const ws = useRef<WebSocket | null>(null)
   const [reconnectCount, setReconnectCount] = useState(0)
   const { updateTodoState, appendChatMessage, updateSubTaskProgress, appendActivity, fetchTodo } = useTodoStore()
+  const fetchDebounce = useRef<ReturnType<typeof setTimeout> | null>(null)
+
+  // Debounced fetchTodo to avoid hammering API on rapid subtask transitions
+  const debouncedFetchTodo = useCallback((id: string) => {
+    if (fetchDebounce.current) clearTimeout(fetchDebounce.current)
+    fetchDebounce.current = setTimeout(() => {
+      fetchTodo(id)
+      fetchDebounce.current = null
+    }, 500)
+  }, [fetchTodo])
 
   useEffect(() => {
     if (!todoId) return
@@ -25,6 +35,11 @@ export function useTaskWebSocket(todoId: string | null) {
               // Refetch full todo to get updated sub-tasks
               fetchTodo(todoId)
             }
+            break
+
+          case 'subtask_update':
+            // Subtask status changed — debounced refetch to get updated sub-tasks
+            debouncedFetchTodo(todoId)
             break
 
           case 'chat_message':
@@ -74,6 +89,7 @@ export function useTaskWebSocket(todoId: string | null) {
     return () => {
       ws.current?.close()
       ws.current = null
+      if (fetchDebounce.current) clearTimeout(fetchDebounce.current)
     }
-  }, [todoId, reconnectCount, updateTodoState, appendChatMessage, updateSubTaskProgress, appendActivity, fetchTodo])
+  }, [todoId, reconnectCount, updateTodoState, appendChatMessage, updateSubTaskProgress, appendActivity, fetchTodo, debouncedFetchTodo])
 }

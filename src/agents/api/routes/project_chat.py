@@ -496,10 +496,13 @@ You ALSO have workspace tools to explore the codebase — USE THEM to research b
 - **read_file** — Read a file's contents (path relative to repo root)
 - **list_directory** — List files and directories (path relative to repo root, empty for root)
 - **search_files** — Search for a text pattern across files (grep)
+- **run_command** — Run a shell command in the repo root. Use for git, gh (GitHub CLI), builds, tests, etc.
+  Examples: `git log --oneline -10`, `git status`, `gh issue list`, `gh pr list`, `gh pr view 42`
 
 IMPORTANT: Always explore the codebase with these tools before creating tasks. \
 Read relevant files, understand the existing code structure, and then plan accordingly. \
-Do NOT guess or assume what the codebase looks like — read it first."""
+Do NOT guess or assume what the codebase looks like — read it first. \
+Use run_command with git/gh to check repo status, open PRs, issues, and branches."""
     else:
         tools_doc += "\n\nNote: No workspace is configured for this project, so codebase exploration tools are not available."
 
@@ -837,6 +840,7 @@ async def _create_tasks_from_plan(
                         "agent_role": st.get("agent_role", "coder"),
                         "execution_order": i if not st.get("parallel") else 0,
                         "depends_on": st.get("depends_on", []),
+                        "review_loop": bool(st.get("review_loop", False)),
                     }
                     for i, st in enumerate(subtasks)
                 ],
@@ -870,13 +874,14 @@ async def _create_tasks_from_plan(
             # Insert sub_tasks into the sub_tasks table
             sub_task_ids = []
             for i, st in enumerate(plan_json["sub_tasks"]):
+                review_loop = bool(st.get("review_loop", False))
                 row = await db.fetchrow(
                     """
                     INSERT INTO sub_tasks (
                         todo_id, title, description, agent_role,
-                        execution_order, input_context
+                        execution_order, input_context, review_loop
                     )
-                    VALUES ($1, $2, $3, $4, $5, '{}'::jsonb)
+                    VALUES ($1, $2, $3, $4, $5, '{}'::jsonb, $6)
                     RETURNING id
                     """,
                     todo_id,
@@ -884,8 +889,16 @@ async def _create_tasks_from_plan(
                     st.get("description", ""),
                     st["agent_role"],
                     st.get("execution_order", 0),
+                    review_loop,
                 )
                 sub_task_ids.append(str(row["id"]))
+
+                # For review_loop sub-tasks, set review_chain_id to themselves (chain root)
+                if review_loop:
+                    await db.execute(
+                        "UPDATE sub_tasks SET review_chain_id = $1 WHERE id = $1",
+                        row["id"],
+                    )
 
             # Set up depends_on using index→UUID mapping
             for i, st in enumerate(plan_json["sub_tasks"]):

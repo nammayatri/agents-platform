@@ -51,6 +51,7 @@ class EventDrivenOrchestrator:
     async def run_forever(self) -> None:
         """Main entry point. Runs event consumer + health check concurrently."""
         await self.event_bus.ensure_consumer_group()
+        await self._recover_orphaned_tasks()
         logger.info(
             "EventDrivenOrchestrator %s starting (max_concurrent=%d, health_check=%ds)",
             self.worker_id, self.max_concurrent, self.health_check_interval,
@@ -78,15 +79,46 @@ class EventDrivenOrchestrator:
             event_loop.cancel()
             health_loop.cancel()
 
-        # Graceful shutdown: wait for active tasks
+        # Graceful shutdown: drain active tasks before force-cancelling
         if self.active_tasks:
-            logger.info("Shutting down: waiting for %d active tasks", len(self.active_tasks))
-            for task in self.active_tasks.values():
-                task.cancel()
-            await asyncio.gather(*self.active_tasks.values(), return_exceptions=True)
+            logger.info("Draining %d active tasks (30s grace)...", len(self.active_tasks))
+            _, still_running = await asyncio.wait(
+                self.active_tasks.values(), timeout=30,
+            )
+            if still_running:
+                logger.warning("Force-cancelling %d tasks", len(still_running))
+                for task in still_running:
+                    task.cancel()
+                await asyncio.gather(*still_running, return_exceptions=True)
 
         await self.notifier.close()
         logger.info("EventDrivenOrchestrator %s stopped", self.worker_id)
+
+    # ── Startup Recovery ────────────────────────────────────────────
+
+    async def _recover_orphaned_tasks(self) -> None:
+        """On startup, reset sub-tasks left in running/assigned by dead workers.
+
+        Targets sub-tasks whose parent todo is in_progress but has no valid
+        (non-expired) lock — meaning the previous worker died.
+        """
+        try:
+            result = await self.db.execute("""
+                UPDATE sub_tasks SET status = 'pending', progress_pct = 0,
+                       progress_message = 'Reset after worker restart'
+                WHERE status IN ('assigned', 'running')
+                  AND todo_id IN (
+                      SELECT id FROM todo_items
+                      WHERE state = 'in_progress'
+                        AND id NOT IN (
+                            SELECT todo_id FROM orchestrator_locks
+                            WHERE expires_at > NOW()
+                        )
+                  )
+            """)
+            logger.info("Orphan recovery: %s", result)
+        except Exception:
+            logger.warning("Orphan recovery failed", exc_info=True)
 
     # ── Event Consumer Loop ──────────────────────────────────────────
 
@@ -223,6 +255,7 @@ class EventDrivenOrchestrator:
                 result = await transition_todo(
                     self.db, todo_id, "intake",
                     event_bus=self.event_bus,
+                    redis=self.redis,
                 )
                 if result:
                     logger.info("Scheduled task %s activated (was due)", todo_id[:8])
@@ -302,6 +335,7 @@ class EventDrivenOrchestrator:
             try:
                 await transition_todo(
                     self.db, todo_id, "failed", error_message=str(e),
+                    redis=self.redis,
                 )
                 todo_data = await self.db.fetchrow(
                     "SELECT title, creator_id FROM todo_items WHERE id = $1", todo_id,

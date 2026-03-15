@@ -23,8 +23,8 @@ from agents.infra.notifier import Notifier
 from agents.orchestrator.workspace import WorkspaceManager
 from agents.orchestrator.state_machine import (
     check_all_subtasks_done,
-    transition_subtask,
-    transition_todo,
+    transition_subtask as _transition_subtask,
+    transition_todo as _transition_todo,
 )
 from agents.providers.base import AIProvider
 from agents.providers.mcp_executor import McpToolExecutor
@@ -65,15 +65,63 @@ or
 """
 
 PLANNER_SYSTEM_PROMPT = """\
-You are a task planner. Decompose the task into sub-tasks for specialist agents.
+You are a senior project planner. Your job is to explore the codebase, understand the \
+existing architecture, and decompose the task into well-structured sub-tasks for specialist agents.
 
-Sub-task fields: title, description, agent_role, execution_order (0=parallel), \
-depends_on (0-based indexes), review_loop (true for code changes needing coder→reviewer→merge cycle), \
-target_repo (optional: {"repo_url":"...", "name":"...", "default_branch":"main", "git_provider_id":null}).
+## Workflow
+1. FIRST, use the workspace tools (read_file, list_directory, search_files, run_command) \
+to explore the codebase. Understand the project structure, relevant files, existing patterns, \
+and conventions BEFORE creating a plan.
+2. Read relevant source files to understand what already exists and what needs to change.
+3. Only AFTER exploring, output your execution plan as a JSON object.
 
-Maximize parallelism. Output ONLY JSON:
+## Planning Rules
+
+CRITICAL — ONE TASK, MANY SUB-TASKS:
+- Decompose the work into focused sub-tasks. Each sub-task should be one unit of work \
+(one file, one feature, one concern).
+- Use depends_on (0-based sub-task indexes) to express ordering between sub-tasks.
+- Maximize parallelism: sub-tasks with no dependencies run concurrently.
+
+AGENT ROLES:
+- **coder** — Implements code, fixes bugs, adds features. Use for all code changes.
+- **tester** — Writes and runs tests. Use after coder sub-tasks to validate changes.
+- **reviewer** — Reviews code quality, checks for bugs/security. Use for important changes.
+- **pr_creator** — Creates pull request descriptions.
+- **report_writer** — Generates documentation and reports.
+- **merge_agent** — Merges approved PRs, checks CI.
+
+REVIEW LOOP (review_loop field):
+- Set review_loop=true for critical or complex code changes that need the full \
+coder→reviewer→merge cycle. The system will automatically chain a reviewer and merge \
+agent after the coder completes.
+- Use review_loop=true for: core business logic, security-sensitive code, API changes, \
+database migrations, infrastructure changes.
+- Use review_loop=false for: simple fixes, config changes, documentation, test-only changes, \
+straightforward additions.
+
+SUB-TASK DESCRIPTIONS:
+- Be specific and detailed. Include which files to modify, what patterns to follow, \
+and what the expected outcome is.
+- Reference actual file paths and code patterns you discovered during exploration.
+- Include relevant context from your codebase exploration so the agent doesn't need to \
+re-discover everything.
+
+## Output Format
+
+After exploring the codebase, output ONLY a JSON object (no markdown fences, no extra text):
 {"summary":"...", "sub_tasks":[{"title":"...", "description":"...", "agent_role":"...", \
 "execution_order":0, "depends_on":[], "review_loop":false, "target_repo":null}], "estimated_tokens":5000}
+
+Sub-task fields:
+- title: short descriptive title
+- description: detailed instructions for the agent
+- agent_role: one of the roles above
+- execution_order: 0 for parallel, sequential number for ordered execution
+- depends_on: list of 0-based indexes of sub-tasks this depends on
+- review_loop: true for critical code changes needing coder→reviewer→merge cycle
+- target_repo: null unless working on a different repo \
+(format: {"repo_url":"...", "name":"...", "default_branch":"main", "git_provider_id":null})
 """
 
 REVIEW_SYSTEM_PROMPT = """\
@@ -101,6 +149,18 @@ class AgentCoordinator:
         self.workspace_mgr = WorkspaceManager(db, settings.workspace_root)
         self.tools_registry = ToolsRegistry(db)
         self.mcp_executor = McpToolExecutor(db)
+
+    async def _transition_todo(self, target_state: str, **kwargs) -> dict | None:
+        """Wrapper that auto-passes db, todo_id, and redis for WS publishing."""
+        return await _transition_todo(
+            self.db, self.todo_id, target_state, redis=self.redis, **kwargs,
+        )
+
+    async def _transition_subtask(self, subtask_id: str, target_status: str, **kwargs) -> dict | None:
+        """Wrapper that auto-passes db and redis for WS publishing."""
+        return await _transition_subtask(
+            self.db, subtask_id, target_status, redis=self.redis, **kwargs,
+        )
 
     async def _resolve_agent_config(self, role: str, owner_id: str) -> dict | None:
         """Look up a custom agent_config for the given role.
@@ -206,7 +266,7 @@ class AgentCoordinator:
                 f"**Requirements:** {json.dumps(result.get('requirements', {}), indent=2)}\n\n"
                 f"**Approach:** {result.get('approach', 'Auto-determined')}"
             )
-            await transition_todo(self.db, self.todo_id, "planning", sub_state="decomposing")
+            await self._transition_todo( "planning", sub_state="decomposing")
             # Immediately continue to planning
             todo = await self._load_todo()
             await self._phase_planning(todo, provider)
@@ -228,9 +288,9 @@ class AgentCoordinator:
     # ---- PLANNING PHASE ----
 
     async def _phase_planning(self, todo: dict, provider: AIProvider) -> None:
-        """Decompose task into sub-tasks and park for human approval."""
+        """Explore codebase with tools, then decompose task into sub-tasks."""
         if todo["state"] != "planning":
-            await transition_todo(self.db, self.todo_id, "planning", sub_state="decomposing")
+            await self._transition_todo( "planning", sub_state="decomposing")
         else:
             await self.db.execute(
                 "UPDATE todo_items SET sub_state = 'decomposing', updated_at = NOW() WHERE id = $1",
@@ -253,28 +313,125 @@ class AgentCoordinator:
 
         planner_prompt = PLANNER_SYSTEM_PROMPT + f"\n\nAvailable agent roles: {available_roles}\n"
 
+        # Resolve workspace for codebase exploration
+        workspace_path = None
+        try:
+            project = await self.db.fetchrow(
+                "SELECT repo_url, workspace_path FROM projects WHERE id = $1",
+                todo["project_id"],
+            )
+            if project and project.get("repo_url"):
+                workspace_path = await self.workspace_mgr.setup_task_workspace(self.todo_id)
+                logger.info("[%s] Planner workspace ready at %s", self.todo_id, workspace_path)
+        except Exception:
+            logger.warning("[%s] Could not set up planner workspace", self.todo_id, exc_info=True)
+
+        # Add workspace context and tool instructions to system prompt
+        if workspace_path:
+            file_tree = self.workspace_mgr.get_file_tree(workspace_path, max_depth=3)
+            planner_prompt += (
+                f"\n\nProject file structure:\n{file_tree}\n\n"
+                "You MUST explore the codebase using the tools before outputting your plan. "
+                "Read relevant files, search for patterns, and understand the existing code."
+            )
+            planner_prompt += build_tools_prompt_block("planner")
+
+        # Build user message — add explicit retry/diff context if present
+        user_parts = [
+            f"Task: {todo['title']}",
+            f"Description: {todo['description'] or 'N/A'}",
+            f"Type: {todo['task_type']}",
+        ]
+
+        previous_run = intake_data.get("previous_run") if intake_data else None
+        if previous_run:
+            user_parts.append("\n## RETRY — Previous Run Context")
+            user_parts.append(f"Previous state: {previous_run.get('previous_state', 'unknown')}")
+            if previous_run.get("result_summary"):
+                user_parts.append(f"Result summary: {previous_run['result_summary']}")
+
+            prev_tasks = previous_run.get("sub_tasks", [])
+            if prev_tasks:
+                user_parts.append("\nPrevious sub-tasks:")
+                for pst in prev_tasks:
+                    status_icon = "✓" if pst["status"] == "completed" else "✗" if pst["status"] == "failed" else "○"
+                    user_parts.append(f"  {status_icon} [{pst['role']}] {pst['title']} — {pst['status']}")
+                    if pst.get("error"):
+                        user_parts.append(f"    Error: {pst['error'][:300]}")
+
+            git_diff = previous_run.get("git_diff")
+            if git_diff:
+                user_parts.append(f"\n## Existing Code Changes (git diff)\n{git_diff.get('stat', '')}")
+                if git_diff.get("files"):
+                    user_parts.append("\nChanged files:")
+                    for f in git_diff["files"]:
+                        user_parts.append(f"  {f['status']}\t{f['path']}")
+                if git_diff.get("diff"):
+                    user_parts.append(f"\nFull diff:\n```\n{git_diff['diff']}\n```")
+                user_parts.append(
+                    "\nIMPORTANT: The above code changes already exist in the workspace. "
+                    "Create sub-tasks that build on or fix these existing changes — "
+                    "do NOT start from scratch. Focus on what still needs to be done."
+                )
+
+            # Strip previous_run from intake_data to avoid duplication
+            intake_for_prompt = {k: v for k, v in intake_data.items() if k != "previous_run"}
+        else:
+            intake_for_prompt = intake_data
+
+        user_parts.append(f"\nIntake data: {json.dumps(intake_for_prompt, default=str)}")
+        user_parts.append(f"Project context: {json.dumps(context, default=str)}")
+        user_parts.append(
+            "\nExplore the codebase first, then output your execution plan as a JSON object. "
+            "The JSON must be the LAST thing you output — after all tool calls and exploration."
+        )
+
         messages = [
             LLMMessage(role="system", content=planner_prompt),
-            LLMMessage(
-                role="user",
-                content=(
-                    f"Task: {todo['title']}\n"
-                    f"Description: {todo['description'] or 'N/A'}\n"
-                    f"Type: {todo['task_type']}\n"
-                    f"Intake data: {json.dumps(intake_data, default=str)}\n"
-                    f"Project context: {json.dumps(context, default=str)}"
-                ),
-            ),
+            LLMMessage(role="user", content="\n".join(user_parts)),
         ]
+
+        # Set up workspace tools for codebase exploration during planning
+        planner_tools = None
+        if workspace_path:
+            planner_tools = self._get_builtin_tools(workspace_path, "planner")
+
+            # Also include MCP tools if configured
+            mcp_tools = await self.tools_registry.resolve_tools(
+                project_id=str(todo["project_id"]),
+                user_id=str(todo["creator_id"]),
+            )
+            if mcp_tools:
+                existing_names = {t["name"] for t in planner_tools}
+                planner_tools.extend(t for t in mcp_tools if t["name"] not in existing_names)
 
         plan = None
         max_retries = 3
         for attempt in range(max_retries):
-            response = await provider.send_message(messages, temperature=0.1)
+            if planner_tools:
+                # Use tool loop: planner explores codebase, then outputs JSON plan
+                from agents.providers.base import run_tool_loop
+
+                content, response = await run_tool_loop(
+                    provider, messages,
+                    tools=planner_tools,
+                    tool_executor=lambda name, args: self.mcp_executor.execute_tool(
+                        name, args, planner_tools,
+                    ),
+                    max_rounds=8,
+                    on_activity=lambda msg: self._report_planning_activity(msg),
+                    temperature=0.1,
+                )
+            else:
+                # No workspace — simple LLM call
+                response = await provider.send_message(messages, temperature=0.1)
+                content = response.content
             await self._track_tokens(response)
 
-            # Try parsing the response as JSON (with trailing comma fix)
-            plan = parse_llm_json(response.content)
+            # Try parsing the response as JSON (with trailing comma fix).
+            # With tool loop, content may include exploration text + JSON at the end.
+            # parse_llm_json handles extracting JSON from mixed content.
+            plan = parse_llm_json(content)
             if plan is not None:
                 logger.info(
                     "[%s] Plan parsed on attempt %d: keys=%s, sub_tasks=%d",
@@ -290,16 +447,18 @@ class AgentCoordinator:
                         )
                 else:
                     logger.warning("[%s] Plan has ZERO sub_tasks! Raw content: %.500s",
-                                   self.todo_id, response.content)
+                                   self.todo_id, content)
                 break
 
-            # Parse failed — retry with correction prompt (don't keep bad response in context)
+            # Parse failed — retry with correction prompt (no tool loop, just JSON output)
             if attempt < max_retries - 1:
                 logger.warning(
                     "Plan parse attempt %d/%d failed for todo %s, retrying",
                     attempt + 1, max_retries, self.todo_id,
                 )
                 # Replace messages with fresh context + correction instruction
+                # (no tools on retry — the planner already explored, just needs valid JSON)
+                planner_tools = None
                 messages = [
                     LLMMessage(role="system", content=PLANNER_SYSTEM_PROMPT),
                     LLMMessage(
@@ -407,7 +566,7 @@ class AgentCoordinator:
 
         logger.info("[%s] Created %d sub-tasks (ids=%s), transitioning to in_progress/executing",
                     self.todo_id, len(sub_task_ids), sub_task_ids)
-        result = await transition_todo(self.db, self.todo_id, "in_progress", sub_state="executing")
+        result = await self._transition_todo( "in_progress", sub_state="executing")
         if result:
             logger.info("[%s] Transitioned to in_progress successfully (state=%s, sub_state=%s)",
                         self.todo_id, result.get("state"), result.get("sub_state"))
@@ -452,7 +611,7 @@ class AgentCoordinator:
         if not sub_tasks:
             # No sub-tasks — skip to review
             logger.warning("[%s] No sub-tasks found in DB! Transitioning to review", self.todo_id)
-            await transition_todo(self.db, self.todo_id, "review")
+            await self._transition_todo( "review")
             return
 
         # Reset stale sub-tasks from previous crashed coordinator runs.
@@ -492,20 +651,42 @@ class AgentCoordinator:
 
         # Find runnable sub-tasks (pending + all dependencies completed)
         runnable = []
+        all_st_ids = {str(s["id"]) for s in sub_tasks}
         for st in sub_tasks:
             if st["status"] != "pending":
                 logger.info("[%s] Sub-task %s status=%s, skipping", self.todo_id, st["id"], st["status"])
                 continue
             deps = st["depends_on"] or []
             if deps:
-                dep_statuses = await self.db.fetch(
-                    "SELECT id, status FROM sub_tasks WHERE id = ANY($1)",
-                    deps,
-                )
-                unmet = [d for d in dep_statuses if d["status"] != "completed"]
-                if unmet:
-                    logger.info("[%s] Sub-task %s blocked on %d unmet deps", self.todo_id, st["id"], len(unmet))
-                    continue
+                # Detect broken deps: self-references or refs to non-existent subtasks
+                st_id_str = str(st["id"])
+                broken = [str(d) for d in deps if str(d) == st_id_str or str(d) not in all_st_ids]
+                if broken:
+                    logger.warning(
+                        "[%s] Sub-task %s (%s) has broken depends_on refs: %s — clearing them",
+                        self.todo_id, st["id"], st["title"], broken,
+                    )
+                    valid_deps = [d for d in deps if str(d) != st_id_str and str(d) in all_st_ids]
+                    await self.db.execute(
+                        "UPDATE sub_tasks SET depends_on = $2 WHERE id = $1",
+                        st["id"],
+                        valid_deps if valid_deps else [],
+                    )
+                    deps = valid_deps
+
+                if deps:
+                    dep_statuses = await self.db.fetch(
+                        "SELECT id, status, title FROM sub_tasks WHERE id = ANY($1)",
+                        deps,
+                    )
+                    unmet = [d for d in dep_statuses if d["status"] != "completed"]
+                    if unmet:
+                        unmet_detail = [(str(d["id"])[:8], d["status"], d["title"]) for d in unmet]
+                        logger.info(
+                            "[%s] Sub-task %s (%s) blocked on %d unmet deps: %s",
+                            self.todo_id, st["id"], st["title"], len(unmet), unmet_detail,
+                        )
+                        continue
             runnable.append(dict(st))
 
         logger.info("[%s] %d runnable sub-tasks: %s", self.todo_id, len(runnable),
@@ -527,8 +708,8 @@ class AgentCoordinator:
                     err_detail = "; ".join(
                         f"{f['title']}: {f['error_message'] or 'unknown'}" for f in failed_tasks
                     )
-                    await transition_todo(
-                        self.db, self.todo_id, "failed",
+                    await self._transition_todo(
+                        "failed",
                         error_message=f"Sub-tasks failed: {err_detail}",
                     )
                 else:
@@ -582,8 +763,7 @@ class AgentCoordinator:
         for st, result in zip(runnable, results):
             if isinstance(result, Exception):
                 logger.error("Sub-task %s failed: %s", st["id"], result, exc_info=result)
-                await transition_subtask(
-                    self.db,
+                await self._transition_subtask(
                     str(st["id"]),
                     "failed",
                     error_message=str(result),
@@ -598,10 +778,150 @@ class AgentCoordinator:
         if user_msg:
             await self._handle_user_message(user_msg, provider)
 
-        # Check if all done now
+        # Re-scan for newly unblocked subtasks — completions above may have
+        # unlocked dependents. Loop until no more runnable or all done.
+        for rescan_round in range(1, 20):  # safety cap
+            all_done, any_failed = await check_all_subtasks_done(self.db, self.todo_id)
+            if all_done:
+                break
+
+            # Fetch fresh subtask list and find newly runnable
+            fresh_sub_tasks = await self.db.fetch(
+                "SELECT * FROM sub_tasks WHERE todo_id = $1 ORDER BY execution_order",
+                self.todo_id,
+            )
+            next_runnable = []
+            for st2 in fresh_sub_tasks:
+                if st2["status"] != "pending":
+                    continue
+                deps2 = st2["depends_on"] or []
+                if deps2:
+                    dep_sts = await self.db.fetch(
+                        "SELECT id, status FROM sub_tasks WHERE id = ANY($1)", deps2,
+                    )
+                    if any(d["status"] != "completed" for d in dep_sts):
+                        continue
+                next_runnable.append(dict(st2))
+
+            if not next_runnable:
+                logger.info("[%s] Re-scan round %d: no more runnable subtasks", self.todo_id, rescan_round)
+                break
+
+            logger.info("[%s] Re-scan round %d: found %d newly runnable subtasks",
+                        self.todo_id, rescan_round, len(next_runnable))
+            next_tasks = []
+            for st2 in next_runnable:
+                st2_ws = workspace_path
+                if st2.get("target_repo"):
+                    try:
+                        st2_ws = await self._setup_dependency_workspace(st2)
+                    except Exception:
+                        pass
+                workspace_map[str(st2["id"])] = st2_ws
+
+                if st2["agent_role"] == "merge_agent":
+                    next_tasks.append(self._execute_merge_subtask(st2, provider, st2_ws))
+                elif has_quality_rules:
+                    next_tasks.append(self._execute_subtask_with_iterations(
+                        st2, provider, workspace_path=st2_ws,
+                        work_rules=work_rules, max_iterations=max_iterations,
+                    ))
+                else:
+                    next_tasks.append(self._execute_subtask(st2, provider, workspace_path=st2_ws))
+
+            rescan_results = await asyncio.gather(*next_tasks, return_exceptions=True)
+            for st2, result2 in zip(next_runnable, rescan_results):
+                if isinstance(result2, Exception):
+                    logger.error("Sub-task %s failed: %s", st2["id"], result2, exc_info=result2)
+                    await self._transition_subtask(str(st2["id"]), "failed", error_message=str(result2))
+                else:
+                    st2_ws = workspace_map.get(str(st2["id"]), workspace_path)
+                    await self._handle_subtask_completion(st2, provider, st2_ws)
+
+        # Final check
         all_done, any_failed = await check_all_subtasks_done(self.db, self.todo_id)
         if all_done and not any_failed:
-            await self._phase_review(todo, provider)
+            # Guardrail: ensure coding tasks have test + review subtasks
+            guardrail_created = await self._ensure_coding_guardrails(workspace_path)
+            if guardrail_created:
+                # New subtasks were created — execute them before review
+                logger.info("[%s] Guardrail subtasks created, executing them", self.todo_id)
+                guardrail_tasks = await self.db.fetch(
+                    "SELECT * FROM sub_tasks WHERE todo_id = $1 AND status = 'pending' "
+                    "ORDER BY execution_order, created_at",
+                    self.todo_id,
+                )
+                for gst in guardrail_tasks:
+                    deps = gst["depends_on"] or []
+                    if deps:
+                        dep_sts = await self.db.fetch(
+                            "SELECT id, status FROM sub_tasks WHERE id = ANY($1)", deps,
+                        )
+                        if any(d["status"] != "completed" for d in dep_sts):
+                            continue
+                    gst_ws = workspace_path
+                    if gst.get("target_repo"):
+                        try:
+                            gst_ws = await self._setup_dependency_workspace(gst)
+                        except Exception:
+                            pass
+                    if has_quality_rules:
+                        await self._execute_subtask_with_iterations(
+                            dict(gst), provider,
+                            workspace_path=gst_ws,
+                            work_rules=work_rules,
+                            max_iterations=max_iterations,
+                        )
+                    else:
+                        await self._execute_subtask(dict(gst), provider, workspace_path=gst_ws)
+
+                # Re-scan: guardrail subtasks may have unblocked others (reviewer after tester)
+                for gr_round in range(1, 10):
+                    gr_fresh = await self.db.fetch(
+                        "SELECT * FROM sub_tasks WHERE todo_id = $1 AND status = 'pending' "
+                        "ORDER BY execution_order, created_at",
+                        self.todo_id,
+                    )
+                    gr_runnable = []
+                    for gst2 in gr_fresh:
+                        deps2 = gst2["depends_on"] or []
+                        if deps2:
+                            dep_sts2 = await self.db.fetch(
+                                "SELECT id, status FROM sub_tasks WHERE id = ANY($1)", deps2,
+                            )
+                            if any(d["status"] != "completed" for d in dep_sts2):
+                                continue
+                        gr_runnable.append(dict(gst2))
+                    if not gr_runnable:
+                        break
+                    logger.info("[%s] Guardrail re-scan round %d: %d runnable",
+                                self.todo_id, gr_round, len(gr_runnable))
+                    for gst2 in gr_runnable:
+                        gst2_ws = workspace_path
+                        if has_quality_rules:
+                            await self._execute_subtask_with_iterations(
+                                gst2, provider,
+                                workspace_path=gst2_ws,
+                                work_rules=work_rules,
+                                max_iterations=max_iterations,
+                            )
+                        else:
+                            await self._execute_subtask(gst2, provider, workspace_path=gst2_ws)
+
+                # After guardrail execution, re-check completion
+                all_done, any_failed = await check_all_subtasks_done(self.db, self.todo_id)
+                if all_done and not any_failed:
+                    await self._phase_review(todo, provider)
+                elif all_done and any_failed:
+                    failed_tasks = await self.db.fetch(
+                        "SELECT title, error_message FROM sub_tasks "
+                        "WHERE todo_id = $1 AND status = 'failed'",
+                        self.todo_id,
+                    )
+                    err = "; ".join(f"{f['title']}: {f['error_message']}" for f in failed_tasks)
+                    await self._transition_todo( "failed", error_message=err)
+            else:
+                await self._phase_review(todo, provider)
         elif all_done and any_failed:
             # Check if we should retry
             if todo["retry_count"] < todo["max_retries"]:
@@ -623,7 +943,7 @@ class AgentCoordinator:
                     self.todo_id,
                 )
                 err = "; ".join(f"{f['title']}: {f['error_message']}" for f in failed_tasks)
-                await transition_todo(self.db, self.todo_id, "failed", error_message=err)
+                await self._transition_todo( "failed", error_message=err)
 
     # ---- WORK RULES ----
 
@@ -684,8 +1004,8 @@ class AgentCoordinator:
         st_id = str(sub_task["id"])
         logger.info("[%s] _execute_subtask_with_iterations START: st=%s role=%s title=%s workspace=%s max_iter=%d",
                     self.todo_id, st_id, sub_task["agent_role"], sub_task["title"], workspace_path, max_iterations)
-        await transition_subtask(self.db, st_id, "assigned")
-        await transition_subtask(self.db, st_id, "running")
+        await self._transition_subtask(st_id, "assigned")
+        await self._transition_subtask(st_id, "running")
 
         await self.db.execute(
             "UPDATE todo_items SET sub_state = $2, updated_at = NOW() WHERE id = $1",
@@ -880,8 +1200,8 @@ class AgentCoordinator:
                             "_validation_errors": val_errors,
                         }
 
-                    await transition_subtask(
-                        self.db, st_id, "completed",
+                    await self._transition_subtask(
+                        st_id, "completed",
                         progress_pct=100,
                         progress_message="Done",
                         output_result=validated_output,
@@ -951,8 +1271,8 @@ class AgentCoordinator:
         await self._append_progress_log(
             sub_task, max_iterations, "failed_max_iterations", iteration_log,
         )
-        await transition_subtask(
-            self.db, st_id, "failed",
+        await self._transition_subtask(
+            st_id, "failed",
             error_message=f"Max iterations ({max_iterations}) reached without passing quality checks",
         )
 
@@ -1370,6 +1690,136 @@ class AgentCoordinator:
             "**Review loop:** Reviewer approved. Created merge sub-task."
         )
 
+    # ---- CODING GUARDRAILS ----
+
+    async def _ensure_coding_guardrails(self, workspace_path: str | None) -> bool:
+        """Check for missing tester/reviewer subtasks on coding tasks.
+
+        When all subtasks are done and there are completed coder subtasks
+        that are NOT in a review chain, this method auto-creates tester
+        and reviewer subtasks to ensure code quality before completion.
+
+        Returns True if new guardrail subtasks were created (caller should
+        re-enter execution), False if no action needed.
+        """
+        # Check if any coder subtask completed outside a review chain
+        coder_subtasks = await self.db.fetch(
+            "SELECT id, title, review_loop, review_chain_id FROM sub_tasks "
+            "WHERE todo_id = $1 AND agent_role = 'coder' AND status = 'completed'",
+            self.todo_id,
+        )
+        if not coder_subtasks:
+            return False  # No coder work → no guardrails needed
+
+        # Filter to coder subtasks NOT in a review chain (those already have their own reviewer)
+        unreviewed_coders = [
+            st for st in coder_subtasks
+            if not st["review_loop"] and not st["review_chain_id"]
+        ]
+        if not unreviewed_coders:
+            return False  # All coder work is in review chains — already covered
+
+        # Check what roles already exist outside of review chains
+        existing_roles = await self.db.fetch(
+            "SELECT DISTINCT agent_role FROM sub_tasks "
+            "WHERE todo_id = $1 AND (review_chain_id IS NULL)",
+            self.todo_id,
+        )
+        existing = {r["agent_role"] for r in existing_roles}
+
+        created: list[tuple[str, str]] = []
+        coder_ids = [str(st["id"]) for st in unreviewed_coders]
+        coder_titles = [st["title"] for st in unreviewed_coders]
+
+        # 1. Tester guardrail
+        if "tester" not in existing:
+            tester_desc = (
+                "Write and run tests to validate the code changes made by the coder subtask(s):\n"
+                + "\n".join(f"- {t}" for t in coder_titles)
+                + "\n\nFocus on: unit tests for new/changed functions, edge cases, "
+                "and regression tests. Run the test suite and report results."
+            )
+            tester_id = await self._create_guardrail_subtask(
+                title="Test implemented changes",
+                description=tester_desc,
+                role="tester",
+                depends_on=coder_ids,
+            )
+            created.append(("tester", tester_id))
+
+        # 2. Reviewer guardrail
+        if "reviewer" not in existing:
+            deps = list(coder_ids)
+            if created:  # tester was just created, reviewer depends on it too
+                deps.append(created[-1][1])
+            reviewer_desc = (
+                "Review all code changes for quality, security, correctness, and adherence "
+                "to requirements. Check the coder subtask(s):\n"
+                + "\n".join(f"- {t}" for t in coder_titles)
+                + "\n\nYou MUST output a JSON verdict at the end of your response:\n"
+                '{"verdict": "approved"} or {"verdict": "needs_changes", "issues": ["issue1", ...]}'
+            )
+            reviewer_id = await self._create_guardrail_subtask(
+                title="Review code changes",
+                description=reviewer_desc,
+                role="reviewer",
+                depends_on=deps,
+            )
+            created.append(("reviewer", reviewer_id))
+
+        if created:
+            roles = ", ".join(r for r, _ in created)
+            logger.info(
+                "[%s] Coding guardrails: auto-created %s subtask(s) for unreviewed coder work",
+                self.todo_id, roles,
+            )
+            await self._post_system_message(
+                f"**Guardrail:** Auto-created {roles} subtask(s) to ensure code quality."
+            )
+            return True
+
+        return False
+
+    async def _create_guardrail_subtask(
+        self,
+        title: str,
+        description: str,
+        role: str,
+        depends_on: list[str],
+    ) -> str:
+        """Create a guardrail subtask and return its ID as string."""
+        # Compute execution_order: max of dependencies + 1
+        max_order = 0
+        if depends_on:
+            rows = await self.db.fetch(
+                "SELECT execution_order FROM sub_tasks WHERE id = ANY($1)",
+                depends_on,
+            )
+            max_order = max((r["execution_order"] or 0) for r in rows) if rows else 0
+
+        row = await self.db.fetchrow(
+            """
+            INSERT INTO sub_tasks (
+                todo_id, title, description, agent_role,
+                execution_order, depends_on
+            )
+            VALUES ($1, $2, $3, $4, $5, $6)
+            RETURNING id
+            """,
+            self.todo_id,
+            title,
+            description,
+            role,
+            max_order + 1,
+            depends_on,
+        )
+        st_id = str(row["id"])
+        logger.info(
+            "[%s] Created guardrail subtask %s: role=%s title=%s depends_on=%s",
+            self.todo_id, st_id, role, title, depends_on,
+        )
+        return st_id
+
     async def _finalize_subtask_workspace(
         self, sub_task: dict, workspace_path: str | None,
     ) -> dict | None:
@@ -1512,8 +1962,8 @@ class AgentCoordinator:
         This is mostly procedural (no LLM needed for happy path).
         """
         st_id = str(sub_task["id"])
-        await transition_subtask(self.db, st_id, "assigned")
-        await transition_subtask(self.db, st_id, "running")
+        await self._transition_subtask(st_id, "assigned")
+        await self._transition_subtask(st_id, "running")
 
         await self.db.execute(
             "UPDATE todo_items SET sub_state = 'merging', updated_at = NOW() WHERE id = $1",
@@ -1536,8 +1986,8 @@ class AgentCoordinator:
             )
             if not pr_deliv:
                 await self._post_system_message("**Merge agent:** No PR found to merge. Skipping.")
-                await transition_subtask(
-                    self.db, st_id, "completed",
+                await self._transition_subtask(
+                    st_id, "completed",
                     progress_pct=100, progress_message="No PR to merge",
                 )
                 return
@@ -1582,8 +2032,8 @@ class AgentCoordinator:
                 await self._post_system_message(
                     f"**Merge agent:** PR #{pr_number} is {pr_data['state']}, not open. Skipping merge."
                 )
-                await transition_subtask(
-                    self.db, st_id, "completed",
+                await self._transition_subtask(
+                    st_id, "completed",
                     progress_pct=100, progress_message=f"PR already {pr_data['state']}",
                 )
                 return
@@ -1597,8 +2047,8 @@ class AgentCoordinator:
                     f"**Merge agent:** CI still running for PR #{pr_number}. Will retry on next cycle."
                 )
                 # Reset to pending so it gets picked up again
-                await transition_subtask(
-                    self.db, st_id, "pending",
+                await self._transition_subtask(
+                    st_id, "pending",
                     progress_message="Waiting for CI",
                 )
                 return
@@ -1613,8 +2063,8 @@ class AgentCoordinator:
                 await self._post_system_message(
                     f"**Merge agent:** CI failed for PR #{pr_number}. {msg}"
                 )
-                await transition_subtask(
-                    self.db, st_id, "failed",
+                await self._transition_subtask(
+                    st_id, "failed",
                     error_message=msg,
                 )
                 return
@@ -1633,8 +2083,8 @@ class AgentCoordinator:
                 await self._post_system_message(
                     f"**Merge agent:** Waiting for dependency PRs: {', '.join(dep_names)}"
                 )
-                await transition_subtask(
-                    self.db, st_id, "pending",
+                await self._transition_subtask(
+                    st_id, "pending",
                     progress_message="Waiting for dependency PRs",
                 )
                 return
@@ -1654,8 +2104,8 @@ class AgentCoordinator:
                 await self._post_system_message(
                     f"**Merge agent:** Failed to merge PR #{pr_number}: {merge_result.get('message', 'unknown error')}"
                 )
-                await transition_subtask(
-                    self.db, st_id, "failed",
+                await self._transition_subtask(
+                    st_id, "failed",
                     error_message=merge_result.get("message", "Merge failed"),
                 )
                 return
@@ -1679,15 +2129,15 @@ class AgentCoordinator:
                 await self._run_post_merge_builds(todo, build_commands, workspace_path)
 
             await self._report_progress(st_id, 100, "Merge complete")
-            await transition_subtask(
-                self.db, st_id, "completed",
+            await self._transition_subtask(
+                st_id, "completed",
                 progress_pct=100, progress_message="Merged",
             )
 
         except Exception as e:
             logger.error("Merge agent failed: %s", e, exc_info=True)
-            await transition_subtask(
-                self.db, st_id, "failed",
+            await self._transition_subtask(
+                st_id, "failed",
                 error_message=str(e)[:500],
             )
 
@@ -1727,8 +2177,8 @@ class AgentCoordinator:
         st_id = str(sub_task["id"])
         logger.info("[%s] _execute_subtask START: st=%s role=%s title=%s workspace=%s",
                     self.todo_id, st_id, sub_task["agent_role"], sub_task["title"], workspace_path)
-        await transition_subtask(self.db, st_id, "assigned")
-        await transition_subtask(self.db, st_id, "running")
+        await self._transition_subtask(st_id, "assigned")
+        await self._transition_subtask(st_id, "running")
 
         # Update parent TODO sub_state
         await self.db.execute(
@@ -1896,8 +2346,7 @@ class AgentCoordinator:
             )
 
             # Update sub-task
-            await transition_subtask(
-                self.db,
+            await self._transition_subtask(
                 st_id,
                 "completed",
                 progress_pct=100,
@@ -1950,7 +2399,7 @@ class AgentCoordinator:
         if current == "review":
             logger.info("[%s] Already in review state, skipping transition", self.todo_id)
         elif current == "in_progress":
-            await transition_todo(self.db, self.todo_id, "review")
+            await self._transition_todo( "review")
         else:
             logger.warning("[%s] Cannot enter review from state=%s, skipping review phase", self.todo_id, current)
             return
@@ -2005,8 +2454,8 @@ class AgentCoordinator:
                 + "Task completed."
                 + issue_note
             )
-            await transition_todo(
-                self.db, self.todo_id, "completed",
+            await self._transition_todo(
+                "completed",
                 result_summary=summary,
             )
             await self.notifier.notify(
@@ -2028,8 +2477,8 @@ class AgentCoordinator:
                 + (f"**PR:** {pr_info['url']}\n\n" if pr_info else "")
                 + "Task completed. Review the issues above and create follow-up tasks if needed."
             )
-            await transition_todo(
-                self.db, self.todo_id, "completed",
+            await self._transition_todo(
+                "completed",
                 result_summary=f"{summary}\n\nIssues: {issue_text}",
             )
             await self.notifier.notify(
@@ -2283,6 +2732,17 @@ class AgentCoordinator:
             json.dumps({
                 "type": "activity",
                 "sub_task_id": subtask_id,
+                "activity": activity,
+            }),
+        )
+
+    async def _report_planning_activity(self, activity: str) -> None:
+        """Publish a planning-phase activity event for live UI display."""
+        await self.redis.publish(
+            f"task:{self.todo_id}:progress",
+            json.dumps({
+                "type": "activity",
+                "phase": "planning",
                 "activity": activity,
             }),
         )

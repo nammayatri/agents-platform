@@ -135,6 +135,10 @@ async def execute_action(tool_name: str, arguments: dict, context: dict) -> str:
                             "type": "array",
                             "items": {"type": "integer"},
                         },
+                        "review_loop": {
+                            "type": "boolean",
+                            "description": "Set true for critical code changes needing coder→reviewer→merge cycle",
+                        },
                     },
                     "required": ["title", "agent_role"],
                 },
@@ -162,6 +166,7 @@ async def _handle_create_task(arguments: dict, context: dict) -> dict:
                     "agent_role": st["agent_role"],
                     "execution_order": st.get("execution_order", i),
                     "depends_on": st.get("depends_on", []),
+                    "review_loop": bool(st.get("review_loop", False)),
                 }
                 for i, st in enumerate(sub_tasks_input)
             ],
@@ -194,13 +199,14 @@ async def _handle_create_task(arguments: dict, context: dict) -> dict:
         # Insert sub-tasks into the sub_tasks table
         sub_task_ids = []
         for i, st in enumerate(plan_json["sub_tasks"]):
+            review_loop = bool(st.get("review_loop", False))
             row = await db.fetchrow(
                 """
                 INSERT INTO sub_tasks (
                     todo_id, title, description, agent_role,
-                    execution_order, input_context
+                    execution_order, input_context, review_loop
                 )
-                VALUES ($1, $2, $3, $4, $5, '{}'::jsonb)
+                VALUES ($1, $2, $3, $4, $5, '{}'::jsonb, $6)
                 RETURNING id
                 """,
                 todo_id,
@@ -208,8 +214,16 @@ async def _handle_create_task(arguments: dict, context: dict) -> dict:
                 st.get("description", ""),
                 st["agent_role"],
                 st.get("execution_order", 0),
+                review_loop,
             )
             sub_task_ids.append(str(row["id"]))
+
+            # For review_loop sub-tasks, set review_chain_id to themselves (chain root)
+            if review_loop:
+                await db.execute(
+                    "UPDATE sub_tasks SET review_chain_id = $1 WHERE id = $1",
+                    row["id"],
+                )
 
         # Set up depends_on using index→UUID mapping
         for i, st in enumerate(plan_json["sub_tasks"]):

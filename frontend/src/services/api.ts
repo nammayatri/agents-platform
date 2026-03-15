@@ -116,6 +116,11 @@ export const todos = {
       method: 'POST',
       body: JSON.stringify({ with_context: withContext ?? false }),
     }),
+  triggerSubTask: (todoId: string, subTaskId: string, force: boolean = false) =>
+    request<{ status: string; sub_task_id: string; force: boolean }>(
+      `/todos/${todoId}/sub-tasks/${subTaskId}/trigger`,
+      { method: 'POST', body: JSON.stringify({ force }) },
+    ),
   acceptDeliverables: (id: string) =>
     request<TodoItem>(`/todos/${id}/accept-deliverables`, { method: 'POST' }),
   requestChanges: (id: string, feedback: string) =>

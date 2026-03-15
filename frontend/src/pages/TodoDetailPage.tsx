@@ -43,7 +43,7 @@ export default function TodoDetailPage() {
   const {
     todos, chatMessages, deliverablesByTodo, activityLogs,
     fetchTodo, fetchChat, fetchDeliverables, sendChat,
-    cancelTodo, retryTodo, acceptDeliverables, requestChanges,
+    cancelTodo, retryTodo, triggerSubTask, acceptDeliverables, requestChanges,
     approvePlan, rejectPlan, appendActivity,
   } = useTodoStore()
 
@@ -452,11 +452,22 @@ export default function TodoDetailPage() {
                           </span>
                         )}
                         {hasIterations && (
-                          <span className="ml-auto text-[11px] text-gray-600 font-mono shrink-0">
+                          <span className="text-[11px] text-gray-600 font-mono shrink-0">
                             {iterLog.length} iter{iterLog.length !== 1 ? 's' : ''}
                             {failedCount > 0 && <span className="text-red-400/60 ml-1">{failedCount} fail</span>}
                             {passedCount > 0 && <span className="text-emerald-400/60 ml-1">{passedCount} pass</span>}
                           </span>
+                        )}
+                        {(st.status === 'pending' || st.status === 'failed') && todoId && (
+                          <div className="ml-auto shrink-0">
+                            <button
+                              onClick={(e) => { e.stopPropagation(); triggerSubTask(todoId, st.id, true) }}
+                              className="px-2 py-0.5 bg-gray-800 hover:bg-gray-700 rounded text-[10px] text-gray-400 transition-colors"
+                              title="Force run — skip dependency checks"
+                            >
+                              Force Run
+                            </button>
+                          </div>
                         )}
                       </div>
                       {st.status === 'running' && (

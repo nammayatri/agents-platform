@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 import sys
 from contextlib import asynccontextmanager
 
@@ -72,15 +73,23 @@ async def lifespan(app: FastAPI):
     from agents.orchestrator.events import EventBus
     from agents.orchestrator.loop import EventDrivenOrchestrator
 
-    event_bus = EventBus(redis_client, worker_id=f"worker-{id(app)}")
+    worker_id = f"worker-{os.environ.get('HOSTNAME', os.getpid())}"
+
+    event_bus = EventBus(redis_client, worker_id=worker_id)
     app.state.event_bus = event_bus
 
     orchestrator = EventDrivenOrchestrator(
-        worker_id=f"worker-{id(app)}",
+        worker_id=worker_id,
         db_pool=pool,
         redis=redis_client,
         event_bus=event_bus,
     )
+    if settings.workspace_root.startswith("/tmp"):
+        logging.getLogger(__name__).warning(
+            "WORKSPACE_ROOT is %s — ephemeral in K8s. Mount a PVC and set WORKSPACE_ROOT.",
+            settings.workspace_root,
+        )
+
     orchestrator_task = asyncio.create_task(orchestrator.run_forever())
     app.state.orchestrator = orchestrator
 
@@ -106,7 +115,7 @@ def create_app() -> FastAPI:
 
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["http://localhost:5173"],  # Vite dev server
+        allow_origins=[o.strip() for o in settings.cors_origins.split(",")],
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
@@ -119,6 +128,7 @@ def create_app() -> FastAPI:
         auth,
         chat,
         deliverables,
+        health,
         notifications,
         project_chat,
         projects,
@@ -127,6 +137,9 @@ def create_app() -> FastAPI:
         todos,
         websocket,
     )
+
+    # Health/readiness probes at root (no /api prefix) for K8s
+    app.include_router(health.router, tags=["health"])
 
     app.include_router(auth.router, prefix="/api/auth", tags=["auth"])
     app.include_router(projects.router, prefix="/api/projects", tags=["projects"])

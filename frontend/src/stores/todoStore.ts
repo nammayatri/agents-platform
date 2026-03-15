@@ -21,6 +21,7 @@ interface TodoState {
   clearCreateError: () => void
   cancelTodo: (todoId: string) => Promise<void>
   retryTodo: (todoId: string, withContext?: boolean) => Promise<void>
+  triggerSubTask: (todoId: string, subTaskId: string, force?: boolean) => Promise<void>
   acceptDeliverables: (todoId: string) => Promise<void>
   requestChanges: (todoId: string, feedback: string) => Promise<void>
   approvePlan: (todoId: string) => Promise<void>
@@ -98,6 +99,19 @@ export const useTodoStore = create<TodoState>((set, get) => ({
     const { todos } = get()
     if (todos[todoId]) {
       set({ todos: { ...todos, [todoId]: { ...todos[todoId], state: 'intake' } } })
+    }
+  },
+
+  triggerSubTask: async (todoId, subTaskId, force?: boolean) => {
+    await todosApi.triggerSubTask(todoId, subTaskId, force ?? false)
+    // Optimistically update the subtask status to pending
+    const { todos } = get()
+    const todo = todos[todoId]
+    if (todo?.sub_tasks) {
+      const updated = todo.sub_tasks.map((st: SubTask) =>
+        st.id === subTaskId ? { ...st, status: 'pending' as const } : st
+      )
+      set({ todos: { ...todos, [todoId]: { ...todo, sub_tasks: updated } } })
     }
   },
 

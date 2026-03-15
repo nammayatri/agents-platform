@@ -8,6 +8,8 @@ Resolution order:
 5. System-level default (first active global provider with no owner)
 """
 
+import time
+
 import asyncpg
 
 from agents.infra.crypto import decrypt
@@ -16,11 +18,13 @@ from agents.providers.base import AIProvider
 from agents.providers.openai_provider import OpenAIProvider
 from agents.providers.self_hosted import SelfHostedProvider
 
+CACHE_TTL = 300  # seconds
+
 
 class ProviderRegistry:
     def __init__(self, db: asyncpg.Pool):
         self.db = db
-        self._cache: dict[str, AIProvider] = {}
+        self._cache: dict[str, tuple[AIProvider, float]] = {}
 
     async def resolve_for_todo(self, todo_id: str) -> AIProvider:
         """Resolve the AI provider for a specific TODO item."""
@@ -109,9 +113,11 @@ class ProviderRegistry:
         return await self.instantiate(provider_id)
 
     async def instantiate(self, provider_id: str) -> AIProvider:
-        """Create or return cached provider instance."""
+        """Create or return cached provider instance (TTL-based eviction)."""
         if provider_id in self._cache:
-            return self._cache[provider_id]
+            provider, cached_at = self._cache[provider_id]
+            if time.monotonic() - cached_at < CACHE_TTL:
+                return provider
 
         config = await self.db.fetchrow(
             "SELECT * FROM ai_provider_configs WHERE id = $1", provider_id
@@ -150,5 +156,5 @@ class ProviderRegistry:
             case _:
                 raise ValueError(f"Unknown provider type: {config['provider_type']}")
 
-        self._cache[provider_id] = provider
+        self._cache[provider_id] = (provider, time.monotonic())
         return provider

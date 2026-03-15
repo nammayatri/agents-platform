@@ -406,7 +406,7 @@ export interface ProjectChatMessage {
 }
 
 export interface WSEvent {
-  type: 'state_change' | 'chat_message' | 'progress' | 'activity' | 'deliverable_created' | 'ping'
+  type: 'state_change' | 'subtask_update' | 'chat_message' | 'progress' | 'activity' | 'deliverable_created' | 'ping'
   state?: TodoState
   message?: string | { role: string; content: string; id?: string }
   sub_task_id?: string

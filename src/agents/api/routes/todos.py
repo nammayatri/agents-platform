@@ -1,10 +1,13 @@
+import asyncio
 import json
+import os
 from datetime import datetime
 
 from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel
 
 from agents.api.deps import DB, CurrentUser, EventBusDep, Redis, check_project_access
+from agents.config.settings import settings
 from agents.orchestrator.events import TaskEvent
 from agents.orchestrator.state_machine import transition_todo
 from agents.schemas.todo import (
@@ -202,18 +205,17 @@ async def retry_todo(
     if todo["state"] not in ("failed", "cancelled", "completed"):
         raise HTTPException(status_code=400, detail="Can only retry failed, cancelled, or completed tasks")
 
-    # Optionally gather context from previous run
-    if body.with_context:
-        prev_context = await _build_previous_run_context(db, todo_id, todo)
-        intake = todo.get("intake_data") or {}
-        if isinstance(intake, str):
-            intake = json.loads(intake)
-        intake["previous_run"] = prev_context
-        await db.execute(
-            "UPDATE todo_items SET intake_data = $2::jsonb WHERE id = $1",
-            todo_id,
-            json.dumps(intake),
-        )
+    # Always gather context from previous run (subtask results + git diff)
+    prev_context = await _build_previous_run_context(db, todo_id, todo)
+    intake = todo.get("intake_data") or {}
+    if isinstance(intake, str):
+        intake = json.loads(intake)
+    intake["previous_run"] = prev_context
+    await db.execute(
+        "UPDATE todo_items SET intake_data = $2::jsonb WHERE id = $1",
+        todo_id,
+        json.dumps(intake),
+    )
 
     result = await transition_todo(db, todo_id, "intake", event_bus=event_bus)
     if not result:
@@ -240,13 +242,18 @@ async def retry_todo(
 
 
 async def _build_previous_run_context(db, todo_id: str, todo) -> dict:
-    """Gather summary from the previous execution to feed into next run."""
+    """Gather summary from the previous execution to feed into next run.
+
+    Includes subtask results and the git diff from the task workspace
+    so the planner knows what code changes already exist.
+    """
     sub_tasks = await db.fetch(
         "SELECT title, agent_role, status, output_result, error_message "
         "FROM sub_tasks WHERE todo_id = $1 ORDER BY execution_order",
         todo_id,
     )
-    return {
+
+    ctx: dict = {
         "result_summary": todo.get("result_summary") or "",
         "previous_state": todo["state"],
         "sub_tasks": [
@@ -264,6 +271,81 @@ async def _build_previous_run_context(db, todo_id: str, todo) -> dict:
             for st in sub_tasks
         ],
     }
+
+    # Capture git diff from the task workspace
+    git_diff = await _get_task_workspace_diff(str(todo["project_id"]), todo_id)
+    if git_diff:
+        ctx["git_diff"] = git_diff
+
+    return ctx
+
+
+async def _get_task_workspace_diff(project_id: str, todo_id: str) -> dict | None:
+    """Get git diff from the task workspace, comparing against the base branch."""
+    repo_dir = os.path.join(
+        settings.workspace_root, project_id, "tasks", todo_id, "repo",
+    )
+    if not os.path.isdir(repo_dir):
+        return None
+
+    async def _run_git(*args: str) -> tuple[int, str]:
+        proc = await asyncio.create_subprocess_exec(
+            "git", *args, cwd=repo_dir,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await proc.communicate()
+        return proc.returncode, stdout.decode(errors="replace")
+
+    try:
+        # Find the merge-base with the default branch to get the full diff
+        # of changes made by the agent (not just the last commit)
+        rc, base_branch = await _run_git(
+            "rev-parse", "--abbrev-ref", "HEAD@{upstream}",
+        )
+        if rc != 0:
+            # Fallback: try origin/main or origin/master
+            for fallback in ("origin/main", "origin/master"):
+                rc2, _ = await _run_git("rev-parse", "--verify", fallback)
+                if rc2 == 0:
+                    base_branch = fallback
+                    break
+            else:
+                # No upstream found — diff against HEAD~1 as last resort
+                base_branch = "HEAD~1"
+        else:
+            base_branch = base_branch.strip()
+
+        # Diff stat (summary of changed files)
+        rc, stat_output = await _run_git("diff", "--stat", base_branch)
+        if rc != 0 or not stat_output.strip():
+            return None
+
+        # Changed files with status
+        _, names_output = await _run_git("diff", "--name-status", base_branch)
+        files = []
+        for line in names_output.strip().split("\n"):
+            if line.strip():
+                parts = line.split("\t", 1)
+                if len(parts) == 2:
+                    files.append({"status": parts[0], "path": parts[1]})
+
+        # Full diff (truncated to avoid blowing up context)
+        _, diff_output = await _run_git("diff", base_branch)
+        max_diff = 15000  # ~15k chars to stay within token budget
+        truncated = len(diff_output) > max_diff
+        diff_text = diff_output[:max_diff]
+        if truncated:
+            diff_text += "\n... (diff truncated)"
+
+        return {
+            "stat": stat_output.strip(),
+            "files": files,
+            "diff": diff_text,
+            "truncated": truncated,
+        }
+    except Exception:
+        return None
 
 
 @router.post("/todos/{todo_id}/accept-deliverables")
@@ -434,3 +516,71 @@ async def reject_plan(
         state="planning",
     ))
     return result
+
+
+class TriggerSubTaskInput(BaseModel):
+    force: bool = False  # If true, clears depends_on to force execution
+
+
+@router.post("/todos/{todo_id}/sub-tasks/{sub_task_id}/trigger")
+async def trigger_subtask(
+    todo_id: str,
+    sub_task_id: str,
+    body: TriggerSubTaskInput,
+    user: CurrentUser,
+    db: DB,
+    redis: Redis,
+    event_bus: EventBusDep,
+):
+    """Manually trigger a blocked or failed subtask.
+
+    Resets the subtask to 'pending' so the coordinator picks it up.
+    If force=true, also clears depends_on to bypass dependency checks.
+    """
+    todo = await db.fetchrow("SELECT project_id, state FROM todo_items WHERE id = $1", todo_id)
+    if not todo:
+        raise HTTPException(status_code=404, detail="Task not found")
+    await check_project_access(db, str(todo["project_id"]), user)
+
+    st = await db.fetchrow(
+        "SELECT id, status, depends_on FROM sub_tasks WHERE id = $1 AND todo_id = $2",
+        sub_task_id, todo_id,
+    )
+    if not st:
+        raise HTTPException(status_code=404, detail="Subtask not found")
+
+    if st["status"] in ("running", "assigned"):
+        raise HTTPException(status_code=400, detail="Subtask is already running")
+
+    # Reset subtask to pending
+    if body.force:
+        await db.execute(
+            "UPDATE sub_tasks SET status = 'pending', depends_on = '{}', "
+            "error_message = NULL, updated_at = NOW() WHERE id = $1",
+            sub_task_id,
+        )
+    else:
+        await db.execute(
+            "UPDATE sub_tasks SET status = 'pending', "
+            "error_message = NULL, updated_at = NOW() WHERE id = $1",
+            sub_task_id,
+        )
+
+    # Ensure the parent todo is in a state the coordinator will pick up
+    if todo["state"] not in ("in_progress",):
+        await transition_todo(db, todo_id, "in_progress", event_bus=event_bus)
+
+    # Publish event so coordinator re-evaluates
+    await event_bus.publish(TaskEvent(
+        event_type="state_changed",
+        todo_id=todo_id,
+        state="in_progress",
+    ))
+
+    # Notify via WebSocket
+    await redis.publish(
+        f"task:{todo_id}:events",
+        json.dumps({"type": "activity", "activity": f"Subtask manually triggered: {sub_task_id[:8]}"}),
+    )
+
+    return {"status": "triggered", "sub_task_id": sub_task_id, "force": body.force}

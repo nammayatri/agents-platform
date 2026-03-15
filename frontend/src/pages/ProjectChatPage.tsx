@@ -508,11 +508,9 @@ export default function ProjectChatPage() {
                             </span>
                           </div>
                         )}
-                        {/* Quick-action buttons on last assistant message (regular chat only, no action metadata) */}
-                        {!isPlanMode &&
-                          msg.id === messages.filter((m) => m.role === 'assistant').at(-1)?.id &&
+                        {/* Quick-action buttons on last assistant message when no action UI already present */}
+                        {msg.id === messages.filter((m) => m.role === 'assistant').at(-1)?.id &&
                           !msg.metadata_json?.action &&
-                          !msg.metadata_json?.tasks_created &&
                           !sending && (
                           <div className="mt-2 pt-2 border-t border-gray-800">
                             {showFeedbackFor === msg.id ? (

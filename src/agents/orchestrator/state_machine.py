@@ -53,11 +53,14 @@ async def transition_todo(
     error_message: str | None = None,
     result_summary: str | None = None,
     event_bus: EventBus | None = None,
+    redis=None,
 ) -> dict | None:
     """Atomically transition a TODO item to a new state with validation.
 
     If event_bus is provided, publishes a state_changed event after a successful
     transition so the event-driven orchestrator can react immediately.
+    If redis is provided, publishes a state_change event to the WebSocket
+    pub/sub channel for real-time UI updates.
     """
     row = await db.fetchrow("SELECT state FROM todo_items WHERE id = $1", todo_id)
     if not row:
@@ -104,6 +107,16 @@ async def transition_todo(
         except Exception:
             logger.warning("Failed to publish state_changed event for %s", todo_id[:8], exc_info=True)
 
+    # Publish to WebSocket channel for real-time UI updates
+    if updated and redis:
+        try:
+            await redis.publish(
+                f"task:{todo_id}:events",
+                json.dumps({"type": "state_change", "state": target_state}),
+            )
+        except Exception:
+            logger.debug("Failed to publish WS state_change for %s", todo_id[:8])
+
     return dict(updated) if updated else None
 
 
@@ -116,8 +129,13 @@ async def transition_subtask(
     progress_message: str | None = None,
     output_result: dict | None = None,
     error_message: str | None = None,
+    redis=None,
 ) -> dict | None:
-    """Transition a sub-task to a new status."""
+    """Transition a sub-task to a new status.
+
+    If redis is provided, publishes a state_change event to the parent
+    todo's WebSocket channel so the UI refreshes subtask state.
+    """
     row = await db.fetchrow("SELECT status FROM sub_tasks WHERE id = $1", subtask_id)
     if not row:
         return None
@@ -150,6 +168,23 @@ async def transition_subtask(
         completed_at,
         current,
     )
+
+    # Publish to WebSocket channel for real-time UI updates
+    if updated and redis:
+        todo_id = str(updated.get("todo_id", ""))
+        if todo_id:
+            try:
+                await redis.publish(
+                    f"task:{todo_id}:events",
+                    json.dumps({
+                        "type": "subtask_update",
+                        "sub_task_id": subtask_id,
+                        "status": target_status,
+                    }),
+                )
+            except Exception:
+                logger.debug("Failed to publish WS subtask_update for %s", subtask_id[:8])
+
     return dict(updated) if updated else None
 
 
