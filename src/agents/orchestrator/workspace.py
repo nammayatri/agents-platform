@@ -366,6 +366,58 @@ class WorkspaceManager:
             body=body,
         )
 
+    async def create_pr_for_repo(
+        self,
+        *,
+        repo_url: str,
+        git_provider_id: str | None = None,
+        head_branch: str,
+        base_branch: str,
+        title: str,
+        body: str,
+    ) -> dict:
+        """Create a PR for any repo (not just the project's main repo).
+
+        Like create_pr but takes explicit repo_url and git_provider_id
+        instead of looking them up from the projects table.
+        Returns {"url": str, "number": int}.
+        """
+        token = None
+        provider_type = None
+        api_base_url = None
+        if git_provider_id:
+            gp_row = await self.db.fetchrow(
+                "SELECT provider_type, api_base_url, token_enc "
+                "FROM git_provider_configs WHERE id = $1",
+                git_provider_id,
+            )
+            if gp_row:
+                token = decrypt(gp_row["token_enc"]) if gp_row.get("token_enc") else None
+                provider_type = gp_row["provider_type"]
+                api_base_url = gp_row.get("api_base_url")
+
+        if not provider_type:
+            provider_type = detect_provider_type(repo_url)
+
+        provider = create_git_provider(
+            provider_type=provider_type,
+            api_base_url=api_base_url,
+            token=token,
+            repo_url=repo_url,
+        )
+
+        owner, repo = parse_repo_url(repo_url)
+        if not owner or not repo:
+            raise ValueError(f"Cannot parse repo URL: {repo_url}")
+
+        return await provider.create_pull_request(
+            owner, repo,
+            head=head_branch,
+            base=base_branch,
+            title=title,
+            body=body,
+        )
+
     # ------------------------------------------------------------------
     # File tree
     # ------------------------------------------------------------------

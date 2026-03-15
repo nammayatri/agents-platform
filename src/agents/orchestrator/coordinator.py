@@ -546,6 +546,7 @@ class AgentCoordinator:
         logger.info("[%s] Dispatching %d sub-tasks (quality_rules=%s, max_iter=%d, workspace=%s)",
                     self.todo_id, len(runnable), has_quality_rules, max_iterations, workspace_path)
         tasks = []
+        workspace_map: dict[str, str] = {}  # subtask_id → resolved workspace
         for st in runnable:
             # Resolve per-subtask workspace (dep repos get their own)
             st_workspace = workspace_path
@@ -557,6 +558,7 @@ class AgentCoordinator:
                     logger.warning(
                         "Failed to set up dep workspace for %s", st["id"], exc_info=True,
                     )
+            workspace_map[str(st["id"])] = st_workspace
 
             if st["agent_role"] == "merge_agent":
                 logger.info("[%s] Sub-task %s: merge_agent path", self.todo_id, st["id"])
@@ -588,7 +590,8 @@ class AgentCoordinator:
                 )
             else:
                 # Handle review loop: create follow-up sub-tasks
-                await self._handle_subtask_completion(st, provider, workspace_path)
+                st_ws = workspace_map.get(str(st["id"]), workspace_path)
+                await self._handle_subtask_completion(st, provider, st_ws)
 
         # Check user messages for steering
         user_msg = await self._check_for_user_messages()
@@ -1246,13 +1249,16 @@ class AgentCoordinator:
 
     async def _create_reviewer_subtask(self, coder_st: dict, chain_id) -> None:
         """Create a reviewer sub-task that depends on the completed coder sub-task."""
+        target_repo_json = coder_st.get("target_repo")
+        if target_repo_json and not isinstance(target_repo_json, str):
+            target_repo_json = json.dumps(target_repo_json)
         row = await self.db.fetchrow(
             """
             INSERT INTO sub_tasks (
                 todo_id, title, description, agent_role,
-                execution_order, depends_on, review_chain_id
+                execution_order, depends_on, review_chain_id, target_repo
             )
-            VALUES ($1, $2, $3, 'reviewer', $4, $5, $6)
+            VALUES ($1, $2, $3, 'reviewer', $4, $5, $6, $7::jsonb)
             RETURNING id
             """,
             self.todo_id,
@@ -1264,6 +1270,7 @@ class AgentCoordinator:
             (coder_st.get("execution_order") or 0) + 1,
             [str(coder_st["id"])],
             chain_id,
+            target_repo_json,
         )
         logger.info("Created reviewer sub-task %s for chain %s", row["id"], chain_id)
         await self._post_system_message(
@@ -1274,13 +1281,16 @@ class AgentCoordinator:
         self, reviewer_st: dict, chain_id, feedback: str,
     ) -> None:
         """Create a coder fix sub-task with reviewer feedback."""
+        target_repo_json = reviewer_st.get("target_repo")
+        if target_repo_json and not isinstance(target_repo_json, str):
+            target_repo_json = json.dumps(target_repo_json)
         row = await self.db.fetchrow(
             """
             INSERT INTO sub_tasks (
                 todo_id, title, description, agent_role,
-                execution_order, depends_on, review_loop, review_chain_id
+                execution_order, depends_on, review_loop, review_chain_id, target_repo
             )
-            VALUES ($1, $2, $3, 'coder', $4, $5, TRUE, $6)
+            VALUES ($1, $2, $3, 'coder', $4, $5, TRUE, $6, $7::jsonb)
             RETURNING id
             """,
             self.todo_id,
@@ -1289,6 +1299,7 @@ class AgentCoordinator:
             (reviewer_st.get("execution_order") or 0) + 1,
             [str(reviewer_st["id"])],
             chain_id,
+            target_repo_json,
         )
         logger.info("Created fix sub-task %s for chain %s", row["id"], chain_id)
         await self._post_system_message(
@@ -1315,13 +1326,16 @@ class AgentCoordinator:
         if approved_id not in depends_on:
             depends_on.append(approved_id)
 
+        target_repo_json = approved_st.get("target_repo")
+        if target_repo_json and not isinstance(target_repo_json, str):
+            target_repo_json = json.dumps(target_repo_json)
         row = await self.db.fetchrow(
             """
             INSERT INTO sub_tasks (
                 todo_id, title, description, agent_role,
-                execution_order, depends_on, review_chain_id
+                execution_order, depends_on, review_chain_id, target_repo
             )
-            VALUES ($1, $2, $3, 'merge_agent', $4, $5, $6)
+            VALUES ($1, $2, $3, 'merge_agent', $4, $5, $6, $7::jsonb)
             RETURNING id
             """,
             self.todo_id,
@@ -1330,6 +1344,7 @@ class AgentCoordinator:
             (approved_st.get("execution_order") or 0) + 1,
             depends_on,
             chain_id,
+            target_repo_json,
         )
         logger.info("Created merge_agent sub-task %s for chain %s (depends on %d tasks)", row["id"], chain_id, len(depends_on))
         await self._post_system_message(
@@ -1345,16 +1360,30 @@ class AgentCoordinator:
 
         try:
             todo = await self._load_todo()
-            project = await self.db.fetchrow(
-                "SELECT repo_url, default_branch FROM projects WHERE id = $1",
-                todo["project_id"],
-            )
-            if not project or not project.get("repo_url"):
-                return None
-
             short_id = str(self.todo_id)[:8]
-            branch_name = f"task/{short_id}"
-            base_branch = project.get("default_branch") or "main"
+
+            # Determine if this is a dependency repo sub-task
+            target_repo = sub_task.get("target_repo")
+            if isinstance(target_repo, str):
+                target_repo = json.loads(target_repo)
+
+            if target_repo and target_repo.get("repo_url"):
+                dep_name = (target_repo.get("name") or "dep").replace("/", "_").replace(" ", "_")
+                branch_name = f"task/{short_id}-{dep_name}"
+                base_branch = target_repo.get("default_branch") or "main"
+            else:
+                project = await self.db.fetchrow(
+                    "SELECT repo_url, default_branch FROM projects WHERE id = $1",
+                    todo["project_id"],
+                )
+                if not project or not project.get("repo_url"):
+                    return None
+                branch_name = f"task/{short_id}"
+                base_branch = project.get("default_branch") or "main"
+
+            logger.info("[%s] Finalizing workspace: branch=%s base=%s dep=%s path=%s",
+                        self.todo_id, branch_name, base_branch,
+                        bool(target_repo), workspace_path)
 
             pushed = await self.workspace_mgr.commit_and_push(
                 workspace_path,
@@ -1374,14 +1403,25 @@ class AgentCoordinator:
             if existing_pr:
                 return {"number": existing_pr["pr_number"]}
 
-            # Create PR
-            pr_info = await self.workspace_mgr.create_pr(
-                str(todo["project_id"]),
-                head_branch=branch_name,
-                base_branch=base_branch,
-                title=todo["title"],
-                body=f"## {sub_task['title']}\n\n*Created by AI Agent — review loop*",
-            )
+            # Create PR — use dependency repo or project repo
+            if target_repo and target_repo.get("repo_url"):
+                pr_info = await self.workspace_mgr.create_pr_for_repo(
+                    repo_url=target_repo["repo_url"],
+                    git_provider_id=target_repo.get("git_provider_id"),
+                    head_branch=branch_name,
+                    base_branch=base_branch,
+                    title=todo["title"],
+                    body=f"## {sub_task['title']}\n\n*Created by AI Agent*",
+                )
+            else:
+                pr_info = await self.workspace_mgr.create_pr(
+                    str(todo["project_id"]),
+                    head_branch=branch_name,
+                    base_branch=base_branch,
+                    title=todo["title"],
+                    body=f"## {sub_task['title']}\n\n*Created by AI Agent*",
+                )
+
             if pr_info:
                 await self.db.execute(
                     """
