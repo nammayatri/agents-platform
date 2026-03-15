@@ -1,9 +1,5 @@
 import re
 from dataclasses import dataclass, field
-from datetime import datetime
-from typing import Any
-
-from pydantic import BaseModel
 
 
 def sanitize_llm_content(text: str) -> str:
@@ -44,6 +40,8 @@ class LLMResponse:
     stop_reason: str = ""  # 'end_turn' | 'tool_use' | 'max_tokens'
     cost_usd: float = 0.0
     cached_tokens: int = 0
+    # Populated by run_tool_loop after execution
+    tool_summary: dict | None = None
 
     def __post_init__(self):
         if self.content:
@@ -57,46 +55,3 @@ class StreamChunk:
     tool_call: dict | None = None
 
 
-@dataclass
-class AgentResult:
-    success: bool
-    output: dict[str, Any] = field(default_factory=dict)
-    deliverables: list[dict] = field(default_factory=list)
-    error: str | None = None
-    tokens_used: int = 0
-    cost_usd: float = 0.0
-
-
-@dataclass
-class PlanStep:
-    agent_role: str
-    task_description: str
-    context: dict = field(default_factory=dict)
-    depends_on: list[int] = field(default_factory=list)  # indexes of steps this depends on
-
-
-@dataclass
-class ExecutionPlan:
-    summary: str
-    steps: list[PlanStep] = field(default_factory=list)
-    estimated_tokens: int = 0
-
-
-class AgentRunOut(BaseModel):
-    id: str
-    todo_id: str
-    sub_task_id: str | None = None
-    agent_role: str
-    agent_model: str
-    provider_type: str
-    status: str
-    progress_pct: int
-    progress_message: str | None = None
-    tokens_input: int
-    tokens_output: int
-    duration_ms: int
-    cost_usd: float
-    error_type: str | None = None
-    error_detail: str | None = None
-    started_at: datetime
-    completed_at: datetime | None = None

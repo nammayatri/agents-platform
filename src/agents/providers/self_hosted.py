@@ -3,9 +3,10 @@
 Works with vLLM, Ollama, text-generation-inference, LM Studio, etc.
 """
 
+import json
 import logging
 import re
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable, Awaitable
 from uuid import uuid4
 
 import openai
@@ -18,6 +19,9 @@ logger = logging.getLogger(__name__)
 
 class SelfHostedProvider(AIProvider):
     provider_type = "self_hosted"
+
+    # Models known to NOT support tool_choice reliably
+    _TOOL_CHOICE_UNSUPPORTED = {"glm", "chatglm", "kimi"}
 
     def __init__(
         self,
@@ -32,6 +36,11 @@ class SelfHostedProvider(AIProvider):
         )
         self.default_model = default_model
         self.fast_model = fast_model
+
+    def _supports_tool_choice(self, model: str) -> bool:
+        """Check if the model supports the tool_choice parameter."""
+        model_lower = model.lower()
+        return not any(kw in model_lower for kw in self._TOOL_CHOICE_UNSUPPORTED)
 
     @staticmethod
     def _parse_xml_tool_calls(content: str) -> list[dict]:
@@ -85,6 +94,48 @@ class SelfHostedProvider(AIProvider):
                 "name": tool_name,
                 "arguments": arguments,
             })
+
+        return results
+
+    @staticmethod
+    def _parse_json_tool_calls(content: str, tools: list[dict]) -> list[dict]:
+        """Parse tool calls embedded as JSON objects in text content.
+
+        Some models (e.g. kimi-latest) emit tool calls as JSON in text
+        instead of using the native tool API.  Looks for objects with a
+        ``name`` field matching a known tool.
+        """
+        from agents.utils.json_helpers import extract_json, fix_trailing_commas
+
+        known_names = {t["name"] for t in tools} if tools else set()
+        results = []
+
+        remaining = content
+        while remaining:
+            raw = extract_json(remaining)
+            if raw is None:
+                break
+            try:
+                obj = json.loads(fix_trailing_commas(raw))
+            except (json.JSONDecodeError, TypeError):
+                # Skip this block and continue scanning
+                idx = remaining.find(raw)
+                if idx < 0:
+                    break
+                remaining = remaining[idx + len(raw):]
+                continue
+
+            if isinstance(obj, dict) and obj.get("name") in known_names:
+                results.append({
+                    "id": f"jsontc_{uuid4().hex[:8]}",
+                    "name": obj["name"],
+                    "arguments": obj.get("arguments", obj.get("parameters", {})),
+                })
+
+            idx = remaining.find(raw)
+            if idx < 0:
+                break
+            remaining = remaining[idx + len(raw):]
 
         return results
 
@@ -148,6 +199,7 @@ class SelfHostedProvider(AIProvider):
         max_tokens: int = 4096,
         temperature: float = 0.1,
         system_prompt: str | None = None,
+        tool_choice: str | dict | None = None,
     ) -> LLMResponse:
         api_messages = self._build_messages(messages, system_prompt)
         use_model = model or self.default_model
@@ -161,6 +213,20 @@ class SelfHostedProvider(AIProvider):
         api_tools = self._build_tools(tools)
         if api_tools:
             kwargs["tools"] = api_tools
+
+        # Only pass tool_choice for models that support it
+        if tool_choice is not None and api_tools and self._supports_tool_choice(use_model):
+            if isinstance(tool_choice, dict) and "name" in tool_choice:
+                kwargs["tool_choice"] = {
+                    "type": "function",
+                    "function": {"name": tool_choice["name"]},
+                }
+            elif tool_choice == "required":
+                kwargs["tool_choice"] = "required"
+            elif tool_choice == "none":
+                kwargs["tool_choice"] = "none"
+            else:
+                kwargs["tool_choice"] = "auto"
 
         logger.info("self_hosted: sending request model=%s msgs=%d tools=%d max_tokens=%d",
                      use_model, len(api_messages), len(api_tools) if api_tools else 0, max_tokens)
@@ -177,30 +243,53 @@ class SelfHostedProvider(AIProvider):
         )
         tool_calls = []
         if choice.message.tool_calls:
-            import json
+            from agents.utils.json_helpers import fix_trailing_commas
+
             for tc in choice.message.tool_calls:
+                raw_args = tc.function.arguments or ""
+                try:
+                    args = json.loads(raw_args)
+                except (json.JSONDecodeError, TypeError):
+                    # Second attempt: fix trailing commas (common self-hosted issue)
+                    try:
+                        args = json.loads(fix_trailing_commas(raw_args))
+                    except (json.JSONDecodeError, TypeError):
+                        logger.warning(
+                            "Failed to parse tool call arguments for %s: %s",
+                            tc.function.name, raw_args[:200],
+                        )
+                        args = {"_raw_arguments": raw_args}
                 tool_calls.append({
                     "id": tc.id,
                     "name": tc.function.name,
-                    "arguments": json.loads(tc.function.arguments),
+                    "arguments": args,
                 })
 
-        # Fallback: parse XML tool calls from content if model doesn't use native tool API
-        xml_tool_calls_parsed = False
+        # Fallback 1: parse XML tool calls from content (GLM models)
+        fallback_parsed = False
         if not tool_calls and content and "<tool_call>" in content:
             xml_calls = self._parse_xml_tool_calls(content)
             if xml_calls:
                 logger.info(
                     "Parsed %d XML tool call(s) from text content (model: %s)",
-                    len(xml_calls),
-                    use_model,
+                    len(xml_calls), use_model,
                 )
                 tool_calls = xml_calls
-                xml_tool_calls_parsed = True
-                # Strip tool call XML from content to keep it clean
+                fallback_parsed = True
                 content = re.sub(
                     r'<tool_call>.*?</tool_call>', '', content, flags=re.DOTALL
                 ).strip()
+
+        # Fallback 2: parse JSON tool calls from content (kimi-latest etc.)
+        if not tool_calls and content and tools:
+            json_calls = self._parse_json_tool_calls(content, tools)
+            if json_calls:
+                logger.info(
+                    "Parsed %d JSON tool call(s) from text content (model: %s)",
+                    len(json_calls), use_model,
+                )
+                tool_calls = json_calls
+                fallback_parsed = True
 
         tokens_in = response.usage.prompt_tokens if response.usage else 0
         tokens_out = response.usage.completion_tokens if response.usage else 0
@@ -208,12 +297,20 @@ class SelfHostedProvider(AIProvider):
         stop_reason = choice.finish_reason or ""
         if stop_reason == "tool_calls":
             stop_reason = "tool_use"
-        if xml_tool_calls_parsed:
+        if fallback_parsed:
+            stop_reason = "tool_use"
+        # Many self-hosted models return finish_reason="stop" even when
+        # tool_calls are present.  Normalize so the tool loop executes them.
+        if tool_calls and stop_reason != "tool_use":
+            logger.info(
+                "self_hosted: normalizing stop_reason '%s' → 'tool_use' (tool_calls=%d)",
+                stop_reason, len(tool_calls),
+            )
             stop_reason = "tool_use"
 
         logger.info(
-            "self_hosted: final stop_reason=%s tool_calls=%d tokens_in=%d tokens_out=%d xml_parsed=%s",
-            stop_reason, len(tool_calls), tokens_in, tokens_out, xml_tool_calls_parsed,
+            "self_hosted: final stop_reason=%s tool_calls=%d tokens_in=%d tokens_out=%d fallback=%s",
+            stop_reason, len(tool_calls), tokens_in, tokens_out, fallback_parsed,
         )
         if tool_calls:
             for tc in tool_calls:
@@ -229,6 +326,138 @@ class SelfHostedProvider(AIProvider):
             cost_usd=0.0,  # self-hosted
         )
 
+    async def send_message_streaming(
+        self,
+        messages: list[LLMMessage],
+        *,
+        on_token: Callable[[str], Awaitable[None]],
+        model: str | None = None,
+        tools: list[dict] | None = None,
+        max_tokens: int = 4096,
+        temperature: float = 0.1,
+        system_prompt: str | None = None,
+        tool_choice: str | dict | None = None,
+    ) -> LLMResponse:
+        from agents.schemas.agent import LLMResponse
+
+        api_messages = self._build_messages(messages, system_prompt)
+        use_model = model or self.default_model
+
+        kwargs: dict = {
+            "model": use_model,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "messages": api_messages,
+            "stream": True,
+        }
+        api_tools = self._build_tools(tools)
+        if api_tools:
+            kwargs["tools"] = api_tools
+        if tool_choice is not None and api_tools and self._supports_tool_choice(use_model):
+            if isinstance(tool_choice, dict) and "name" in tool_choice:
+                kwargs["tool_choice"] = {
+                    "type": "function",
+                    "function": {"name": tool_choice["name"]},
+                }
+            elif tool_choice == "required":
+                kwargs["tool_choice"] = "required"
+            elif tool_choice == "none":
+                kwargs["tool_choice"] = "none"
+            else:
+                kwargs["tool_choice"] = "auto"
+
+        # Try to get usage info (not all self-hosted endpoints support this)
+        try:
+            kwargs["stream_options"] = {"include_usage": True}
+        except Exception:
+            pass
+
+        stream = await self.client.chat.completions.create(**kwargs)
+
+        content_parts: list[str] = []
+        tc_map: dict[int, dict] = {}
+        tokens_in = 0
+        tokens_out = 0
+        finish_reason = ""
+
+        async for chunk in stream:
+            if hasattr(chunk, "usage") and chunk.usage:
+                tokens_in = chunk.usage.prompt_tokens or 0
+                tokens_out = chunk.usage.completion_tokens or 0
+            if not chunk.choices:
+                continue
+            choice = chunk.choices[0]
+            if choice.finish_reason:
+                finish_reason = choice.finish_reason
+            delta = choice.delta
+            if delta.content:
+                content_parts.append(delta.content)
+                await on_token(delta.content)
+            if hasattr(delta, "tool_calls") and delta.tool_calls:
+                for tc_delta in delta.tool_calls:
+                    idx = tc_delta.index
+                    if idx not in tc_map:
+                        tc_map[idx] = {"id": "", "name": "", "args": ""}
+                    if tc_delta.id:
+                        tc_map[idx]["id"] = tc_delta.id
+                    if tc_delta.function:
+                        if tc_delta.function.name:
+                            tc_map[idx]["name"] = tc_delta.function.name
+                        if tc_delta.function.arguments:
+                            tc_map[idx]["args"] += tc_delta.function.arguments
+
+        content = "".join(content_parts)
+        tool_calls = []
+        if tc_map:
+            from agents.utils.json_helpers import fix_trailing_commas
+
+            for idx in sorted(tc_map.keys()):
+                tc = tc_map[idx]
+                raw_args = tc["args"]
+                try:
+                    args = json.loads(raw_args)
+                except (json.JSONDecodeError, TypeError):
+                    try:
+                        args = json.loads(fix_trailing_commas(raw_args))
+                    except (json.JSONDecodeError, TypeError):
+                        args = {"_raw_arguments": raw_args}
+                tool_calls.append({"id": tc["id"], "name": tc["name"], "arguments": args})
+
+        # Fallback: parse XML/JSON tool calls from content (same as send_message)
+        fallback_parsed = False
+        if not tool_calls and content and "<tool_call>" in content:
+            xml_calls = self._parse_xml_tool_calls(content)
+            if xml_calls:
+                tool_calls = xml_calls
+                fallback_parsed = True
+                content = re.sub(
+                    r'<tool_call>.*?</tool_call>', '', content, flags=re.DOTALL
+                ).strip()
+
+        if not tool_calls and content and tools:
+            json_calls = self._parse_json_tool_calls(content, tools)
+            if json_calls:
+                tool_calls = json_calls
+                fallback_parsed = True
+
+        stop_reason = finish_reason
+        if stop_reason == "tool_calls":
+            stop_reason = "tool_use"
+        if fallback_parsed:
+            stop_reason = "tool_use"
+        if tool_calls and stop_reason != "tool_use":
+            stop_reason = "tool_use"
+
+        return LLMResponse(
+            content=content,
+            tool_calls=tool_calls,
+            tokens_input=tokens_in,
+            tokens_output=tokens_out,
+            model=use_model,
+            stop_reason=stop_reason,
+            cost_usd=0.0,
+        )
+
     async def stream_message(
         self,
         messages: list[LLMMessage],
@@ -238,6 +467,7 @@ class SelfHostedProvider(AIProvider):
         max_tokens: int = 4096,
         temperature: float = 0.1,
         system_prompt: str | None = None,
+        tool_choice: str | dict | None = None,
     ) -> AsyncIterator[StreamChunk]:
         api_messages = []
         if system_prompt:
@@ -275,3 +505,21 @@ class SelfHostedProvider(AIProvider):
 
     def estimate_cost(self, tokens_input: int, tokens_output: int, model: str) -> float:
         return 0.0  # self-hosted
+
+    async def list_models(self) -> list[dict]:
+        try:
+            response = await self.client.models.list()
+            models = []
+            for m in response.data:
+                models.append({
+                    "id": m.id,
+                    "name": m.id,
+                    "is_default": m.id == self.default_model,
+                })
+            return sorted(models, key=lambda x: x["id"])
+        except Exception:
+            logger.warning("Failed to list models from self-hosted API, returning configured models")
+            result = [{"id": self.default_model, "name": self.default_model, "is_default": True}]
+            if self.fast_model:
+                result.append({"id": self.fast_model, "name": self.fast_model, "is_default": False})
+            return result

@@ -34,6 +34,13 @@ class Settings(BaseSettings):
     # Admin seed — first user with this email gets promoted to admin on startup
     admin_seed_email: str = ""
 
+    # CORS
+    cors_origins: str = "http://localhost:5173"  # comma-separated
+
+    # Indexing & context management
+    repo_map_token_budget: int = 4000
+    context_compaction_keep_recent: int = 3
+
     # Logging
     log_level: str = "INFO"
 

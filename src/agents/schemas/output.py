@@ -43,19 +43,24 @@ class CoderOutput(BaseAgentOutput):
 # ── Tester ──────────────────────────────────────────────────────────
 
 
+class TestFailure(BaseModel):
+    file: str = Field(default="", description="File path where the failure occurred")
+    type: Literal["build", "type_error", "test", "lint", "runtime"] = Field(
+        description="Failure category",
+    )
+    error: str = Field(description="Error message or output")
+
+
 class TesterOutput(BaseAgentOutput):
+    passed: bool = Field(description="Whether all tests/checks passed")
+    summary: str = Field(description="Brief summary of test results")
     test_files: list[str] = Field(
         default_factory=list,
-        description="Test file paths created",
+        description="Test file paths created or run",
     )
-    test_summary: str = Field(description="What tests cover")
-    bug_reproduced_before_fix: bool = Field(
-        default=False,
-        description="Bug reproduced before fix",
-    )
-    bug_resolved_after_fix: bool = Field(
-        default=False,
-        description="Bug resolved after fix",
+    failures: list[TestFailure] = Field(
+        default_factory=list,
+        description="Structured list of failures found",
     )
 
 
@@ -66,6 +71,8 @@ class ReviewIssue(BaseModel):
     severity: Literal["critical", "major", "minor", "nit"] = Field(
         description="Issue severity",
     )
+    file: str = Field(default="", description="File path where the issue is located")
+    line: int | None = Field(default=None, description="Line number (approximate)")
     description: str = Field(description="What the issue is")
     suggestion: str = Field(default="", description="How to fix it")
 
@@ -116,6 +123,29 @@ class MergeAgentOutput(BaseAgentOutput):
     ci_passed: bool = Field(default=False)
 
 
+# ── Debugger ───────────────────────────────────────────────────────
+
+
+class DebuggerOutput(BaseAgentOutput):
+    root_cause: str = Field(description="Identified root cause of the issue")
+    evidence: list[str] = Field(
+        default_factory=list,
+        description="Log entries, query results, code paths supporting the diagnosis",
+    )
+    fix_applied: bool = Field(
+        default=False,
+        description="Whether a fix was applied in this run",
+    )
+    files_changed: list[str] = Field(
+        default_factory=list,
+        description="Files modified (if fix was applied)",
+    )
+    recommendation: str = Field(
+        default="",
+        description="Next steps or recommendation",
+    )
+
+
 # ── Registry ────────────────────────────────────────────────────────
 
 ROLE_OUTPUT_SCHEMAS: dict[str, type[BaseAgentOutput]] = {
@@ -125,4 +155,5 @@ ROLE_OUTPUT_SCHEMAS: dict[str, type[BaseAgentOutput]] = {
     "pr_creator": PRCreatorOutput,
     "report_writer": ReportWriterOutput,
     "merge_agent": MergeAgentOutput,
+    "debugger": DebuggerOutput,
 }

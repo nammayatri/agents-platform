@@ -1,15 +1,26 @@
-from collections.abc import AsyncIterator
+import json as _json_mod
+import logging
+from collections.abc import AsyncIterator, Callable, Awaitable
 
 import openai
 
 from agents.providers.base import AIProvider
 from agents.schemas.agent import LLMMessage, LLMResponse, StreamChunk
 
+logger = logging.getLogger(__name__)
+
 PRICING = {
     "gpt-4o": {"input": 2.50, "output": 10.0},
     "gpt-4o-mini": {"input": 0.15, "output": 0.60},
     "o3": {"input": 10.0, "output": 40.0},
     "o3-mini": {"input": 1.10, "output": 4.40},
+}
+
+CONTEXT_WINDOWS = {
+    "gpt-4o": 128_000,
+    "gpt-4o-mini": 128_000,
+    "o3": 200_000,
+    "o3-mini": 128_000,
 }
 
 
@@ -64,20 +75,61 @@ class OpenAIProvider(AIProvider):
             api_messages.insert(0, {"role": "system", "content": system_prompt})
         return api_messages
 
-    def _build_tools(self, tools: list[dict] | None) -> list[dict] | None:
+    @staticmethod
+    def _make_strict_schema(schema: dict) -> dict:
+        """Transform a JSON Schema for OpenAI strict mode.
+
+        Recursively adds ``additionalProperties: false`` and puts all
+        properties into ``required`` on every object-level schema.
+        """
+        if not isinstance(schema, dict):
+            return schema
+
+        result = dict(schema)
+
+        if result.get("type") == "object" and "properties" in result:
+            result["additionalProperties"] = False
+            result["required"] = list(result["properties"].keys())
+            result["properties"] = {
+                k: OpenAIProvider._make_strict_schema(v)
+                for k, v in result["properties"].items()
+            }
+
+        if result.get("type") == "array" and "items" in result:
+            result["items"] = OpenAIProvider._make_strict_schema(result["items"])
+
+        return result
+
+    def _build_tools(
+        self, tools: list[dict] | None, *, strict: bool = True,
+    ) -> list[dict] | None:
         if not tools:
             return None
-        return [
-            {
-                "type": "function",
-                "function": {
-                    "name": t["name"],
-                    "description": t.get("description", ""),
-                    "parameters": t.get("parameters", t.get("input_schema", {})),
-                },
+        result = []
+        for t in tools:
+            params = t.get("parameters", t.get("input_schema", {}))
+            func: dict = {
+                "name": t["name"],
+                "description": t.get("description", ""),
+                "parameters": self._make_strict_schema(params) if strict else params,
             }
-            for t in tools
-        ]
+            if strict:
+                func["strict"] = True
+            result.append({"type": "function", "function": func})
+        return result
+
+    @staticmethod
+    def _map_tool_choice(tool_choice: str | dict | None) -> str | dict | None:
+        """Map canonical tool_choice to OpenAI format."""
+        if tool_choice is None:
+            return None
+        if isinstance(tool_choice, dict) and "name" in tool_choice:
+            return {"type": "function", "function": {"name": tool_choice["name"]}}
+        if tool_choice == "required":
+            return "required"
+        if tool_choice == "none":
+            return "none"
+        return "auto"
 
     async def send_message(
         self,
@@ -88,6 +140,7 @@ class OpenAIProvider(AIProvider):
         max_tokens: int = 4096,
         temperature: float = 0.1,
         system_prompt: str | None = None,
+        tool_choice: str | dict | None = None,
     ) -> LLMResponse:
         api_messages = self._build_messages(messages, system_prompt)
         use_model = model or self.default_model
@@ -101,6 +154,9 @@ class OpenAIProvider(AIProvider):
         api_tools = self._build_tools(tools)
         if api_tools:
             kwargs["tools"] = api_tools
+        mapped_tc = self._map_tool_choice(tool_choice)
+        if mapped_tc is not None and api_tools:
+            kwargs["tool_choice"] = mapped_tc
 
         response = await self.client.chat.completions.create(**kwargs)
         choice = response.choices[0]
@@ -111,10 +167,18 @@ class OpenAIProvider(AIProvider):
             import json
 
             for tc in choice.message.tool_calls:
+                try:
+                    args = json.loads(tc.function.arguments)
+                except (json.JSONDecodeError, TypeError):
+                    logger.warning(
+                        "Failed to parse tool call arguments for %s: %s",
+                        tc.function.name, tc.function.arguments[:200] if tc.function.arguments else "None",
+                    )
+                    args = {"_raw_arguments": tc.function.arguments or ""}
                 tool_calls.append({
                     "id": tc.id,
                     "name": tc.function.name,
-                    "arguments": json.loads(tc.function.arguments),
+                    "arguments": args,
                 })
 
         tokens_in = response.usage.prompt_tokens if response.usage else 0
@@ -123,6 +187,99 @@ class OpenAIProvider(AIProvider):
 
         # Normalize stop_reason: OpenAI uses "tool_calls", Anthropic uses "tool_use"
         stop_reason = choice.finish_reason or ""
+        if stop_reason == "tool_calls":
+            stop_reason = "tool_use"
+
+        return LLMResponse(
+            content=content,
+            tool_calls=tool_calls,
+            tokens_input=tokens_in,
+            tokens_output=tokens_out,
+            model=use_model,
+            stop_reason=stop_reason,
+            cost_usd=cost,
+        )
+
+    async def send_message_streaming(
+        self,
+        messages: list[LLMMessage],
+        *,
+        on_token: Callable[[str], Awaitable[None]],
+        model: str | None = None,
+        tools: list[dict] | None = None,
+        max_tokens: int = 4096,
+        temperature: float = 0.1,
+        system_prompt: str | None = None,
+        tool_choice: str | dict | None = None,
+    ) -> LLMResponse:
+        api_messages = self._build_messages(messages, system_prompt)
+        use_model = model or self.default_model
+
+        kwargs: dict = {
+            "model": use_model,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "messages": api_messages,
+            "stream": True,
+            "stream_options": {"include_usage": True},
+        }
+        api_tools = self._build_tools(tools)
+        if api_tools:
+            kwargs["tools"] = api_tools
+        mapped_tc = self._map_tool_choice(tool_choice)
+        if mapped_tc is not None and api_tools:
+            kwargs["tool_choice"] = mapped_tc
+
+        stream = await self.client.chat.completions.create(**kwargs)
+
+        content_parts: list[str] = []
+        tc_map: dict[int, dict] = {}  # index → {id, name, args}
+        tokens_in = 0
+        tokens_out = 0
+        finish_reason = ""
+
+        async for chunk in stream:
+            if chunk.usage:
+                tokens_in = chunk.usage.prompt_tokens or 0
+                tokens_out = chunk.usage.completion_tokens or 0
+            if not chunk.choices:
+                continue
+            choice = chunk.choices[0]
+            if choice.finish_reason:
+                finish_reason = choice.finish_reason
+            delta = choice.delta
+            if delta.content:
+                content_parts.append(delta.content)
+                await on_token(delta.content)
+            if delta.tool_calls:
+                for tc_delta in delta.tool_calls:
+                    idx = tc_delta.index
+                    if idx not in tc_map:
+                        tc_map[idx] = {"id": "", "name": "", "args": ""}
+                    if tc_delta.id:
+                        tc_map[idx]["id"] = tc_delta.id
+                    if tc_delta.function:
+                        if tc_delta.function.name:
+                            tc_map[idx]["name"] = tc_delta.function.name
+                        if tc_delta.function.arguments:
+                            tc_map[idx]["args"] += tc_delta.function.arguments
+
+        content = "".join(content_parts)
+        tool_calls = []
+        for idx in sorted(tc_map.keys()):
+            tc = tc_map[idx]
+            try:
+                args = _json_mod.loads(tc["args"])
+            except (_json_mod.JSONDecodeError, TypeError):
+                logger.warning(
+                    "Failed to parse streamed tool call arguments for %s: %s",
+                    tc["name"], tc["args"][:200],
+                )
+                args = {"_raw_arguments": tc["args"]}
+            tool_calls.append({"id": tc["id"], "name": tc["name"], "arguments": args})
+
+        cost = self.estimate_cost(tokens_in, tokens_out, use_model)
+        stop_reason = finish_reason
         if stop_reason == "tool_calls":
             stop_reason = "tool_use"
 
@@ -145,6 +302,7 @@ class OpenAIProvider(AIProvider):
         max_tokens: int = 4096,
         temperature: float = 0.1,
         system_prompt: str | None = None,
+        tool_choice: str | dict | None = None,
     ) -> AsyncIterator[StreamChunk]:
         api_messages = self._build_messages(messages, system_prompt)
 
@@ -179,3 +337,18 @@ class OpenAIProvider(AIProvider):
     def estimate_cost(self, tokens_input: int, tokens_output: int, model: str) -> float:
         pricing = PRICING.get(model, {"input": 2.50, "output": 10.0})
         return (tokens_input * pricing["input"] + tokens_output * pricing["output"]) / 1_000_000
+
+    def get_context_window(self, model: str | None = None) -> int:
+        return CONTEXT_WINDOWS.get(model or self.default_model, 128_000)
+
+    async def list_models(self) -> list[dict]:
+        known = [
+            {"id": "gpt-4o", "name": "GPT-4o"},
+            {"id": "gpt-4o-mini", "name": "GPT-4o Mini"},
+            {"id": "o3", "name": "O3"},
+            {"id": "o3-mini", "name": "O3 Mini"},
+        ]
+        return [
+            {**m, "is_default": m["id"] == self.default_model}
+            for m in known
+        ]

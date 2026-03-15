@@ -1,10 +1,11 @@
 import asyncio
 import json
+import secrets
 
 from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel
 
-from agents.api.deps import DB, CurrentUser, check_project_access, check_project_owner
+from agents.api.deps import DB, CurrentUser, Redis, check_project_access, check_project_owner
 
 router = APIRouter()
 
@@ -36,6 +37,9 @@ class UpdateProjectInput(BaseModel):
     context_docs: list[ProjectDependency] | None = None
     git_provider_id: str | None = None
     icon_url: str | None = None
+    architect_editor_enabled: bool | None = None
+    architect_model: str | None = None
+    editor_model: str | None = None
 
 
 def _sanitize_project(row: dict) -> dict:
@@ -63,10 +67,10 @@ async def list_projects(user: CurrentUser, db: DB):
 
 
 @router.post("", status_code=status.HTTP_201_CREATED)
-async def create_project(body: CreateProjectInput, user: CurrentUser, db: DB):
-    context_docs_json = json.dumps(
-        [d.model_dump(exclude_none=True) for d in body.context_docs]
-    ) if body.context_docs else "[]"
+async def create_project(body: CreateProjectInput, user: CurrentUser, db: DB, redis: Redis):
+    context_docs_list = [
+        d.model_dump(exclude_none=True) for d in body.context_docs
+    ] if body.context_docs else []
 
     row = await db.fetchrow(
         """
@@ -74,7 +78,7 @@ async def create_project(body: CreateProjectInput, user: CurrentUser, db: DB):
             owner_id, name, description, repo_url, default_branch,
             ai_provider_id, context_docs, git_provider_id, icon_url
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9) RETURNING *
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING *
         """,
         user["id"],
         body.name,
@@ -82,7 +86,7 @@ async def create_project(body: CreateProjectInput, user: CurrentUser, db: DB):
         body.repo_url,
         body.default_branch,
         body.ai_provider_id,
-        context_docs_json,
+        context_docs_list,
         body.git_provider_id,
         body.icon_url,
     )
@@ -90,7 +94,7 @@ async def create_project(body: CreateProjectInput, user: CurrentUser, db: DB):
 
     # Kick off async project analysis if repo_url is provided
     if body.repo_url:
-        asyncio.create_task(_analyze_project(str(row["id"]), db))
+        asyncio.create_task(_analyze_project(str(row["id"]), db, redis))
 
     return result
 
@@ -107,7 +111,7 @@ async def get_project(project_id: str, user: CurrentUser, db: DB):
 
 
 @router.put("/{project_id}")
-async def update_project(project_id: str, body: UpdateProjectInput, user: CurrentUser, db: DB):
+async def update_project(project_id: str, body: UpdateProjectInput, user: CurrentUser, db: DB, redis: Redis):
     await check_project_owner(db, project_id, user)
     row = await db.fetchrow("SELECT * FROM projects WHERE id = $1", project_id)
     if not row:
@@ -117,19 +121,16 @@ async def update_project(project_id: str, body: UpdateProjectInput, user: Curren
     if not updates:
         return _sanitize_project(dict(row))
 
-    # Serialize context_docs to JSON string for JSONB column
+    # Ensure context_docs is a list of dicts (not Pydantic models)
     if "context_docs" in updates:
-        updates["context_docs"] = json.dumps(
-            [d if isinstance(d, dict) else d for d in updates["context_docs"]]
-        )
+        updates["context_docs"] = [
+            d if isinstance(d, dict) else d for d in updates["context_docs"]
+        ]
 
     set_parts = []
     values = []
     for i, (k, v) in enumerate(updates.items()):
-        if k == "context_docs":
-            set_parts.append(f"{k} = ${i+2}::jsonb")
-        else:
-            set_parts.append(f"{k} = ${i+2}")
+        set_parts.append(f"{k} = ${i+2}")
         values.append(v)
 
     set_clause = ", ".join(set_parts)
@@ -151,29 +152,49 @@ async def update_project(project_id: str, body: UpdateProjectInput, user: Curren
     if "repo_url" in updates and updates["repo_url"] != old_repo:
         should_reanalyze = True
     if "context_docs" in updates:
-        old_deps_str = json.dumps(old_deps) if old_deps else "[]"
-        new_deps_str = updates["context_docs"] if isinstance(updates["context_docs"], str) else json.dumps(updates["context_docs"])
-        if new_deps_str != old_deps_str:
+        old_deps_norm = json.dumps(old_deps, sort_keys=True) if old_deps else "[]"
+        new_deps_norm = json.dumps(updates["context_docs"], sort_keys=True) if updates["context_docs"] else "[]"
+        if new_deps_norm != old_deps_norm:
             should_reanalyze = True
     if "git_provider_id" in updates and str(updates["git_provider_id"] or "") != str(old_git or ""):
         should_reanalyze = True
 
     if should_reanalyze and result.get("repo_url"):
-        asyncio.create_task(_analyze_project(project_id, db))
+        asyncio.create_task(_analyze_project(project_id, db, redis))
 
     return result
 
 
 @router.post("/{project_id}/analyze")
-async def analyze_project(project_id: str, user: CurrentUser, db: DB):
+async def analyze_project(project_id: str, user: CurrentUser, db: DB, redis: Redis):
     """Manually trigger project analysis."""
     await check_project_access(db, project_id, user)
     row = await db.fetchrow("SELECT * FROM projects WHERE id = $1", project_id)
     if not row["repo_url"]:
         raise HTTPException(status_code=400, detail="Project has no repository URL")
 
-    asyncio.create_task(_analyze_project(project_id, db))
+    asyncio.create_task(_analyze_project(project_id, db, redis))
     return {"status": "analyzing"}
+
+
+@router.post("/{project_id}/cancel-analysis")
+async def cancel_analysis(project_id: str, user: CurrentUser, db: DB):
+    """Cancel/reset a stuck analysis."""
+    await check_project_access(db, project_id, user)
+    row = await db.fetchrow("SELECT settings_json FROM projects WHERE id = $1", project_id)
+    if not row:
+        raise HTTPException(status_code=404)
+    settings = row["settings_json"] or {}
+    if isinstance(settings, str):
+        settings = json.loads(settings)
+    if settings.get("analysis_status") == "analyzing":
+        settings["analysis_status"] = None
+        await db.execute(
+            "UPDATE projects SET settings_json = $2, updated_at = NOW() WHERE id = $1",
+            project_id,
+            settings,
+        )
+    return {"status": "cancelled"}
 
 
 @router.delete("/{project_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -292,6 +313,29 @@ class WorkRulesInput(BaseModel):
     general: list[str] | None = None
 
 
+# ── Debug Context ──────────────────────────────────────────
+
+
+class DebugLogSource(BaseModel):
+    service_name: str
+    log_path: str | None = None
+    log_command: str | None = None
+    description: str | None = None
+
+
+class DebugMcpHint(BaseModel):
+    mcp_server_name: str
+    available_data: list[str] | None = None
+    example_queries: list[str] | None = None
+    notes: str | None = None
+
+
+class DebugContextInput(BaseModel):
+    log_sources: list[DebugLogSource] | None = None
+    mcp_hints: list[DebugMcpHint] | None = None
+    custom_instructions: str | None = None
+
+
 @router.get("/{project_id}/rules")
 async def get_work_rules(project_id: str, user: CurrentUser, db: DB):
     """Get project-level work rules."""
@@ -318,19 +362,341 @@ async def update_work_rules(project_id: str, body: WorkRulesInput, user: Current
     settings["work_rules"] = rules
 
     await db.execute(
-        "UPDATE projects SET settings_json = $2::jsonb, updated_at = NOW() WHERE id = $1",
+        "UPDATE projects SET settings_json = $2, updated_at = NOW() WHERE id = $1",
         project_id,
-        json.dumps(settings),
+        settings,
     )
     return rules
 
 
-async def _analyze_project(project_id: str, db) -> None:
+@router.get("/{project_id}/debug-context")
+async def get_debug_context(project_id: str, user: CurrentUser, db: DB):
+    """Get project-level debug context (log sources, MCP hints, instructions)."""
+    await check_project_access(db, project_id, user)
+    row = await db.fetchrow("SELECT settings_json FROM projects WHERE id = $1", project_id)
+    settings = row["settings_json"] or {}
+    if isinstance(settings, str):
+        settings = json.loads(settings)
+    return settings.get("debug_context", {})
+
+
+@router.put("/{project_id}/debug-context")
+async def update_debug_context(
+    project_id: str, body: DebugContextInput, user: CurrentUser, db: DB,
+):
+    """Update project-level debug context. Owner-only."""
+    await check_project_owner(db, project_id, user)
+    row = await db.fetchrow("SELECT settings_json FROM projects WHERE id = $1", project_id)
+    settings = row["settings_json"] or {}
+    if isinstance(settings, str):
+        settings = json.loads(settings)
+
+    settings["debug_context"] = body.model_dump(exclude_none=True)
+
+    await db.execute(
+        "UPDATE projects SET settings_json = $2, updated_at = NOW() WHERE id = $1",
+        project_id,
+        settings,
+    )
+    return settings["debug_context"]
+
+
+class BuildSettingsInput(BaseModel):
+    build_commands: list[str] | None = None
+    merge_method: str | None = None
+    require_merge_approval: bool | None = None
+    require_plan_approval: bool | None = None
+
+
+# ── Release Pipeline Settings ─────────────────────────────────────
+
+
+class ReleaseEndpointConfig(BaseModel):
+    enabled: bool = False
+    api_url: str | None = None
+    http_method: str = "POST"
+    headers: dict[str, str] | None = None
+    body_template: str | None = None
+    success_status_codes: list[int] | None = None
+    poll_status_url: str | None = None
+    poll_success_value: str | None = None
+
+
+class ProdReleaseEndpointConfig(ReleaseEndpointConfig):
+    require_approval: bool = False
+
+
+class BuildConfig(BaseModel):
+    workflow_name: str | None = None      # GitHub Actions
+    job_url: str | None = None            # Jenkins
+    token: str | None = None              # Jenkins auth token
+    timeout_minutes: int = 30
+    poll_interval_seconds: int = 30
+
+
+class ReleaseConfig(BaseModel):
+    build_provider: str = "github_actions"  # "github_actions" | "jenkins"
+    build_config: BuildConfig | None = None
+    test_release: ReleaseEndpointConfig | None = None
+    prod_release: ProdReleaseEndpointConfig | None = None
+
+
+class ReleaseSettingsInput(BaseModel):
+    release_pipeline_enabled: bool | None = None
+    release_config: ReleaseConfig | None = None
+
+
+@router.get("/{project_id}/build-settings")
+async def get_build_settings(project_id: str, user: CurrentUser, db: DB):
+    """Get project build & merge settings."""
+    await check_project_access(db, project_id, user)
+    row = await db.fetchrow("SELECT settings_json FROM projects WHERE id = $1", project_id)
+    settings = row["settings_json"] or {}
+    if isinstance(settings, str):
+        settings = json.loads(settings)
+    return {
+        "build_commands": settings.get("build_commands", []),
+        "merge_method": settings.get("merge_method", "squash"),
+        "require_merge_approval": settings.get("require_merge_approval", False),
+        "require_plan_approval": settings.get("require_plan_approval", False),
+    }
+
+
+@router.put("/{project_id}/build-settings")
+async def update_build_settings(
+    project_id: str, body: BuildSettingsInput, user: CurrentUser, db: DB,
+):
+    """Update project build & merge settings. Owner-only."""
+    await check_project_owner(db, project_id, user)
+    row = await db.fetchrow("SELECT settings_json FROM projects WHERE id = $1", project_id)
+    if not row:
+        raise HTTPException(status_code=404)
+    settings = row["settings_json"] or {}
+    if isinstance(settings, str):
+        settings = json.loads(settings)
+
+    if body.build_commands is not None:
+        settings["build_commands"] = body.build_commands
+    if body.merge_method is not None:
+        settings["merge_method"] = body.merge_method
+    if body.require_merge_approval is not None:
+        settings["require_merge_approval"] = body.require_merge_approval
+    if body.require_plan_approval is not None:
+        settings["require_plan_approval"] = body.require_plan_approval
+
+    await db.execute(
+        "UPDATE projects SET settings_json = $2, updated_at = NOW() WHERE id = $1",
+        project_id,
+        settings,
+    )
+    return {
+        "build_commands": settings.get("build_commands", []),
+        "merge_method": settings.get("merge_method", "squash"),
+        "require_merge_approval": settings.get("require_merge_approval", False),
+        "require_plan_approval": settings.get("require_plan_approval", False),
+    }
+
+
+@router.get("/{project_id}/release-settings")
+async def get_release_settings(project_id: str, user: CurrentUser, db: DB):
+    """Get project release pipeline settings."""
+    await check_project_access(db, project_id, user)
+    row = await db.fetchrow("SELECT settings_json FROM projects WHERE id = $1", project_id)
+    settings = row["settings_json"] or {}
+    if isinstance(settings, str):
+        settings = json.loads(settings)
+    return {
+        "release_pipeline_enabled": settings.get("release_pipeline_enabled", False),
+        "release_config": settings.get("release_config", {}),
+    }
+
+
+@router.put("/{project_id}/release-settings")
+async def update_release_settings(
+    project_id: str, body: ReleaseSettingsInput, user: CurrentUser, db: DB,
+):
+    """Update project release pipeline settings. Owner-only."""
+    await check_project_owner(db, project_id, user)
+    row = await db.fetchrow("SELECT settings_json FROM projects WHERE id = $1", project_id)
+    if not row:
+        raise HTTPException(status_code=404)
+    settings = row["settings_json"] or {}
+    if isinstance(settings, str):
+        settings = json.loads(settings)
+
+    if body.release_pipeline_enabled is not None:
+        settings["release_pipeline_enabled"] = body.release_pipeline_enabled
+    if body.release_config is not None:
+        settings["release_config"] = body.release_config.model_dump(exclude_none=True)
+
+    await db.execute(
+        "UPDATE projects SET settings_json = $2, updated_at = NOW() WHERE id = $1",
+        project_id,
+        settings,
+    )
+    return {
+        "release_pipeline_enabled": settings.get("release_pipeline_enabled", False),
+        "release_config": settings.get("release_config", {}),
+    }
+
+
+# ── Project Memories ──────────────────────────────────────────
+
+
+class UpdateMemoryInput(BaseModel):
+    content: str | None = None
+    category: str | None = None
+    confidence: float | None = None
+
+
+@router.get("/{project_id}/memories")
+async def list_memories(project_id: str, user: CurrentUser, db: DB):
+    """List project memories with optional category filter."""
+    await check_project_access(db, project_id, user)
+    rows = await db.fetch(
+        """
+        SELECT id, project_id, category, content, source_todo_id,
+               confidence, created_at, updated_at
+        FROM project_memories
+        WHERE project_id = $1
+        ORDER BY confidence DESC, created_at DESC
+        """,
+        project_id,
+    )
+    return [dict(r) for r in rows]
+
+
+@router.put("/{project_id}/memories/{memory_id}")
+async def update_memory(
+    project_id: str, memory_id: str, body: UpdateMemoryInput,
+    user: CurrentUser, db: DB,
+):
+    """Update a memory's content or category. Owner-only."""
+    await check_project_owner(db, project_id, user)
+    row = await db.fetchrow(
+        "SELECT id FROM project_memories WHERE id = $1 AND project_id = $2",
+        memory_id, project_id,
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail="Memory not found")
+
+    updates = body.model_dump(exclude_none=True)
+    if not updates:
+        return {"status": "no changes"}
+
+    set_parts = []
+    values = []
+    for i, (k, v) in enumerate(updates.items()):
+        set_parts.append(f"{k} = ${i+3}")
+        values.append(v)
+
+    await db.execute(
+        f"UPDATE project_memories SET {', '.join(set_parts)}, updated_at = NOW() WHERE id = $1 AND project_id = $2",
+        memory_id, project_id, *values,
+    )
+    return {"status": "ok"}
+
+
+@router.delete("/{project_id}/memories/{memory_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_memory(project_id: str, memory_id: str, user: CurrentUser, db: DB):
+    """Delete a memory. Owner-only."""
+    await check_project_owner(db, project_id, user)
+    result = await db.execute(
+        "DELETE FROM project_memories WHERE id = $1 AND project_id = $2",
+        memory_id, project_id,
+    )
+    if result == "DELETE 0":
+        raise HTTPException(status_code=404, detail="Memory not found")
+
+
+# ── Webhook Secrets ──────────────────────────────────────────
+
+
+class WebhookSecretInput(BaseModel):
+    provider_type: str  # 'github' | 'gitlab'
+
+
+@router.post("/{project_id}/webhook-secrets", status_code=status.HTTP_201_CREATED)
+async def create_webhook_secret(
+    project_id: str, body: WebhookSecretInput, user: CurrentUser, db: DB,
+):
+    """Generate and store a webhook secret for a provider. Owner-only."""
+    await check_project_owner(db, project_id, user)
+
+    if body.provider_type not in ("github", "gitlab"):
+        raise HTTPException(status_code=400, detail="provider_type must be 'github' or 'gitlab'")
+
+    secret = secrets.token_hex(32)
+
+    # Upsert: deactivate existing, insert new
+    await db.execute(
+        "UPDATE webhook_secrets SET is_active = FALSE WHERE project_id = $1 AND provider_type = $2",
+        project_id, body.provider_type,
+    )
+    row = await db.fetchrow(
+        """
+        INSERT INTO webhook_secrets (project_id, provider_type, secret)
+        VALUES ($1, $2, $3)
+        RETURNING id, provider_type, is_active, created_at
+        """,
+        project_id, body.provider_type, secret,
+    )
+
+    return {
+        "id": str(row["id"]),
+        "provider_type": row["provider_type"],
+        "secret": secret,
+        "webhook_url": f"/api/webhooks/{body.provider_type}/{project_id}",
+        "created_at": str(row["created_at"]),
+    }
+
+
+@router.get("/{project_id}/webhook-secrets")
+async def list_webhook_secrets(project_id: str, user: CurrentUser, db: DB):
+    """List webhook secrets (without exposing secret values). Owner-only."""
+    await check_project_owner(db, project_id, user)
+    rows = await db.fetch(
+        """
+        SELECT id, provider_type, is_active, created_at, updated_at
+        FROM webhook_secrets
+        WHERE project_id = $1
+        ORDER BY created_at DESC
+        """,
+        project_id,
+    )
+    return [
+        {
+            "id": str(r["id"]),
+            "provider_type": r["provider_type"],
+            "is_active": r["is_active"],
+            "webhook_url": f"/api/webhooks/{r['provider_type']}/{project_id}",
+            "created_at": str(r["created_at"]),
+            "updated_at": str(r["updated_at"]),
+        }
+        for r in rows
+    ]
+
+
+@router.delete("/{project_id}/webhook-secrets/{secret_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_webhook_secret(
+    project_id: str, secret_id: str, user: CurrentUser, db: DB,
+):
+    """Delete a webhook secret. Owner-only."""
+    await check_project_owner(db, project_id, user)
+    result = await db.execute(
+        "DELETE FROM webhook_secrets WHERE id = $1 AND project_id = $2",
+        secret_id, project_id,
+    )
+    if result == "DELETE 0":
+        raise HTTPException(status_code=404, detail="Webhook secret not found")
+
+
+async def _analyze_project(project_id: str, db, redis=None) -> None:
     """Background task to analyze a project's repo and store understanding."""
     from agents.orchestrator.project_analyzer import ProjectAnalyzer
 
     try:
-        analyzer = ProjectAnalyzer(db)
+        analyzer = ProjectAnalyzer(db, redis=redis)
         await analyzer.analyze(project_id)
     except Exception:
         import logging

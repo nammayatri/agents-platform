@@ -1,4 +1,4 @@
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable, Awaitable
 
 import anthropic
 
@@ -10,6 +10,13 @@ PRICING = {
     "claude-sonnet-4-20250514": {"input": 3.0, "output": 15.0},
     "claude-opus-4-20250514": {"input": 15.0, "output": 75.0},
     "claude-haiku-3-20250311": {"input": 0.25, "output": 1.25},
+}
+
+# Context window sizes (tokens)
+CONTEXT_WINDOWS = {
+    "claude-sonnet-4-20250514": 200_000,
+    "claude-opus-4-20250514": 200_000,
+    "claude-haiku-3-20250311": 200_000,
 }
 
 
@@ -77,6 +84,19 @@ class AnthropicProvider(AIProvider):
             for t in tools
         ]
 
+    @staticmethod
+    def _map_tool_choice(tool_choice: str | dict | None) -> dict | None:
+        """Map canonical tool_choice to Anthropic format."""
+        if tool_choice is None:
+            return None
+        if isinstance(tool_choice, dict) and "name" in tool_choice:
+            return {"type": "tool", "name": tool_choice["name"]}
+        if tool_choice == "required":
+            return {"type": "any"}
+        if tool_choice == "none":
+            return None  # handled by caller removing tools
+        return {"type": "auto"}
+
     async def send_message(
         self,
         messages: list[LLMMessage],
@@ -86,6 +106,7 @@ class AnthropicProvider(AIProvider):
         max_tokens: int = 4096,
         temperature: float = 0.1,
         system_prompt: str | None = None,
+        tool_choice: str | dict | None = None,
     ) -> LLMResponse:
         sys_from_messages, api_messages = self._build_messages(messages)
         system = system_prompt or sys_from_messages
@@ -98,9 +119,15 @@ class AnthropicProvider(AIProvider):
         }
         if system:
             kwargs["system"] = system
+        # For tool_choice="none", skip sending tools entirely
+        if tool_choice == "none":
+            tools = None
         api_tools = self._build_tools(tools)
         if api_tools:
             kwargs["tools"] = api_tools
+        mapped_tc = self._map_tool_choice(tool_choice)
+        if mapped_tc is not None and api_tools:
+            kwargs["tool_choice"] = mapped_tc
 
         response = await self.client.messages.create(**kwargs)
 
@@ -134,6 +161,72 @@ class AnthropicProvider(AIProvider):
             cached_tokens=getattr(response.usage, "cache_read_input_tokens", 0) or 0,
         )
 
+    async def send_message_streaming(
+        self,
+        messages: list[LLMMessage],
+        *,
+        on_token: Callable[[str], Awaitable[None]],
+        model: str | None = None,
+        tools: list[dict] | None = None,
+        max_tokens: int = 4096,
+        temperature: float = 0.1,
+        system_prompt: str | None = None,
+        tool_choice: str | dict | None = None,
+    ) -> LLMResponse:
+        sys_from_messages, api_messages = self._build_messages(messages)
+        system = system_prompt or sys_from_messages
+
+        kwargs: dict = {
+            "model": model or self.default_model,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "messages": api_messages,
+        }
+        if system:
+            kwargs["system"] = system
+        if tool_choice == "none":
+            tools = None
+        api_tools = self._build_tools(tools)
+        if api_tools:
+            kwargs["tools"] = api_tools
+        mapped_tc = self._map_tool_choice(tool_choice)
+        if mapped_tc is not None and api_tools:
+            kwargs["tool_choice"] = mapped_tc
+
+        async with self.client.messages.stream(**kwargs) as stream:
+            async for text in stream.text_stream:
+                await on_token(text)
+            final = await stream.get_final_message()
+
+        content = ""
+        tool_calls = []
+        for block in final.content:
+            if block.type == "text":
+                content += block.text
+            elif block.type == "tool_use":
+                tool_calls.append({
+                    "id": block.id,
+                    "name": block.name,
+                    "arguments": block.input,
+                })
+
+        cost = self.estimate_cost(
+            final.usage.input_tokens,
+            final.usage.output_tokens,
+            kwargs["model"],
+        )
+
+        return LLMResponse(
+            content=content,
+            tool_calls=tool_calls,
+            tokens_input=final.usage.input_tokens,
+            tokens_output=final.usage.output_tokens,
+            model=kwargs["model"],
+            stop_reason=final.stop_reason or "",
+            cost_usd=cost,
+            cached_tokens=getattr(final.usage, "cache_read_input_tokens", 0) or 0,
+        )
+
     async def stream_message(
         self,
         messages: list[LLMMessage],
@@ -143,6 +236,7 @@ class AnthropicProvider(AIProvider):
         max_tokens: int = 4096,
         temperature: float = 0.1,
         system_prompt: str | None = None,
+        tool_choice: str | dict | None = None,
     ) -> AsyncIterator[StreamChunk]:
         sys_from_messages, api_messages = self._build_messages(messages)
         system = system_prompt or sys_from_messages
@@ -177,3 +271,17 @@ class AnthropicProvider(AIProvider):
     def estimate_cost(self, tokens_input: int, tokens_output: int, model: str) -> float:
         pricing = PRICING.get(model, {"input": 3.0, "output": 15.0})
         return (tokens_input * pricing["input"] + tokens_output * pricing["output"]) / 1_000_000
+
+    def get_context_window(self, model: str | None = None) -> int:
+        return CONTEXT_WINDOWS.get(model or self.default_model, 200_000)
+
+    async def list_models(self) -> list[dict]:
+        known = [
+            {"id": "claude-opus-4-20250514", "name": "Claude Opus 4"},
+            {"id": "claude-sonnet-4-20250514", "name": "Claude Sonnet 4"},
+            {"id": "claude-haiku-3-20250311", "name": "Claude Haiku 3"},
+        ]
+        return [
+            {**m, "is_default": m["id"] == self.default_model}
+            for m in known
+        ]

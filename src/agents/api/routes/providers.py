@@ -2,10 +2,7 @@ from fastapi import APIRouter, HTTPException, status
 
 from agents.api.deps import DB, CurrentUser
 from agents.infra.crypto import encrypt
-from agents.schemas.provider import (
-    NotificationChannelInput,
-    ProviderConfigInput,
-)
+from agents.schemas.provider import ProviderConfigInput
 
 router = APIRouter()
 
@@ -18,7 +15,8 @@ async def list_providers(user: CurrentUser, db: DB):
     rows = await db.fetch(
         """
         SELECT id, owner_id, provider_type, display_name, api_base_url,
-               default_model, fast_model, max_tokens, temperature, is_active
+               default_model, fast_model, max_tokens, temperature, is_active,
+               extra_config
         FROM ai_provider_configs
         WHERE owner_id = $1 OR owner_id IS NULL
         ORDER BY created_at DESC
@@ -30,8 +28,8 @@ async def list_providers(user: CurrentUser, db: DB):
 
 @router.post("", status_code=status.HTTP_201_CREATED)
 async def create_provider(body: ProviderConfigInput, user: CurrentUser, db: DB):
-    api_key_enc = encrypt(body.api_key) if body.api_key else None
-    import json
+    api_key_clean = body.api_key.strip() if body.api_key else None
+    api_key_enc = encrypt(api_key_clean) if api_key_clean else None
 
     row = await db.fetchrow(
         """
@@ -40,9 +38,10 @@ async def create_provider(body: ProviderConfigInput, user: CurrentUser, db: DB):
             api_key_enc, default_model, fast_model, max_tokens,
             temperature, extra_config
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
         RETURNING id, owner_id, provider_type, display_name, api_base_url,
-                  default_model, fast_model, max_tokens, temperature, is_active
+                  default_model, fast_model, max_tokens, temperature, is_active,
+                  extra_config
         """,
         user["id"],
         body.provider_type,
@@ -53,7 +52,7 @@ async def create_provider(body: ProviderConfigInput, user: CurrentUser, db: DB):
         body.fast_model,
         body.max_tokens,
         body.temperature,
-        json.dumps(body.extra_config),
+        body.extra_config,
     )
     return dict(row)
 
@@ -68,8 +67,8 @@ async def update_provider(provider_id: str, body: ProviderConfigInput, user: Cur
     if existing["owner_id"] and str(existing["owner_id"]) != str(user["id"]):
         raise HTTPException(status_code=403)
 
-    api_key_enc = encrypt(body.api_key) if body.api_key else None
-    import json
+    api_key_clean = body.api_key.strip() if body.api_key else None
+    api_key_enc = encrypt(api_key_clean) if api_key_clean else None
 
     row = await db.fetchrow(
         """
@@ -77,10 +76,11 @@ async def update_provider(provider_id: str, body: ProviderConfigInput, user: Cur
         SET provider_type = $2, display_name = $3, api_base_url = $4,
             api_key_enc = COALESCE($5, api_key_enc), default_model = $6,
             fast_model = $7, max_tokens = $8, temperature = $9,
-            extra_config = $10::jsonb
+            extra_config = $10
         WHERE id = $1
         RETURNING id, owner_id, provider_type, display_name, api_base_url,
-                  default_model, fast_model, max_tokens, temperature, is_active
+                  default_model, fast_model, max_tokens, temperature, is_active,
+                  extra_config
         """,
         provider_id,
         body.provider_type,
@@ -91,7 +91,7 @@ async def update_provider(provider_id: str, body: ProviderConfigInput, user: Cur
         body.fast_model,
         body.max_tokens,
         body.temperature,
-        json.dumps(body.extra_config),
+        body.extra_config,
     )
     return dict(row)
 
@@ -110,9 +110,9 @@ async def delete_provider(provider_id: str, user: CurrentUser, db: DB):
 
 @router.post("/{provider_id}/test")
 async def test_provider(provider_id: str, user: CurrentUser, db: DB):
-    from agents.providers.registry import ProviderRegistry
+    from agents.providers.registry import get_registry
 
-    registry = ProviderRegistry(db)
+    registry = get_registry(db)
     try:
         provider = await registry.instantiate(provider_id)
     except Exception as e:
@@ -125,43 +125,23 @@ async def test_provider(provider_id: str, user: CurrentUser, db: DB):
         return {"status": "error", "detail": str(e)}
 
 
-# --- Notification Channels ---
+@router.get("/{provider_id}/models")
+async def list_provider_models(provider_id: str, user: CurrentUser, db: DB):
+    """List available models for a provider."""
+    from agents.providers.registry import get_registry
 
-
-@router.get("/notifications")
-async def list_notification_channels(user: CurrentUser, db: DB):
-    rows = await db.fetch(
-        "SELECT * FROM notification_channels WHERE user_id = $1 ORDER BY created_at DESC",
-        user["id"],
+    config = await db.fetchrow(
+        "SELECT id, owner_id FROM ai_provider_configs WHERE id = $1", provider_id
     )
-    return [dict(r) for r in rows]
-
-
-@router.post("/notifications", status_code=status.HTTP_201_CREATED)
-async def create_notification_channel(body: NotificationChannelInput, user: CurrentUser, db: DB):
-    import json
-
-    row = await db.fetchrow(
-        """
-        INSERT INTO notification_channels
-            (user_id, channel_type, display_name, config_json, notify_on)
-        VALUES ($1, $2, $3, $4::jsonb, $5)
-        RETURNING *
-        """,
-        user["id"],
-        body.channel_type,
-        body.display_name,
-        json.dumps(body.config_json),
-        body.notify_on,
-    )
-    return dict(row)
-
-
-@router.delete("/notifications/{channel_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_notification_channel(channel_id: str, user: CurrentUser, db: DB):
-    existing = await db.fetchrow(
-        "SELECT user_id FROM notification_channels WHERE id = $1", channel_id
-    )
-    if not existing or str(existing["user_id"]) != str(user["id"]):
+    if not config:
         raise HTTPException(status_code=404)
-    await db.execute("DELETE FROM notification_channels WHERE id = $1", channel_id)
+    if config["owner_id"] and str(config["owner_id"]) != str(user["id"]):
+        raise HTTPException(status_code=403)
+
+    registry = get_registry(db)
+    try:
+        provider = await registry.instantiate(provider_id)
+        models = await provider.list_models()
+        return {"provider_id": provider_id, "models": models}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to list models: {e}")

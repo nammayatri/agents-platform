@@ -2,7 +2,10 @@ import { useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { projects as projectsApi } from '../../services/api'
 import type { Project, ProjectDependency, ProviderConfig, GitProviderConfig } from '../../types'
-import { inputClass, selectClass } from '../../styles/classes'
+
+import ProjectGeneralTab from './ProjectGeneralTab'
+import ProjectRepoTab from './ProjectRepoTab'
+import ProjectDepsTab from './ProjectDepsTab'
 
 interface ProjectWizardProps {
   onComplete: (projectId: string) => void
@@ -28,14 +31,6 @@ export default function ProjectWizard({ onComplete, providers, gitProviders }: P
   const wizardSteps = ['Project', 'Repository', 'Dependencies', 'Review']
 
   const activeProviders = providers.filter((p) => p.is_active)
-
-  const addDependency = () => setDependencies([...dependencies, { name: '', repo_url: '', description: '' }])
-  const updateDependency = (i: number, field: keyof ProjectDependency, value: string) => {
-    const updated = [...dependencies]
-    updated[i] = { ...updated[i], [field]: value }
-    setDependencies(updated)
-  }
-  const removeDependency = (i: number) => setDependencies(dependencies.filter((_, idx) => idx !== i))
 
   const handleSave = async () => {
     if (!name.trim()) { setError('Project name is required'); return }
@@ -109,94 +104,29 @@ export default function ProjectWizard({ onComplete, providers, gitProviders }: P
       {/* Step content */}
       <div className="space-y-4 min-h-[200px]">
         {wizardStep === 0 && (
-          <>
-            <div>
-              <label className="block text-xs text-gray-500 mb-1">Project Name *</label>
-              <input className={inputClass} placeholder="My Awesome Project" value={name} onChange={(e) => setName(e.target.value)} autoFocus />
-            </div>
-            <div>
-              <label className="block text-xs text-gray-500 mb-1">Description</label>
-              <textarea className={`${inputClass} resize-none`} placeholder="What is this project about?" value={description} onChange={(e) => setDescription(e.target.value)} rows={3} />
-            </div>
-            <div>
-              <label className="block text-xs text-gray-500 mb-1">Icon URL</label>
-              <div className="flex items-center gap-3">
-                {iconUrl && (
-                  <div className="w-8 h-8 rounded bg-gray-800/60 shrink-0 flex items-center justify-center overflow-hidden"><img src={iconUrl} alt="" className="w-6 h-6 object-contain" onError={(e) => { (e.target as HTMLImageElement).parentElement!.style.display = 'none' }} /></div>
-                )}
-                <input className={inputClass} placeholder="https://example.com/icon.png" value={iconUrl} onChange={(e) => setIconUrl(e.target.value)} />
-              </div>
-              <p className="text-[11px] text-gray-600 mt-1">Optional. Shown in sidebar next to project name.</p>
-            </div>
-            <div>
-              <label className="block text-xs text-gray-500 mb-1">AI Provider</label>
-              <select value={aiProviderId} onChange={(e) => setAiProviderId(e.target.value)} className={selectClass}>
-                <option value="">Default (auto-resolve)</option>
-                {activeProviders.map((p) => (
-                  <option key={p.id} value={p.id}>{p.display_name} -- {p.default_model}</option>
-                ))}
-              </select>
-            </div>
-          </>
+          <ProjectGeneralTab
+            name={name} setName={setName}
+            description={description} setDescription={setDescription}
+            iconUrl={iconUrl} setIconUrl={setIconUrl}
+            aiProviderId={aiProviderId} setAiProviderId={setAiProviderId}
+            activeProviders={activeProviders}
+          />
         )}
 
         {wizardStep === 1 && (
-          <>
-            <div>
-              <label className="block text-xs text-gray-500 mb-1">Repository URL</label>
-              <input className={inputClass} placeholder="https://github.com/org/repo" value={repoUrl} onChange={(e) => setRepoUrl(e.target.value)} autoFocus />
-              <p className="text-[11px] text-gray-600 mt-1">Optional. Enables code analysis and PR creation.</p>
-            </div>
-            <div>
-              <label className="block text-xs text-gray-500 mb-1">Default Branch</label>
-              <input className={inputClass} placeholder="main" value={defaultBranch} onChange={(e) => setDefaultBranch(e.target.value)} />
-            </div>
-            {gitProviders.length > 0 && (
-              <div>
-                <label className="block text-xs text-gray-500 mb-1">Git Provider</label>
-                <select value={gitProviderId} onChange={(e) => setGitProviderId(e.target.value)} className={selectClass}>
-                  <option value="">None (public repos only)</option>
-                  {gitProviders.map((g) => (
-                    <option key={g.id} value={g.id}>{g.display_name} ({g.provider_type})</option>
-                  ))}
-                </select>
-                <p className="text-[11px] text-gray-600 mt-1">For private repositories. Configure providers in Settings.</p>
-              </div>
-            )}
-          </>
+          <ProjectRepoTab
+            repoUrl={repoUrl} setRepoUrl={setRepoUrl}
+            defaultBranch={defaultBranch} setDefaultBranch={setDefaultBranch}
+            gitProviderId={gitProviderId} setGitProviderId={setGitProviderId}
+            gitProviderList={gitProviders}
+          />
         )}
 
         {wizardStep === 2 && (
-          <>
-            <div className="flex items-center justify-between">
-              <div>
-                <p className="text-sm text-gray-300">Context Dependencies</p>
-                <p className="text-[11px] text-gray-600 mt-0.5">Libraries or repos this project depends on. Helps AI understand your stack.</p>
-              </div>
-              <button onClick={addDependency} className="text-xs text-indigo-400 hover:text-indigo-300 transition-colors shrink-0">
-                + Add
-              </button>
-            </div>
-            {dependencies.length === 0 && (
-              <div className="py-8 text-center text-sm text-gray-600 border border-dashed border-gray-800 rounded-lg">
-                No dependencies yet. You can add them later.
-              </div>
-            )}
-            <div className="space-y-2">
-              {dependencies.map((dep, i) => (
-                <div key={i} className="p-3 bg-gray-900 border border-gray-800 rounded-lg">
-                  <div className="grid grid-cols-3 gap-2 mb-2">
-                    <input className="px-2 py-1.5 bg-gray-950 border border-gray-800 rounded text-white text-sm focus:outline-none focus:border-indigo-500 transition-colors" placeholder="Name" value={dep.name} onChange={(e) => updateDependency(i, 'name', e.target.value)} />
-                    <input className="col-span-2 px-2 py-1.5 bg-gray-950 border border-gray-800 rounded text-white text-sm focus:outline-none focus:border-indigo-500 transition-colors" placeholder="Repository URL (optional)" value={dep.repo_url || ''} onChange={(e) => updateDependency(i, 'repo_url', e.target.value)} />
-                  </div>
-                  <div className="flex gap-2">
-                    <input className="flex-1 px-2 py-1.5 bg-gray-950 border border-gray-800 rounded text-white text-sm focus:outline-none focus:border-indigo-500 transition-colors" placeholder="Short description (optional)" value={dep.description || ''} onChange={(e) => updateDependency(i, 'description', e.target.value)} />
-                    <button onClick={() => removeDependency(i)} className="px-2 py-1.5 text-gray-600 hover:text-red-400 transition-colors text-sm">Remove</button>
-                  </div>
-                </div>
-              ))}
-            </div>
-          </>
+          <ProjectDepsTab
+            dependencies={dependencies} setDependencies={setDependencies}
+            gitProviderList={gitProviders}
+          />
         )}
 
         {wizardStep === 3 && (

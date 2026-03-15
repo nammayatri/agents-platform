@@ -78,6 +78,37 @@ def validate_agent_output(
         return None, errors
 
 
+def validate_agent_output_dict(
+    role: str,
+    data: dict[str, Any],
+    raw_content: str = "",
+) -> tuple[dict[str, Any] | None, list[str]]:
+    """Validate a pre-parsed dict (from tool call arguments) against the schema.
+
+    Use this when structured output comes from a ``submit_result`` tool call
+    rather than text extraction.
+    """
+    schema_cls = ROLE_OUTPUT_SCHEMAS.get(role)
+    if schema_cls is None:
+        data.setdefault("raw_content", raw_content)
+        data.setdefault("content", raw_content)
+        return data, []
+
+    data["raw_content"] = raw_content
+
+    try:
+        validated = schema_cls.model_validate(data)
+        result = validated.model_dump()
+        result["content"] = raw_content
+        return result, []
+    except ValidationError as exc:
+        errors: list[str] = []
+        for err in exc.errors():
+            field_path = " -> ".join(str(loc) for loc in err["loc"])
+            errors.append(f"'{field_path}': {err['msg']}")
+        return None, errors
+
+
 # ── Correction prompt ───────────────────────────────────────────────
 
 

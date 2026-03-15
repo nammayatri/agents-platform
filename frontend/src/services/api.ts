@@ -8,7 +8,9 @@ import type {
   ProviderCreatePayload, ProviderUpdatePayload,
   GitProviderPayload, SkillPayload, McpServerPayload,
   NotificationChannelPayload, AgentCreatePayload, AgentUpdatePayload,
-  ProjectMember,
+  ProjectMember, DebugContext, ProjectMemory,
+  FileTreeNode, FileContent, GitStatus,
+  ProviderRepos, ReleaseConfig,
 } from '../types'
 
 const API_BASE = '/api'
@@ -72,6 +74,7 @@ export const projects = {
     request<Project>(`/projects/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
   delete: (id: string) => request<void>(`/projects/${id}`, { method: 'DELETE' }),
   analyze: (id: string) => request<{ status: string }>(`/projects/${id}/analyze`, { method: 'POST' }),
+  cancelAnalysis: (id: string) => request<{ status: string }>(`/projects/${id}/cancel-analysis`, { method: 'POST' }),
   rules: {
     get: (projectId: string) =>
       request<Record<string, string[]>>(`/projects/${projectId}/rules`),
@@ -80,6 +83,37 @@ export const projects = {
         method: 'PUT',
         body: JSON.stringify(rules),
       }),
+  },
+  debugContext: {
+    get: (projectId: string) =>
+      request<DebugContext>(`/projects/${projectId}/debug-context`),
+    update: (projectId: string, data: DebugContext) =>
+      request<DebugContext>(`/projects/${projectId}/debug-context`, {
+        method: 'PUT',
+        body: JSON.stringify(data),
+      }),
+  },
+  buildSettings: {
+    get: (projectId: string) =>
+      request<{ build_commands: string[]; merge_method: string; require_merge_approval: boolean; require_plan_approval: boolean }>(
+        `/projects/${projectId}/build-settings`,
+      ),
+    update: (projectId: string, data: { build_commands?: string[]; merge_method?: string; require_merge_approval?: boolean; require_plan_approval?: boolean }) =>
+      request<{ build_commands: string[]; merge_method: string; require_merge_approval: boolean; require_plan_approval: boolean }>(
+        `/projects/${projectId}/build-settings`,
+        { method: 'PUT', body: JSON.stringify(data) },
+      ),
+  },
+  releaseSettings: {
+    get: (projectId: string) =>
+      request<{ release_pipeline_enabled: boolean; release_config: ReleaseConfig }>(
+        `/projects/${projectId}/release-settings`,
+      ),
+    update: (projectId: string, data: { release_pipeline_enabled?: boolean; release_config?: ReleaseConfig }) =>
+      request<{ release_pipeline_enabled: boolean; release_config: ReleaseConfig }>(
+        `/projects/${projectId}/release-settings`,
+        { method: 'PUT', body: JSON.stringify(data) },
+      ),
   },
   members: {
     list: (projectId: string) =>
@@ -93,6 +127,17 @@ export const projects = {
       ),
     remove: (projectId: string, userId: string) =>
       request<void>(`/projects/${projectId}/members/${userId}`, { method: 'DELETE' }),
+  },
+  memories: {
+    list: (projectId: string) =>
+      request<ProjectMemory[]>(`/projects/${projectId}/memories`),
+    update: (projectId: string, memoryId: string, data: { content?: string; category?: string; confidence?: number }) =>
+      request<{ status: string }>(`/projects/${projectId}/memories/${memoryId}`, {
+        method: 'PUT',
+        body: JSON.stringify(data),
+      }),
+    delete: (projectId: string, memoryId: string) =>
+      request<void>(`/projects/${projectId}/memories/${memoryId}`, { method: 'DELETE' }),
   },
 }
 
@@ -116,6 +161,16 @@ export const todos = {
       method: 'POST',
       body: JSON.stringify({ with_context: withContext ?? false }),
     }),
+  triggerSubTask: (todoId: string, subTaskId: string, force: boolean = false) =>
+    request<{ status: string; sub_task_id: string; force: boolean }>(
+      `/todos/${todoId}/sub-tasks/${subTaskId}/trigger`,
+      { method: 'POST', body: JSON.stringify({ force }) },
+    ),
+  injectSubtask: (todoId: string, subtaskId: string, content: string) =>
+    request<{ status: string }>(`/todos/${todoId}/subtasks/${subtaskId}/inject`, {
+      method: 'POST',
+      body: JSON.stringify({ content }),
+    }),
   acceptDeliverables: (id: string) =>
     request<TodoItem>(`/todos/${id}/accept-deliverables`, { method: 'POST' }),
   requestChanges: (id: string, feedback: string) =>
@@ -130,6 +185,71 @@ export const todos = {
       method: 'POST',
       body: JSON.stringify({ feedback }),
     }),
+  approveMerge: (id: string) =>
+    request<{ status: string }>(`/todos/${id}/approve-merge`, { method: 'POST' }),
+  rejectMerge: (id: string, feedback: string) =>
+    request<{ status: string }>(`/todos/${id}/reject-merge`, {
+      method: 'POST',
+      body: JSON.stringify({ feedback }),
+    }),
+  approveRelease: (id: string) =>
+    request<{ status: string }>(`/todos/${id}/approve-release`, { method: 'POST' }),
+  rejectRelease: (id: string, feedback: string) =>
+    request<{ status: string }>(`/todos/${id}/reject-release`, {
+      method: 'POST',
+      body: JSON.stringify({ feedback }),
+    }),
+  resume: (id: string) =>
+    request<{ status: string }>(`/todos/${id}/resume`, { method: 'POST' }),
+  workspace: {
+    repos: (todoId: string) =>
+      request<Array<{ name: string; label: string }>>(`/todos/${todoId}/workspace/repos`),
+    tree: (todoId: string, repo?: string) => {
+      const params = new URLSearchParams()
+      if (repo) params.set('repo', repo)
+      const qs = params.toString()
+      return request<FileTreeNode[]>(`/todos/${todoId}/workspace/tree${qs ? `?${qs}` : ''}`)
+    },
+    file: (todoId: string, path: string, repo?: string) => {
+      const params = new URLSearchParams({ path })
+      if (repo) params.set('repo', repo)
+      return request<FileContent>(`/todos/${todoId}/workspace/file?${params}`)
+    },
+    saveFile: (todoId: string, path: string, content: string, repo?: string) =>
+      request<{ path: string; size: number; saved: boolean }>(`/todos/${todoId}/workspace/file`, {
+        method: 'PUT',
+        body: JSON.stringify({ path, content, repo: repo || undefined }),
+      }),
+    gitStatus: (todoId: string, repo?: string) => {
+      const params = new URLSearchParams()
+      if (repo) params.set('repo', repo)
+      const qs = params.toString()
+      return request<GitStatus>(`/todos/${todoId}/workspace/git/status${qs ? `?${qs}` : ''}`)
+    },
+    gitDiff: (todoId: string, staged?: boolean, path?: string, repo?: string) => {
+      const params = new URLSearchParams()
+      if (staged) params.set('staged', 'true')
+      if (path) params.set('path', path)
+      if (repo) params.set('repo', repo)
+      const qs = params.toString()
+      return request<{ diff: string; stats: string }>(`/todos/${todoId}/workspace/git/diff${qs ? `?${qs}` : ''}`)
+    },
+    gitAdd: (todoId: string, paths: string[], repo?: string) =>
+      request<GitStatus>(`/todos/${todoId}/workspace/git/add`, {
+        method: 'POST',
+        body: JSON.stringify({ paths, repo: repo || undefined }),
+      }),
+    gitCommit: (todoId: string, message: string, repo?: string) =>
+      request<{ hash: string; message: string; success: boolean }>(`/todos/${todoId}/workspace/git/commit`, {
+        method: 'POST',
+        body: JSON.stringify({ message, repo: repo || undefined }),
+      }),
+    gitPush: (todoId: string, repo?: string) =>
+      request<{ success: boolean; output: string; branch: string }>(`/todos/${todoId}/workspace/git/push`, {
+        method: 'POST',
+        body: JSON.stringify({ repo: repo || undefined }),
+      }),
+  },
 }
 
 // Chat (todo-level)
@@ -173,6 +293,11 @@ export const projectChat = {
         `/projects/${projectId}/chat/sessions/${sessionId}/toggle-plan`,
         { method: 'POST' },
       ),
+    setChatMode: (projectId: string, sessionId: string, mode: string) =>
+      request<{ chat_mode: string; plan_mode: boolean }>(
+        `/projects/${projectId}/chat/sessions/${sessionId}/mode`,
+        { method: 'POST', body: JSON.stringify({ mode }) },
+      ),
     get: (projectId: string, sessionId: string) =>
       request<ChatSession & { messages: ProjectChatMessage[] }>(`/projects/${projectId}/chat/sessions/${sessionId}`),
     update: (projectId: string, sessionId: string, data: { title: string }) =>
@@ -182,17 +307,48 @@ export const projectChat = {
       }),
     delete: (projectId: string, sessionId: string) =>
       request<void>(`/projects/${projectId}/chat/sessions/${sessionId}`, { method: 'DELETE' }),
+    acceptPlan: (projectId: string, sessionId: string) =>
+      request<{ user_message: ProjectChatMessage; assistant_message: ProjectChatMessage }>(
+        `/projects/${projectId}/chat/sessions/${sessionId}/accept-plan`,
+        { method: 'POST' },
+      ),
+    acceptTaskPlan: (projectId: string, sessionId: string) =>
+      request<{
+        user_message: ProjectChatMessage
+        assistant_message: ProjectChatMessage
+        task_id: string
+        existing_active_subtasks?: Array<{ id: string; title: string; agent_role: string; status: string }>
+        old_todo_id?: string
+      }>(
+        `/projects/${projectId}/chat/sessions/${sessionId}/accept-task-plan`,
+        { method: 'POST' },
+      ),
+    cancelSubtasks: (projectId: string, sessionId: string, subtaskIds: string[]) =>
+      request<{ cancelled: string[]; todo_id: string }>(
+        `/projects/${projectId}/chat/sessions/${sessionId}/cancel-subtasks`,
+        { method: 'POST', body: JSON.stringify({ subtask_ids: subtaskIds }) },
+      ),
+    discardTaskPlan: (projectId: string, sessionId: string, feedback: string) =>
+      request<{ status: string }>(
+        `/projects/${projectId}/chat/sessions/${sessionId}/discard-task-plan`,
+        { method: 'POST', body: JSON.stringify({ feedback }) },
+      ),
   },
-  sendInSession: (projectId: string, sessionId: string, content: string, intent?: string) =>
-    request<{ user_message: ProjectChatMessage; assistant_message: ProjectChatMessage }>(
+  sendInSession: (projectId: string, sessionId: string, content: string, intent?: string, model?: string) =>
+    request<{ user_message: ProjectChatMessage; assistant_message: ProjectChatMessage; routing_mode?: string; mode_auto_switched?: boolean }>(
       `/projects/${projectId}/chat/sessions/${sessionId}/messages`,
-      { method: 'POST', body: JSON.stringify({ content, intent }) },
+      { method: 'POST', body: JSON.stringify({ content, intent, model: model || undefined }) },
     ),
   deleteSessionMessage: (projectId: string, sessionId: string, messageId: string) =>
     request<{ status: string }>(
       `/projects/${projectId}/chat/sessions/${sessionId}/messages/${messageId}`,
       { method: 'DELETE' },
     ),
+  injectInSession: (projectId: string, sessionId: string, content: string) =>
+    request<{ status: string }>(`/projects/${projectId}/chat/sessions/${sessionId}/inject`, {
+      method: 'POST',
+      body: JSON.stringify({ content }),
+    }),
 }
 
 // Deliverables
@@ -219,6 +375,8 @@ export const providers = {
     request<ProviderConfig>(`/providers/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
   delete: (id: string) => request<void>(`/providers/${id}`, { method: 'DELETE' }),
   test: (id: string) => request<{ status: string; detail?: string }>(`/providers/${id}/test`, { method: 'POST' }),
+  listModels: (id: string) =>
+    request<{ provider_id: string; models: Array<{ id: string; name: string; is_default: boolean }> }>(`/providers/${id}/models`),
 }
 
 // Git Providers
@@ -229,6 +387,8 @@ export const gitProviders = {
   update: (id: string, data: Partial<GitProviderPayload>) =>
     request<GitProviderConfig>(`/config/git-providers/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
   delete: (id: string) => request<void>(`/config/git-providers/${id}`, { method: 'DELETE' }),
+  test: (id: string) => request<{ status: string; detail?: string }>(`/config/git-providers/${id}/test`, { method: 'POST' }),
+  listRepos: () => request<ProviderRepos[]>('/config/git-providers/repos'),
 }
 
 // Skills
@@ -250,8 +410,12 @@ export const mcpServers = {
     request<McpServer>(`/config/mcp-servers/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
   delete: (id: string) => request<void>(`/config/mcp-servers/${id}`, { method: 'DELETE' }),
   discoverTools: (id: string) =>
-    request<{ status: string; detail?: string; tools: { name: string; description: string }[] }>(
+    request<{ status: string; detail?: string; tools: { name: string; description: string }[]; transport_updated?: string; url_updated?: string }>(
       `/config/mcp-servers/${id}/discover-tools`, { method: 'POST' }
+    ),
+  testConnection: (id: string) =>
+    request<{ status: string; current_transport: string; current_url: string; probes: Record<string, unknown>[]; recommendation: { transport: string; url: string } | null }>(
+      `/config/mcp-servers/${id}/test-connection`, { method: 'POST' }
     ),
 }
 
@@ -296,6 +460,8 @@ export const agents = {
     }),
   chatClear: () =>
     request<{ status: string }>('/config/agents/chat', { method: 'DELETE' }),
+  chatUndo: () =>
+    request<{ status: string; action: string; agent_id: string }>('/config/agents/chat/undo', { method: 'DELETE' }),
 }
 
 // Notifications

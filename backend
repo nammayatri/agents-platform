@@ -1,0 +1,128 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  annotations:
+    deployment.kubernetes.io/revision: "2"
+    kubectl.kubernetes.io/last-applied-configuration: |
+      {"apiVersion":"apps/v1","kind":"Deployment","metadata":{"annotations":{},"labels":{"app":"backend"},"name":"backend","namespace":"atlas-ai"},"spec":{"replicas":1,"selector":{"matchLabels":{"app":"backend"}},"template":{"metadata":{"labels":{"app":"backend"}},"spec":{"containers":[{"env":[{"name":"POSTGRES_PASSWORD","valueFrom":{"secretKeyRef":{"key":"POSTGRES_PASSWORD","name":"agents-secrets"}}},{"name":"DATABASE_URL","value":"postgresql://agents:$(POSTGRES_PASSWORD)@postgres:5432/agents"},{"name":"REDIS_URL","value":"redis://redis:6379/0"},{"name":"JWT_SECRET_KEY","valueFrom":{"secretKeyRef":{"key":"JWT_SECRET_KEY","name":"agents-secrets"}}},{"name":"JWT_ALGORITHM","value":"HS256"},{"name":"JWT_EXPIRE_MINUTES","value":"1440"},{"name":"ENCRYPTION_KEY","valueFrom":{"secretKeyRef":{"key":"ENCRYPTION_KEY","name":"agents-secrets"}}},{"name":"ORCHESTRATOR_POLL_INTERVAL","value":"5"},{"name":"ORCHESTRATOR_MAX_CONCURRENT","value":"50"},{"name":"ORCHESTRATOR_LOCK_TTL","value":"300"},{"name":"CORS_ORIGINS","value":"*"},{"name":"LOG_LEVEL","value":"INFO"}],"image":"ghcr.io/nammayatri/agents-platform/backend:8109d7f","livenessProbe":{"httpGet":{"path":"/api/health","port":8000},"initialDelaySeconds":30,"periodSeconds":15},"name":"backend","ports":[{"containerPort":8000}],"readinessProbe":{"httpGet":{"path":"/api/health","port":8000},"initialDelaySeconds":10,"periodSeconds":10},"resources":{"limits":{"cpu":"1","memory":"1Gi"},"requests":{"cpu":"250m","memory":"512Mi"}}}]}}}}
+  creationTimestamp: "2026-03-16T13:52:07Z"
+  generation: 2
+  labels:
+    app: backend
+  name: backend
+  namespace: atlas-ai
+  resourceVersion: "1050815284"
+  uid: 1b3e9f44-28f0-4845-a8c0-548c65712e18
+spec:
+  progressDeadlineSeconds: 600
+  replicas: 1
+  revisionHistoryLimit: 10
+  selector:
+    matchLabels:
+      app: backend
+  strategy:
+    rollingUpdate:
+      maxSurge: 25%
+      maxUnavailable: 25%
+    type: RollingUpdate
+  template:
+    metadata:
+      annotations:
+        kubectl.kubernetes.io/restartedAt: "2026-03-16T19:25:47+05:30"
+      creationTimestamp: null
+      labels:
+        app: backend
+    spec:
+      containers:
+      - env:
+        - name: POSTGRES_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              key: POSTGRES_PASSWORD
+              name: agents-secrets
+        - name: DATABASE_URL
+          value: postgresql://agents:$(POSTGRES_PASSWORD)@postgres:5432/agents
+        - name: REDIS_URL
+          value: redis://redis:6379/0
+        - name: JWT_SECRET_KEY
+          valueFrom:
+            secretKeyRef:
+              key: JWT_SECRET_KEY
+              name: agents-secrets
+        - name: JWT_ALGORITHM
+          value: HS256
+        - name: JWT_EXPIRE_MINUTES
+          value: "1440"
+        - name: ENCRYPTION_KEY
+          valueFrom:
+            secretKeyRef:
+              key: ENCRYPTION_KEY
+              name: agents-secrets
+        - name: ORCHESTRATOR_POLL_INTERVAL
+          value: "5"
+        - name: ORCHESTRATOR_MAX_CONCURRENT
+          value: "50"
+        - name: ORCHESTRATOR_LOCK_TTL
+          value: "300"
+        - name: CORS_ORIGINS
+          value: '*'
+        - name: LOG_LEVEL
+          value: INFO
+        image: ghcr.io/nammayatri/agents-platform/backend:8109d7f
+        imagePullPolicy: IfNotPresent
+        livenessProbe:
+          failureThreshold: 3
+          httpGet:
+            path: /api/health
+            port: 8000
+            scheme: HTTP
+          initialDelaySeconds: 30
+          periodSeconds: 15
+          successThreshold: 1
+          timeoutSeconds: 1
+        name: backend
+        ports:
+        - containerPort: 8000
+          protocol: TCP
+        readinessProbe:
+          failureThreshold: 3
+          httpGet:
+            path: /api/health
+            port: 8000
+            scheme: HTTP
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          successThreshold: 1
+          timeoutSeconds: 1
+        resources:
+          limits:
+            cpu: "1"
+            memory: 1Gi
+          requests:
+            cpu: 250m
+            memory: 512Mi
+        terminationMessagePath: /dev/termination-log
+        terminationMessagePolicy: File
+      dnsPolicy: ClusterFirst
+      restartPolicy: Always
+      schedulerName: default-scheduler
+      securityContext: {}
+      terminationGracePeriodSeconds: 30
+status:
+  conditions:
+  - lastTransitionTime: "2026-03-16T13:52:07Z"
+    lastUpdateTime: "2026-03-16T13:52:07Z"
+    message: Deployment does not have minimum availability.
+    reason: MinimumReplicasUnavailable
+    status: "False"
+    type: Available
+  - lastTransitionTime: "2026-03-16T13:52:07Z"
+    lastUpdateTime: "2026-03-16T13:55:47Z"
+    message: ReplicaSet "backend-d5458667b" is progressing.
+    reason: ReplicaSetUpdated
+    status: "True"
+    type: Progressing
+  observedGeneration: 2
+  replicas: 2
+  unavailableReplicas: 2
+  updatedReplicas: 1

@@ -1,8 +1,12 @@
 """GitHub git provider implementation."""
 
+import logging
+
 import httpx
 
 from .base import GitProvider
+
+logger = logging.getLogger(__name__)
 
 SKIP_DIRS = ("node_modules/", "vendor/", ".git/", "dist/", "__pycache__/", ".venv/")
 
@@ -50,7 +54,17 @@ class GitHubProvider(GitProvider):
             f"{self.api_base_url}/repos/{owner}/{repo}/pulls",
             json={"head": head, "base": base, "title": title, "body": body},
         )
-        resp.raise_for_status()
+        if resp.status_code >= 400:
+            error_body = resp.text
+            logger.error(
+                "GitHub PR creation failed: %s %s → %d %s\n  head=%s base=%s\n  response: %s",
+                owner, repo, resp.status_code, resp.reason_phrase, head, base, error_body,
+            )
+            raise httpx.HTTPStatusError(
+                f"GitHub API error {resp.status_code} for {owner}/{repo}/pulls: {error_body}",
+                request=resp.request,
+                response=resp,
+            )
         data = resp.json()
         return {"url": data["html_url"], "number": data["number"]}
 
@@ -87,7 +101,17 @@ class GitHubProvider(GitProvider):
             f"{self.api_base_url}/repos/{owner}/{repo}/pulls/{number}/merge",
             json={"merge_method": method},
         )
-        resp.raise_for_status()
+        if resp.status_code >= 400:
+            error_body = resp.text
+            logger.error(
+                "GitHub PR merge failed: %s %s #%s → %d %s\n  response: %s",
+                owner, repo, number, resp.status_code, resp.reason_phrase, error_body,
+            )
+            raise httpx.HTTPStatusError(
+                f"GitHub API error {resp.status_code} merging {owner}/{repo}#{number}: {error_body}",
+                request=resp.request,
+                response=resp,
+            )
         data = resp.json()
         return {
             "merged": data.get("merged", True),

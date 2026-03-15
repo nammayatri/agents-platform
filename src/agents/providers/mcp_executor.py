@@ -8,15 +8,231 @@ import asyncio
 import json
 import logging
 import os
+import threading
+from collections import OrderedDict
+
+import re as _re_module
 
 import asyncpg
 
+# Dangerous command patterns — checked before shell execution in run_command.
+# Each tuple: (regex_pattern, human-readable reason).
+_BLOCKED_COMMANDS: list[tuple[str, str]] = [
+    (r'\brm\s+(-[a-zA-Z]*r[a-zA-Z]*f|.*--recursive)\b', "Recursive rm blocked"),
+    (r'\bgit\s+push\b(?!.*--dry-run)', "git push blocked (use --dry-run to preview)"),
+    (r'\bgit\s+reset\s+--hard\b', "git reset --hard blocked"),
+    (r'\bcurl\b.*\|\s*(bash|sh|zsh)\b', "Piping curl to shell blocked"),
+    (r'\bwget\b.*\|\s*(bash|sh|zsh)\b', "Piping wget to shell blocked"),
+    (r'\bsudo\b', "sudo blocked"),
+    (r'\bnpm\s+publish\b', "npm publish blocked"),
+    (r'\bchmod\s+777\b', "chmod 777 blocked"),
+    (r'\bmkfs\b', "mkfs blocked"),
+    (r'\bdd\s+if=', "dd blocked"),
+]
+
+
+def _analyze_command_safety(command: str, repo_dir: str) -> dict:
+    """Analyze a shell command for safety risks beyond the basic blocklist.
+
+    Returns:
+        dict with "risk_level" ("safe"|"moderate"|"dangerous") and "reason" (str).
+    """
+    import re
+
+    reasons: list[str] = []
+    risk = "safe"
+
+    # Pipe chain analysis — detect data piped to interpreters
+    pipe_to_exec = re.search(
+        r'\|\s*(python[23]?|ruby|perl|node|php|bash|sh|zsh|eval)\b',
+        command, re.IGNORECASE,
+    )
+    if pipe_to_exec:
+        reasons.append(f"Pipe to interpreter: {pipe_to_exec.group()}")
+        risk = "dangerous"
+
+    # Destructive file operations
+    destructive_patterns = [
+        (r'\bfind\b.*-delete\b', "find -delete"),
+        (r'\bfind\b.*-exec\s+rm\b', "find -exec rm"),
+        (r'>\s*/dev/sd[a-z]', "Write to block device"),
+        (r'>\s*\.(env|gitignore|dockerignore|git)', "Overwrite config file"),
+        (r'\btruncate\b', "truncate command"),
+        (r'\bshred\b', "shred command"),
+    ]
+    for pattern, desc in destructive_patterns:
+        if re.search(pattern, command, re.IGNORECASE):
+            reasons.append(f"Destructive operation: {desc}")
+            risk = "dangerous"
+
+    # Network exfiltration patterns
+    network_patterns = [
+        (r'\bcurl\b.*(-X\s*POST|-d\s)', "curl POST/data upload", "moderate"),
+        (r'\bwget\b.*--post', "wget POST", "moderate"),
+        (r'\bnc\b|\bnetcat\b', "netcat usage", "dangerous"),
+        (r'\bscp\b|\brsync\b.*:', "Remote file transfer", "moderate"),
+        (r'\bssh\b\s', "SSH command", "moderate"),
+    ]
+    for pattern, desc, level in network_patterns:
+        if re.search(pattern, command, re.IGNORECASE):
+            reasons.append(f"Network operation: {desc}")
+            if level == "dangerous" or risk != "dangerous":
+                risk = max(risk, level, key=lambda x: {"safe": 0, "moderate": 1, "dangerous": 2}[x])
+
+    # Privilege escalation
+    priv_patterns = [
+        (r'\bchown\b', "chown"),
+        (r'\bchmod\b\s+[0-7]*[67][0-7]{2}', "chmod with broad permissions"),
+        (r'\bsetuid\b|\bsetgid\b', "setuid/setgid"),
+    ]
+    for pattern, desc in priv_patterns:
+        if re.search(pattern, command, re.IGNORECASE):
+            reasons.append(f"Privilege change: {desc}")
+            if risk == "safe":
+                risk = "moderate"
+
+    # Path escape — commands targeting outside repo_dir
+    if repo_dir:
+        outside_patterns = [
+            r'(?:^|\s)/etc/',
+            r'(?:^|\s)/usr/',
+            r'(?:^|\s)/var/',
+            r'(?:^|\s)/tmp/',
+            r'(?:^|\s)~/',
+            r'(?:^|\s)\$HOME/',
+        ]
+        for pattern in outside_patterns:
+            if re.search(pattern, command):
+                reasons.append("Targets paths outside repo")
+                if risk == "safe":
+                    risk = "moderate"
+                break
+
+    reason = "; ".join(reasons) if reasons else "No issues detected"
+    return {"risk_level": risk, "reason": reason}
+
+
 logger = logging.getLogger(__name__)
+
+
+# ── LRU File Cache ─────────────────────────────────────────────────
+# Process-wide cache shared across McpToolExecutor instances.
+# Keyed by absolute real_path for uniqueness.
+# write_file updates the cache, read_file serves from cache when fresh.
+
+MAX_CACHE_BYTES = 100 * 1024 * 1024  # 100 MB total memory cap
+MAX_SINGLE_FILE = 5 * 1024 * 1024     # Don't cache files larger than 5 MB
+
+
+class _CacheEntry:
+    __slots__ = ("content", "mtime", "size")
+
+    def __init__(self, content: str, mtime: float, size: int):
+        self.content = content
+        self.mtime = mtime     # filesystem mtime at time of caching
+        self.size = size       # len(content) as byte count (approx)
+
+
+class FileCache:
+    """Thread-safe LRU file cache with mtime validation and memory cap."""
+
+    def __init__(self, max_bytes: int = MAX_CACHE_BYTES):
+        self._lock = threading.Lock()
+        self._store: OrderedDict[str, _CacheEntry] = OrderedDict()
+        self._total_bytes: int = 0
+        self._max_bytes = max_bytes
+        self._hits = 0
+        self._misses = 0
+
+    def get(self, real_path: str) -> str | None:
+        """Return cached content if fresh, else None.
+
+        Freshness is validated by comparing cached mtime against the
+        current filesystem mtime.  This ensures external writes (git
+        operations, other processes) are never served stale.
+        """
+        with self._lock:
+            entry = self._store.get(real_path)
+            if entry is None:
+                self._misses += 1
+                return None
+
+            # Validate mtime against disk
+            try:
+                disk_mtime = os.path.getmtime(real_path)
+            except OSError:
+                # File was deleted — evict and miss
+                self._evict_entry(real_path)
+                self._misses += 1
+                return None
+
+            if disk_mtime != entry.mtime:
+                # File changed on disk — evict stale entry
+                self._evict_entry(real_path)
+                self._misses += 1
+                return None
+
+            # Cache hit — move to end (most recently used)
+            self._store.move_to_end(real_path)
+            self._hits += 1
+            return entry.content
+
+    def put(self, real_path: str, content: str, mtime: float | None = None) -> None:
+        """Insert or update a cached file.  Evicts LRU entries to stay under cap."""
+        byte_size = len(content.encode("utf-8", errors="replace"))
+        if byte_size > MAX_SINGLE_FILE:
+            # Don't cache very large files — they'd dominate the cache
+            return
+
+        if mtime is None:
+            try:
+                mtime = os.path.getmtime(real_path)
+            except OSError:
+                return
+
+        with self._lock:
+            # Remove old entry if exists
+            if real_path in self._store:
+                self._evict_entry(real_path)
+
+            # Evict LRU entries until we have room
+            while self._total_bytes + byte_size > self._max_bytes and self._store:
+                _, evicted = self._store.popitem(last=False)  # pop oldest
+                self._total_bytes -= evicted.size
+
+            self._store[real_path] = _CacheEntry(content, mtime, byte_size)
+            self._total_bytes += byte_size
+
+    def invalidate(self, real_path: str) -> None:
+        """Remove a specific path from the cache."""
+        with self._lock:
+            self._evict_entry(real_path)
+
+    def _evict_entry(self, real_path: str) -> None:
+        """Remove entry and update size tracking. Caller must hold lock."""
+        entry = self._store.pop(real_path, None)
+        if entry:
+            self._total_bytes -= entry.size
+
+    @property
+    def stats(self) -> dict:
+        with self._lock:
+            return {
+                "entries": len(self._store),
+                "total_bytes": self._total_bytes,
+                "hits": self._hits,
+                "misses": self._misses,
+            }
+
+
+# Singleton cache instance
+_file_cache = FileCache()
 
 
 class McpToolExecutor:
     def __init__(self, db: asyncpg.Pool):
         self.db = db
+        self.file_cache = _file_cache
 
     async def execute_tool(
         self,
@@ -75,8 +291,147 @@ class McpToolExecutor:
             else:
                 return json.dumps({"error": f"Unknown transport: {transport}"})
         except Exception as e:
-            logger.warning("MCP tool call failed: %s / %s: %s", tool_name, server_id, e)
+            logger.warning("MCP tool call failed (%s @ %s): %s / %s: %s",
+                           transport, server.get("url"), tool_name, server_id, e)
+            # Fallback: try alternate transport
+            if transport in ("sse", "streamable-http"):
+                try:
+                    fb_transport, fb_url = self._fallback_transport(transport, server.get("url", ""))
+                    if fb_transport:
+                        logger.info("MCP tool call fallback: trying %s @ %s", fb_transport, fb_url)
+                        fb_server = {**server, "url": fb_url}
+                        result = await self._call_http(fb_server, original_name, tool_input, fb_transport)
+                        # Fallback worked — update DB for future calls
+                        await self.db.execute(
+                            "UPDATE mcp_servers SET transport = $2, url = $3, updated_at = NOW() WHERE id = $1",
+                            server_id, fb_transport, fb_url,
+                        )
+                        logger.info("MCP auto-updated server %s: %s -> %s @ %s", server_id, transport, fb_transport, fb_url)
+                        return result
+                except Exception as fb_err:
+                    logger.debug("MCP fallback also failed: %s", fb_err)
             return json.dumps({"error": str(e)})
+
+    async def execute_tools_batch(
+        self,
+        tool_calls: list[dict],
+        mcp_tools: list[dict],
+        *,
+        max_parallel: int = 5,
+    ) -> list[str]:
+        """Execute multiple tool calls concurrently with bounded parallelism.
+
+        Args:
+            tool_calls: List of dicts with "name" and "arguments" keys.
+            mcp_tools: The resolved tools list (with _mcp_server_id or _builtin metadata).
+            max_parallel: Max concurrent tool executions (default 5).
+
+        Returns:
+            List of result strings in the same order as input tool_calls.
+        """
+        sem = asyncio.Semaphore(max_parallel)
+
+        async def _guarded(tc: dict) -> str:
+            async with sem:
+                return await self.execute_tool(
+                    tc["name"], tc.get("arguments", {}), mcp_tools,
+                )
+
+        results = await asyncio.gather(
+            *[_guarded(tc) for tc in tool_calls],
+            return_exceptions=True,
+        )
+
+        # Convert exceptions to error JSON strings
+        processed: list[str] = []
+        for i, r in enumerate(results):
+            if isinstance(r, Exception):
+                tc_name = tool_calls[i].get("name", "unknown")
+                logger.error("batch_exec: tool %s failed: %s", tc_name, r)
+                processed.append(json.dumps({
+                    "error": f"Tool execution failed: {r}",
+                }))
+            else:
+                processed.append(r)
+
+        return processed
+
+    def _resolve_allowed_dirs(self, workspace_path: str, tool_name: str) -> list[str]:
+        """Compute allowed directories per tool type.
+
+        Read-only tools (read_file, list_directory, search_files) can access
+        the main repo, dependency repos under workspace/deps/, and the
+        main_repo/ symlink (for dep workspaces referencing the main project).
+        Write tools remain restricted to the repo/ directory only.
+        """
+        repo_dir = os.path.join(workspace_path, "repo") if workspace_path else ""
+        allowed = [os.path.realpath(repo_dir)] if repo_dir else []
+
+        read_only_tools = {"read_file", "list_directory", "search_files"}
+        if tool_name in read_only_tools:
+            deps_dir = os.path.join(workspace_path, "deps")
+            if os.path.exists(deps_dir):
+                allowed.append(os.path.realpath(deps_dir))
+            # For dep workspaces: allow reading the main project repo
+            main_repo_dir = os.path.join(workspace_path, "main_repo")
+            if os.path.exists(main_repo_dir):
+                allowed.append(os.path.realpath(main_repo_dir))
+            # Allow reading .context/ docs (project understanding files)
+            context_dir = os.path.join(workspace_path, ".context")
+            if os.path.exists(context_dir):
+                allowed.append(os.path.realpath(context_dir))
+
+        return allowed
+
+    @staticmethod
+    def _check_path_allowed(real_path: str, allowed_dirs: list[str]) -> bool:
+        """Check if a resolved path falls within any allowed directory."""
+        return any(real_path.startswith(d + os.sep) or real_path == d for d in allowed_dirs)
+
+    @staticmethod
+    def _identify_repo(workspace_path: str, real_path: str) -> str:
+        """Identify which repository a resolved file path belongs to.
+
+        Returns a label like 'main', 'ny-react-native', or 'context-docs'.
+        Handles both project workspaces (repo/ = main) and dep workspaces
+        (repo/ = dep, main_repo/ = main).
+        """
+        if not workspace_path:
+            return "main"
+
+        real_ws = os.path.realpath(workspace_path)
+
+        # Check deps/{name}/ first (most specific)
+        deps_dir = os.path.join(real_ws, "deps")
+        real_deps = os.path.realpath(deps_dir) if os.path.exists(deps_dir) else None
+        if real_deps and (real_path.startswith(real_deps + os.sep) or real_path == real_deps):
+            # Extract dep name from path: deps/{name}/...
+            rel = real_path[len(real_deps):].lstrip(os.sep)
+            dep_name = rel.split(os.sep, 1)[0] if rel else ""
+            return dep_name or "dependency"
+
+        # Check main_repo/ (for dep workspaces referencing the main project)
+        main_repo_dir = os.path.join(real_ws, "main_repo")
+        real_main = os.path.realpath(main_repo_dir) if os.path.exists(main_repo_dir) else None
+        if real_main and (real_path.startswith(real_main + os.sep) or real_path == real_main):
+            return "main"
+
+        # Check .context/
+        ctx_dir = os.path.join(real_ws, ".context")
+        real_ctx = os.path.realpath(ctx_dir) if os.path.exists(ctx_dir) else None
+        if real_ctx and (real_path.startswith(real_ctx + os.sep) or real_path == real_ctx):
+            return "context-docs"
+
+        # For dep workspaces, repo/ is the dep repo (indicated by main_repo/ existing).
+        # Extract the dep name from the workspace dir name (format: dep_{name}).
+        if os.path.exists(os.path.join(real_ws, "main_repo")):
+            ws_basename = os.path.basename(real_ws)
+            if ws_basename.startswith("dep_"):
+                return ws_basename[4:]  # strip "dep_" prefix
+            return ws_basename  # fallback to full dirname
+
+        # Default: repo/ directory = main repo
+        return "main"
 
     async def _execute_builtin(self, tool_meta: dict, tool_input: dict) -> str:
         """Execute a built-in workspace tool directly (no MCP server)."""
@@ -90,23 +445,36 @@ class McpToolExecutor:
             if tool_name == "read_file":
                 path = tool_input.get("path", "")
                 full_path = os.path.join(repo_dir, path)
-                # Security: ensure path stays within repo
+                # Security: ensure path stays within repo or deps (read-only)
                 real_path = os.path.realpath(full_path)
-                real_repo = os.path.realpath(repo_dir)
-                if not real_path.startswith(real_repo):
+                allowed_dirs = self._resolve_allowed_dirs(workspace_path, tool_name)
+                if not self._check_path_allowed(real_path, allowed_dirs):
                     logger.warning("builtin[read_file]: path traversal blocked: %s", path)
                     return json.dumps({"error": "Path traversal not allowed"})
                 if not os.path.isfile(real_path):
                     logger.info("builtin[read_file]: file not found: %s (resolved: %s)", path, real_path)
                     return json.dumps({"error": f"File not found: {path}"})
+
+                repo_label = self._identify_repo(workspace_path, real_path)
+
+                # Try cache first (validates mtime freshness automatically)
+                content = self.file_cache.get(real_path)
+                if content is not None:
+                    logger.info("builtin[read_file]: %s → %d chars (cache hit, repo=%s)", path, len(content), repo_label)
+                    return f"[Repository: {repo_label}] {path}\n{content}"
+
+                # Cache miss — read from disk
                 with open(real_path, "r", errors="replace") as f:
                     content = f.read()
                 # Truncate very large files
                 if len(content) > 100_000:
                     logger.info("builtin[read_file]: %s truncated from %d to 100000 chars", path, len(content))
                     content = content[:100_000] + "\n... (truncated)"
-                logger.info("builtin[read_file]: %s → %d chars", path, len(content))
-                return content
+                else:
+                    # Cache the full (non-truncated) content
+                    self.file_cache.put(real_path, content)
+                logger.info("builtin[read_file]: %s → %d chars (disk, repo=%s)", path, len(content), repo_label)
+                return f"[Repository: {repo_label}] {path}\n{content}"
 
             elif tool_name == "write_file":
                 path = tool_input.get("path", "")
@@ -120,20 +488,95 @@ class McpToolExecutor:
                 os.makedirs(os.path.dirname(real_path), exist_ok=True)
                 with open(real_path, "w") as f:
                     f.write(content)
-                logger.info("builtin[write_file]: %s → %d bytes written (resolved: %s)", path, len(content), real_path)
-                return json.dumps({"status": "ok", "path": path, "bytes_written": len(content)})
+                # Update cache with the written content (mtime from disk after write)
+                self.file_cache.put(real_path, content)
+                repo_label = self._identify_repo(workspace_path, real_path)
+                logger.info("builtin[write_file]: %s → %d bytes written (repo=%s)", path, len(content), repo_label)
+                return json.dumps({"status": "ok", "path": path, "bytes_written": len(content), "repository": repo_label})
+
+            elif tool_name == "edit_file":
+                path = tool_input.get("path", "")
+                old_text = tool_input.get("old_text", "")
+                new_text = tool_input.get("new_text", "")
+                if not old_text:
+                    return json.dumps({"error": "old_text is required"})
+                full_path = os.path.join(repo_dir, path)
+                real_path = os.path.realpath(full_path)
+                real_repo = os.path.realpath(repo_dir)
+                if not real_path.startswith(real_repo):
+                    logger.warning("builtin[edit_file]: path traversal blocked: %s", path)
+                    return json.dumps({"error": "Path traversal not allowed"})
+                if not os.path.isfile(real_path):
+                    logger.info("builtin[edit_file]: file not found: %s", path)
+                    return json.dumps({"error": f"File not found: {path}"})
+
+                with open(real_path, "r", errors="replace") as f:
+                    content = f.read()
+
+                # Use progressive fuzzy matching instead of exact-only matching
+                try:
+                    from agents.utils.edit_match import apply_edit, EditMatchError
+                    try:
+                        new_content, match = apply_edit(content, old_text, new_text)
+                        with open(real_path, "w") as f:
+                            f.write(new_content)
+                        self.file_cache.put(real_path, new_content)
+                        logger.info(
+                            "builtin[edit_file]: %s — replaced %d chars with %d chars (method=%s, confidence=%.2f)",
+                            path, len(old_text), len(new_text), match.method, match.confidence,
+                        )
+                        repo_label = self._identify_repo(workspace_path, real_path)
+                        return json.dumps({
+                            "status": "ok",
+                            "path": path,
+                            "chars_removed": len(match.matched_text),
+                            "chars_added": len(new_text),
+                            "match_method": match.method,
+                            "match_confidence": round(match.confidence, 3),
+                            "repository": repo_label,
+                        })
+                    except EditMatchError as e:
+                        logger.info("builtin[edit_file]: fuzzy match failed in %s: %s", path, str(e)[:200])
+                        return json.dumps({"error": str(e)})
+                except ImportError:
+                    # Fallback to exact matching if edit_match module not available
+                    count = content.count(old_text)
+                    if count == 0:
+                        logger.info("builtin[edit_file]: old_text not found in %s", path)
+                        return json.dumps({
+                            "error": "old_text not found in the file. Make sure it matches exactly (including whitespace/indentation).",
+                        })
+                    if count > 1:
+                        logger.info("builtin[edit_file]: old_text matched %d times in %s", count, path)
+                        return json.dumps({
+                            "error": f"old_text matched {count} times — it must be unique. Include more surrounding context to make it unique.",
+                        })
+                    new_content = content.replace(old_text, new_text, 1)
+                    with open(real_path, "w") as f:
+                        f.write(new_content)
+                    self.file_cache.put(real_path, new_content)
+                    repo_label = self._identify_repo(workspace_path, real_path)
+                    logger.info("builtin[edit_file]: %s — replaced %d chars with %d chars (repo=%s)", path, len(old_text), len(new_text), repo_label)
+                    return json.dumps({
+                        "status": "ok",
+                        "path": path,
+                        "chars_removed": len(old_text),
+                        "chars_added": len(new_text),
+                        "repository": repo_label,
+                    })
 
             elif tool_name == "list_directory":
                 path = tool_input.get("path", "")
                 full_path = os.path.join(repo_dir, path) if path else repo_dir
                 real_path = os.path.realpath(full_path)
-                real_repo = os.path.realpath(repo_dir)
-                if not real_path.startswith(real_repo):
+                allowed_dirs = self._resolve_allowed_dirs(workspace_path, tool_name)
+                if not self._check_path_allowed(real_path, allowed_dirs):
                     logger.warning("builtin[list_directory]: path traversal blocked: %s", path)
                     return json.dumps({"error": "Path traversal not allowed"})
                 if not os.path.isdir(real_path):
                     logger.info("builtin[list_directory]: directory not found: %s (resolved: %s)", path, real_path)
                     return json.dumps({"error": f"Directory not found: {path}"})
+                repo_label = self._identify_repo(workspace_path, real_path)
                 entries = sorted(os.listdir(real_path))
                 result = []
                 for e in entries[:500]:  # limit entries
@@ -142,8 +585,8 @@ class McpToolExecutor:
                         "name": e,
                         "type": "directory" if os.path.isdir(full_e) else "file",
                     })
-                logger.info("builtin[list_directory]: %s → %d entries", path or "/", len(result))
-                return json.dumps(result)
+                logger.info("builtin[list_directory]: %s → %d entries (repo=%s)", path or "/", len(result), repo_label)
+                return json.dumps({"repository": repo_label, "path": path or "/", "entries": result})
 
             elif tool_name == "search_files":
                 pattern = tool_input.get("pattern", "")
@@ -153,15 +596,16 @@ class McpToolExecutor:
                 file_glob = tool_input.get("file_glob", "*")
                 full_search = os.path.join(repo_dir, search_path) if search_path else repo_dir
                 real_search = os.path.realpath(full_search)
-                real_repo = os.path.realpath(repo_dir)
-                if not real_search.startswith(real_repo):
+                allowed_dirs = self._resolve_allowed_dirs(workspace_path, tool_name)
+                if not self._check_path_allowed(real_search, allowed_dirs):
                     logger.warning("builtin[search_files]: path traversal blocked: %s", search_path)
                     return json.dumps({"error": "Path traversal not allowed"})
                 if not os.path.isdir(real_search):
                     logger.info("builtin[search_files]: directory not found: %s", search_path)
                     return json.dumps({"error": f"Directory not found: {search_path}"})
 
-                logger.info("builtin[search_files]: pattern=%s path=%s glob=%s", pattern, search_path or "/", file_glob)
+                repo_label = self._identify_repo(workspace_path, real_search)
+                logger.info("builtin[search_files]: pattern=%s path=%s glob=%s repo=%s", pattern, search_path or "/", file_glob, repo_label)
                 cmd = ["grep", "-rn", "--include", file_glob, pattern, "."]
                 proc = await asyncio.create_subprocess_exec(
                     *cmd,
@@ -177,7 +621,16 @@ class McpToolExecutor:
                         output = output[:50_000] + "\n... (truncated)"
                     match_count = output.count("\n") if output else 0
                     logger.info("builtin[search_files]: %d matching lines, %d chars", match_count, len(output))
-                    return output if output else "No matches found."
+                    header = f"[Repository: {repo_label}] Search results for '{pattern}':\n"
+                    return (header + output) if output else f"[Repository: {repo_label}] No matches found."
+                except asyncio.CancelledError:
+                    try:
+                        proc.kill()
+                    except ProcessLookupError:
+                        pass
+                    await proc.wait()
+                    logger.info("builtin[search_files]: cancelled, subprocess killed")
+                    raise
                 except asyncio.TimeoutError:
                     proc.kill()
                     logger.warning("builtin[search_files]: timed out after 30s (pattern=%s)", pattern)
@@ -187,10 +640,71 @@ class McpToolExecutor:
                 command = tool_input.get("command", "")
                 if not command:
                     return json.dumps({"error": "No command provided"})
-                logger.info("builtin[run_command]: cmd=%s cwd=%s", command[:200], repo_dir)
+
+                # The LLM only knows about relative paths inside the repo.
+                # Handle cd prefixes so the LLM doesn't get stuck in a loop.
+                effective_cwd = repo_dir
+                actual_command = command.strip()
+
+                import re as _re
+
+                # Intercept bare "cd <path>" (no &&/;) — useless in subprocess
+                bare_cd = _re.match(r'^cd(\s+\S+)?\s*$', actual_command)
+                if bare_cd:
+                    logger.info("builtin[run_command]: intercepted bare cd")
+                    return json.dumps({
+                        "exit_code": 0,
+                        "output": "Your working directory is already the repo root. "
+                                  "Do not use 'cd' alone. To run in a subdirectory: cd subdir && your_command",
+                    })
+
+                # Handle "cd <path> && <rest>" — resolve relative path as cwd
+                cd_prefix = _re.match(r'^cd\s+([^\s;&]+)\s*&&\s*(.+)$', actual_command, _re.DOTALL)
+                if cd_prefix:
+                    cd_target = cd_prefix.group(1)
+                    actual_command = cd_prefix.group(2).strip()
+                    # Only allow relative paths within the repo
+                    if os.path.isabs(cd_target):
+                        logger.warning("builtin[run_command]: blocked absolute cd path: %s", cd_target)
+                        return json.dumps({
+                            "exit_code": 1,
+                            "output": "Absolute paths are not allowed. Use relative paths from the repo root.",
+                        })
+                    resolved = os.path.realpath(os.path.join(repo_dir, cd_target))
+                    real_repo = os.path.realpath(repo_dir)
+                    if not resolved.startswith(real_repo):
+                        logger.warning("builtin[run_command]: cd traversal blocked: %s", cd_target)
+                        return json.dumps({
+                            "exit_code": 1,
+                            "output": "Path traversal not allowed. Stay within the repo directory.",
+                        })
+                    if os.path.isdir(resolved):
+                        effective_cwd = resolved
+                    logger.info("builtin[run_command]: cd to subdir=%s cmd=%s", cd_target, actual_command[:100])
+
+                # Check against blocked command patterns
+                for _bp, _br in _BLOCKED_COMMANDS:
+                    if _re.search(_bp, actual_command, _re.IGNORECASE):
+                        logger.warning("builtin[run_command]: blocked: %s — %s", actual_command[:200], _br)
+                        return json.dumps({"exit_code": 1, "output": f"Command blocked: {_br}"})
+
+                # Safety analysis beyond blocklist
+                safety = _analyze_command_safety(actual_command, repo_dir)
+                if safety["risk_level"] == "dangerous":
+                    logger.warning("builtin[run_command]: DANGEROUS command blocked: %s — %s",
+                                   actual_command[:200], safety["reason"])
+                    return json.dumps({
+                        "exit_code": 1,
+                        "output": f"Command blocked (safety analysis): {safety['reason']}",
+                    })
+                elif safety["risk_level"] == "moderate":
+                    logger.info("builtin[run_command]: moderate risk: %s — %s",
+                                actual_command[:200], safety["reason"])
+
+                logger.info("builtin[run_command]: cmd=%s cwd=%s", actual_command[:200], effective_cwd)
                 proc = await asyncio.create_subprocess_shell(
-                    command,
-                    cwd=repo_dir,
+                    actual_command,
+                    cwd=effective_cwd,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.STDOUT,
                 )
@@ -200,16 +714,73 @@ class McpToolExecutor:
                     if len(output) > 50_000:
                         logger.info("builtin[run_command]: output truncated from %d to 50000 chars", len(output))
                         output = output[:50_000] + "\n... (truncated)"
-                    logger.info("builtin[run_command]: exit_code=%d output_len=%d cmd=%s",
-                                proc.returncode, len(output), command[:100])
+                    # Strip absolute repo path from output so LLM never sees it
+                    if repo_dir:
+                        output = output.replace(repo_dir + "/", "").replace(repo_dir, ".")
+                    repo_label = self._identify_repo(workspace_path, os.path.realpath(repo_dir))
+                    logger.info("builtin[run_command]: exit_code=%d output_len=%d cmd=%s repo=%s",
+                                proc.returncode, len(output), actual_command[:100], repo_label)
                     return json.dumps({
                         "exit_code": proc.returncode,
                         "output": output,
+                        "repository": repo_label,
                     })
+                except asyncio.CancelledError:
+                    try:
+                        proc.kill()
+                    except ProcessLookupError:
+                        pass
+                    await proc.wait()
+                    logger.info("builtin[run_command]: cancelled, subprocess killed cmd=%s", actual_command[:100])
+                    raise
                 except asyncio.TimeoutError:
                     proc.kill()
-                    logger.warning("builtin[run_command]: timed out after 120s cmd=%s", command[:200])
+                    logger.warning("builtin[run_command]: timed out after 120s cmd=%s", actual_command[:200])
                     return json.dumps({"error": "Command timed out after 120s"})
+
+            elif tool_name == "semantic_search":
+                query = tool_input.get("query", "")
+                top_k = tool_input.get("top_k", 10)
+                if not query:
+                    return json.dumps({"error": "query is required"})
+                try:
+                    # Use shared project-level index directory if available
+                    index_dir = tool_meta.get("_index_dir")
+                    dep_index_dirs = tool_meta.get("_dep_index_dirs")
+
+                    if dep_index_dirs:
+                        from agents.indexing.search_tool import execute_multi_repo_search
+                        result_text, meta = execute_multi_repo_search(
+                            repo_dir, query, top_k=top_k,
+                            cache_dir=index_dir, dep_index_dirs=dep_index_dirs,
+                        )
+                    else:
+                        from agents.indexing.search_tool import execute_semantic_search
+                        result_text, meta = execute_semantic_search(
+                            repo_dir, query, top_k=top_k, cache_dir=index_dir,
+                        )
+                    logger.info(
+                        "builtin[semantic_search]: query=%s top_k=%d results=%d top_score=%.3f latency=%dms source=%s",
+                        query[:100], top_k,
+                        meta.get("results_count", 0),
+                        meta.get("top_score", 0),
+                        meta.get("latency_ms", 0),
+                        meta.get("source", "?"),
+                    )
+                    return result_text
+                except ImportError:
+                    logger.info("builtin[semantic_search]: module not available, falling back to search_files hint")
+                    return json.dumps({
+                        "error": "Semantic search is not available (missing dependencies). Use search_files tool instead.",
+                    })
+                except Exception as e:
+                    logger.warning("builtin[semantic_search]: failed: %s", e)
+                    return json.dumps({"error": f"Semantic search failed: {e}. Use search_files instead."})
+
+            elif tool_name == "task_complete":
+                summary = tool_input.get("summary", "")
+                logger.info("builtin[task_complete]: agent signaled done: %s", summary[:200])
+                return json.dumps({"status": "acknowledged", "summary": summary})
 
             else:
                 logger.warning("builtin: unknown tool: %s", tool_name)
@@ -322,26 +893,45 @@ class McpToolExecutor:
         if transport == "sse":
             return await self._call_sse(url, tool_name, tool_input)
 
-        # streamable-http: direct POST
-        async with httpx.AsyncClient(timeout=60) as client:
+        # streamable-http: POST with streaming reads (servers may return SSE streams)
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/event-stream",
+        }
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(60.0, connect=30.0), verify=False,
+        ) as client:
             # Initialize
-            resp = await client.post(url, json={
+            init_resp, init_headers = await self._streamable_post(client, url, {
                 "jsonrpc": "2.0", "id": 1, "method": "initialize",
                 "params": {
-                    "protocolVersion": "2024-11-05",
+                    "protocolVersion": "2025-03-26",
                     "capabilities": {},
                     "clientInfo": {"name": "agents-platform", "version": "0.1.0"},
                 },
-            })
-            resp.raise_for_status()
+            }, headers)
+            if "error" in init_resp:
+                return json.dumps({"error": f"MCP init error: {init_resp['error']}"})
+
+            # Capture session ID for subsequent requests (MCP spec requirement)
+            session_id = init_headers.get("mcp-session-id")
+            if session_id:
+                headers = {**headers, "mcp-session-id": session_id}
+                logger.info("MCP streamable-http: session_id=%s", session_id)
+
+            # Initialized notification (fire-and-forget)
+            try:
+                await self._streamable_post(client, url, {
+                    "jsonrpc": "2.0", "method": "notifications/initialized",
+                }, headers, expect_response=False)
+            except Exception:
+                pass
 
             # Call tool
-            resp = await client.post(url, json={
+            result, _ = await self._streamable_post(client, url, {
                 "jsonrpc": "2.0", "id": 2, "method": "tools/call",
                 "params": {"name": tool_name, "arguments": tool_input},
-            })
-            resp.raise_for_status()
-            result = resp.json()
+            }, headers, timeout=55)
 
             if "error" in result:
                 return json.dumps({"error": result["error"]})
@@ -368,22 +958,31 @@ class McpToolExecutor:
             try:
                 async for chunk in resp.aiter_bytes():
                     buf += chunk
+                    # Normalize CRLF → LF (SSE spec allows both)
+                    buf = buf.replace(b"\r\n", b"\n")
                     while b"\n\n" in buf:
                         block, buf = buf.split(b"\n\n", 1)
-                        etype = edata = None
+                        etype = None
+                        data_lines: list[str] = []
                         for line in block.decode(errors="replace").strip().split("\n"):
+                            if line.startswith(":"):
+                                continue  # SSE comment
                             if line.startswith("event:"):
                                 etype = line[6:].strip()
                             elif line.startswith("data:"):
-                                edata = line[5:].strip()
-                        if etype and edata:
-                            await events.put((etype, edata))
+                                data_lines.append(line[5:].strip())
+                        edata = "\n".join(data_lines) if data_lines else None
+                        # SSE spec: default event type is "message"
+                        if edata is not None:
+                            await events.put((etype or "message", edata))
             except Exception as exc:
                 await events.put(("error", str(exc)))
 
         async with httpx.AsyncClient(
-            timeout=httpx.Timeout(60.0, connect=10.0), follow_redirects=True
+            timeout=httpx.Timeout(60.0, connect=30.0), follow_redirects=True,
+            verify=False,
         ) as client:
+            logger.info("SSE: connecting to %s", url)
             req = client.build_request("GET", url, headers={"Accept": "text/event-stream"})
             resp = await client.send(req, stream=True)
             resp.raise_for_status()
@@ -392,9 +991,11 @@ class McpToolExecutor:
             try:
                 # Wait for endpoint
                 etype, edata = await asyncio.wait_for(events.get(), timeout=15)
+                logger.info("SSE: first event type=%s data=%s", etype, edata[:200] if edata else "")
                 if etype != "endpoint":
-                    return json.dumps({"error": f"Expected endpoint event, got {etype}"})
+                    return json.dumps({"error": f"Expected endpoint event, got {etype}: {edata}"})
                 post_url = edata if edata.startswith("http") else base_url + edata
+                logger.info("SSE: post_url=%s", post_url)
 
                 # Initialize
                 await client.post(post_url, json={
@@ -432,6 +1033,66 @@ class McpToolExecutor:
             finally:
                 reader.cancel()
                 await resp.aclose()
+
+    @staticmethod
+    def _fallback_transport(transport: str, url: str) -> tuple[str | None, str]:
+        """Determine alternate transport/URL to try when primary fails."""
+        from urllib.parse import urlparse, urlunparse
+        parsed = urlparse(url)
+        base_url = urlunparse((parsed.scheme, parsed.netloc, "", "", "", ""))
+        if transport == "sse":
+            return "streamable-http", base_url + "/mcp"
+        elif transport == "streamable-http":
+            return "sse", base_url + "/sse"
+        return None, url
+
+    @staticmethod
+    async def _streamable_post(
+        client, url: str, body: dict, headers: dict, *,
+        expect_response: bool = True, timeout: float = 30,
+    ) -> tuple[dict, dict]:
+        """POST a JSON-RPC message, handling both JSON and SSE-stream responses.
+
+        Returns (json_response, response_headers_dict).
+        Servers may return text/event-stream for streamable-HTTP POSTs.
+        Uses streaming reads to avoid hanging on open SSE connections.
+        """
+        req = client.build_request("POST", url, content=json.dumps(body), headers=headers)
+        resp = await client.send(req, stream=True)
+        resp.raise_for_status()
+
+        content_type = resp.headers.get("content-type", "")
+        resp_headers = dict(resp.headers)
+
+        try:
+            if "text/event-stream" in content_type:
+                if not expect_response:
+                    return {}, resp_headers
+                deadline = asyncio.get_event_loop().time() + timeout
+                async for raw_line in resp.aiter_lines():
+                    if asyncio.get_event_loop().time() > deadline:
+                        raise TimeoutError("Timed out reading SSE response")
+                    line = raw_line.strip()
+                    if line.startswith("data:"):
+                        data = line[5:].strip()
+                        if not data:
+                            continue
+                        try:
+                            msg = json.loads(data)
+                            if "id" in msg:
+                                return msg, resp_headers
+                        except json.JSONDecodeError:
+                            continue
+                if not expect_response:
+                    return {}, resp_headers
+                raise ValueError("SSE stream ended without JSON-RPC response")
+            else:
+                raw = await resp.aread()
+                if not expect_response:
+                    return {}, resp_headers
+                return json.loads(raw), resp_headers
+        finally:
+            await resp.aclose()
 
     @staticmethod
     async def _read_jsonrpc(stdout: asyncio.StreamReader) -> dict:

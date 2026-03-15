@@ -1,0 +1,45 @@
+node_modules/
+
+# Version control
+.git/
+.gitignore
+
+# Backend / Python
+src/
+backend/
+tests/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+__pycache__/
+*.pyc
+*.pyo
+pyproject.toml
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Environment
+.env
+.env.*
+*.env
+
+# Docker
+docker-compose*.yml
+
+# Docs / meta
+*.md
+LICENSE
+CLAUDE.md
+.claude/
+
+# Build artifacts
+dist/
+build/
+*.egg-info/
+
+# K8s
+k8s/

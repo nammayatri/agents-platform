@@ -43,16 +43,19 @@ def _register_tool(defn: BuiltinToolDef) -> None:
 
 _register_tool(BuiltinToolDef(
     name="read_file",
-    description="Read a file's contents. Path is relative to repo root.",
+    description=(
+        "Read a file's contents. Path is relative to repo root. "
+        "You can also read dependency repo files via ../deps/{name}/path (read-only)."
+    ),
     input_schema={
         "type": "object",
         "properties": {
-            "path": {"type": "string", "description": "File path relative to repo root"},
+            "path": {"type": "string", "description": "File path relative to repo root (use ../deps/{name}/path for dependency repos)"},
         },
         "required": ["path"],
     },
-    prompt_hint="Read a file's contents. Args: path (relative to repo root)",
-    example='read_file(path="src/main.py")',
+    prompt_hint="Read a file's contents. Args: path (relative to repo root, or ../deps/{name}/path for deps)",
+    example='read_file(path="src/main.py")  # or read_file(path="../deps/auth-lib/src/index.ts")',
 ))
 
 _register_tool(BuiltinToolDef(
@@ -72,49 +75,178 @@ _register_tool(BuiltinToolDef(
 
 _register_tool(BuiltinToolDef(
     name="list_directory",
-    description="List files and directories. Path is relative to repo root (empty for root).",
+    description=(
+        "List files and directories. Path is relative to repo root (empty for root). "
+        "Use ../deps/ to list available dependency repos, or ../deps/{name}/ to explore one."
+    ),
     input_schema={
         "type": "object",
         "properties": {
-            "path": {"type": "string", "description": "Directory path relative to repo root"},
+            "path": {"type": "string", "description": "Directory path relative to repo root (use ../deps/ to list dependency repos)"},
         },
         "required": ["path"],
     },
-    prompt_hint="List files and directories. Args: path (empty string for repo root)",
-    example='list_directory(path="src/")',
+    prompt_hint="List files and directories. Args: path (empty for repo root, ../deps/ for dependency repos)",
+    example='list_directory(path="src/")  # or list_directory(path="../deps/")',
 ))
 
 _register_tool(BuiltinToolDef(
     name="search_files",
     description=(
         "Search for a text pattern across files using grep. "
-        "Returns matching lines with file paths and line numbers."
+        "Returns matching lines with file paths and line numbers. "
+        "Use path='../deps/{name}/' to search within a dependency repo."
     ),
     input_schema={
         "type": "object",
         "properties": {
             "pattern": {"type": "string", "description": "Search pattern (regex supported)"},
-            "path": {"type": "string", "description": "Directory to search in, relative to repo root (empty for root)"},
+            "path": {"type": "string", "description": "Directory to search in, relative to repo root (empty for root, ../deps/{name}/ for deps)"},
             "file_glob": {"type": "string", "description": "File glob filter, e.g. '*.py', '*.ts' (optional)"},
         },
         "required": ["pattern"],
     },
-    prompt_hint="Grep for a pattern across files. Args: pattern, path (optional), file_glob (optional)",
-    example='search_files(pattern="def handle_", file_glob="*.py")',
+    prompt_hint="Grep for a pattern across files. Args: pattern, path (optional, ../deps/{name}/ for deps), file_glob (optional)",
+    example='search_files(pattern="def handle_", file_glob="*.py")  # or search_files(pattern="export", path="../deps/shared-types/")',
 ))
 
 _register_tool(BuiltinToolDef(
     name="run_command",
-    description="Run a shell command in the repo directory. Use for builds, tests, linting, git, gh CLI, etc.",
+    description=(
+        "Run a shell command. The working directory is ALREADY set to the repo root — "
+        "do NOT use bare 'cd' commands (they have no effect since each call is a fresh process). "
+        "Use for builds, tests, linting, git, etc. "
+        "To run in a subdirectory: 'cd subdir && command'."
+    ),
     input_schema={
         "type": "object",
         "properties": {
-            "command": {"type": "string", "description": "Shell command to execute"},
+            "command": {"type": "string", "description": "Shell command to execute (cwd is already the repo root)"},
         },
         "required": ["command"],
     },
-    prompt_hint="Run a shell command in the repo directory. Args: command",
+    prompt_hint="Run a shell command (cwd is already repo root, no cd needed). Args: command",
     example='run_command(command="npm test")',
+))
+
+
+_register_tool(BuiltinToolDef(
+    name="edit_file",
+    description=(
+        "Apply a targeted edit to a file by replacing an exact string match. "
+        "More efficient than write_file for small changes to large files — "
+        "you only specify the old text and the new replacement. "
+        "Path is relative to repo root."
+    ),
+    input_schema={
+        "type": "object",
+        "properties": {
+            "path": {"type": "string", "description": "File path relative to repo root"},
+            "old_text": {
+                "type": "string",
+                "description": "The exact text to find and replace (must match uniquely in the file)",
+            },
+            "new_text": {
+                "type": "string",
+                "description": "The replacement text",
+            },
+        },
+        "required": ["path", "old_text", "new_text"],
+    },
+    prompt_hint=(
+        "Apply a surgical edit to a file — replace an exact string match with new text. "
+        "More efficient than rewriting the whole file. Args: path, old_text, new_text"
+    ),
+    example='edit_file(path="src/main.py", old_text="def old_func():", new_text="def new_func():")',
+))
+
+_register_tool(BuiltinToolDef(
+    name="semantic_search",
+    description=(
+        "Search the codebase semantically using natural language. "
+        "Use this when you need to find code related to a concept, feature, or pattern. "
+        "More powerful than search_files/grep for conceptual queries like "
+        "'where is authentication handled' or 'error handling patterns'. "
+        "For exact string matching, use search_files instead."
+    ),
+    input_schema={
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "Natural language description of what to find in the codebase",
+            },
+            "top_k": {
+                "type": "integer",
+                "description": "Number of results to return (default: 10)",
+                "default": 10,
+            },
+        },
+        "required": ["query"],
+    },
+    prompt_hint="Search codebase semantically with natural language. Args: query, top_k (optional)",
+    example='semantic_search(query="authentication and authorization logic")',
+))
+
+_register_tool(BuiltinToolDef(
+    name="create_subtask",
+    description=(
+        "Create a new subtask under the current task. Use this when you want to "
+        "break your work into smaller parallel pieces. The new subtask will be "
+        "picked up and executed by a specialist agent. "
+        "Returns the ID of the created subtask."
+    ),
+    input_schema={
+        "type": "object",
+        "properties": {
+            "title": {"type": "string", "description": "Short descriptive title for the subtask"},
+            "description": {
+                "type": "string",
+                "description": (
+                    "Detailed instructions for the agent. Include file paths, "
+                    "code patterns, and expected outcome."
+                ),
+            },
+            "agent_role": {
+                "type": "string",
+                "description": "Agent role: coder, tester, reviewer, debugger",
+                "enum": ["coder", "tester", "reviewer", "debugger"],
+            },
+        },
+        "required": ["title", "description", "agent_role"],
+    },
+    prompt_hint=(
+        "Create a child subtask for parallel work. "
+        "Args: title, description (detailed instructions), agent_role (coder/tester/reviewer)"
+    ),
+    example='create_subtask(title="Add unit tests for auth module", '
+            'description="Write pytest tests for src/auth.py covering login, logout, token refresh", '
+            'agent_role="tester")',
+))
+
+
+_register_tool(BuiltinToolDef(
+    name="task_complete",
+    description=(
+        "Signal that you have finished your work. Call this when you believe "
+        "your task is done — all code changes are written, tests pass, etc. "
+        "This stops the iteration loop. Provide a brief summary of what you did."
+    ),
+    input_schema={
+        "type": "object",
+        "properties": {
+            "summary": {
+                "type": "string",
+                "description": "Brief summary of what was accomplished",
+            },
+        },
+        "required": ["summary"],
+    },
+    prompt_hint=(
+        "Signal task completion and stop the iteration loop. "
+        "Call this when ALL your work is done. Args: summary"
+    ),
+    example='task_complete(summary="Implemented the auth module with login/logout endpoints and added tests")',
 ))
 
 
@@ -214,17 +346,27 @@ _register(AgentDefinition(
         "## Workflow\n"
         "1. Use `read_file` and `list_directory` to understand the existing codebase\n"
         "2. Use `search_files` to find relevant patterns and usages\n"
-        "3. Use `write_file` to create or modify files with your changes\n"
+        "3. Use `edit_file` for targeted changes to existing files (surgical find-and-replace)\n"
+        "   Use `write_file` only when creating new files or rewriting most of a file\n"
         "4. Use `run_command` to verify your changes (build, lint, test)\n\n"
+        "## Splitting Work\n"
+        "If your task is large or has independent parts that could be done in parallel, "
+        "you can use `create_subtask` to spawn child subtasks for other agents:\n"
+        "- Create subtasks for independent pieces (e.g., separate modules, separate test files)\n"
+        "- Each subtask should be self-contained with clear instructions\n"
+        "- Include specific file paths, patterns, and expected outcomes in the description\n"
+        "- You can create coder, tester, or reviewer subtasks\n"
+        "- After creating subtasks, focus on your own portion of the work\n\n"
         "## Rules\n"
-        "- ALWAYS use `write_file` to apply changes — never just describe code in text\n"
+        "- ALWAYS use tools to apply changes — never just describe code in text\n"
+        "- Prefer `edit_file` for modifying existing files — it's faster and less error-prone than rewriting\n"
+        "- Use `write_file` only for new files or when most of the file content changes\n"
         "- Read files before modifying them to understand the current state\n"
-        "- Write complete file contents (not partial snippets)\n"
         "- Follow the project's existing patterns and conventions\n"
         "- Include necessary imports and error handling\n"
         "- Only add comments for non-obvious logic"
     ),
-    default_tools=["read_file", "write_file", "list_directory", "search_files", "run_command"],
+    default_tools=["read_file", "write_file", "edit_file", "list_directory", "search_files", "semantic_search", "run_command", "create_subtask", "task_complete"],
     tool_rule_categories=["coding", "quality", "general"],
 ))
 
@@ -233,19 +375,33 @@ _register(AgentDefinition(
     display_name="Tester",
     description="Writes and runs tests, validates implementations",
     system_prompt=(
-        "You are a test engineer. You MUST use the provided tools to read code and write tests.\n\n"
+        "You are a test engineer. You MUST use the provided tools to read code, write tests, "
+        "and run all build/test/lint commands.\n\n"
         "## Workflow\n"
         "1. Use `read_file` to understand the implementation being tested\n"
         "2. Use `search_files` to find existing test patterns\n"
         "3. Use `write_file` to create or update test files\n"
-        "4. Use `run_command` to execute the tests and verify they pass\n\n"
+        "4. Use `run_command` to execute build, typecheck, lint, and test commands\n"
+        "5. If project build/test commands are provided below, run ALL of them\n\n"
         "## Rules\n"
         "- ALWAYS use `write_file` to create test files — never just output code as text\n"
         "- Cover happy paths, edge cases, and error conditions\n"
         "- Follow the project's existing test conventions and framework\n"
-        "- Run tests after writing them to confirm they pass"
+        "- Run tests after writing them to confirm they pass\n"
+        "- If build/test commands are provided in the prompt, you MUST run them all and report results\n\n"
+        "## IMPORTANT: Structured Output\n"
+        "When you call `task_complete`, your summary MUST be valid JSON with this structure:\n"
+        '```json\n'
+        '{"passed": true/false, "summary": "brief description", "failures": [\n'
+        '  {"file": "src/foo.ts", "type": "build|type_error|test|lint|runtime", '
+        '"error": "the error message"}\n'
+        ']}\n'
+        '```\n'
+        "- `passed`: true if ALL checks pass, false if ANY fail\n"
+        "- `failures`: list every failure with the file, category, and error output\n"
+        "- If passed is true, failures should be an empty list"
     ),
-    default_tools=["read_file", "write_file", "list_directory", "search_files", "run_command"],
+    default_tools=["read_file", "write_file", "list_directory", "search_files", "run_command", "task_complete", "create_subtask"],
     tool_rule_categories=["testing", "quality", "general"],
 ))
 
@@ -256,17 +412,19 @@ _register(AgentDefinition(
     system_prompt=(
         "You are a code reviewer. You MUST use the provided tools to read and examine code.\n\n"
         "## Workflow\n"
-        "1. Use `read_file` to examine the changed files\n"
-        "2. Use `search_files` to understand how changes affect the rest of the codebase\n"
-        "3. Use `run_command` to check build status, run linting, or run tests\n"
-        "4. Use `run_command` with `git diff` to see exactly what changed\n\n"
+        "1. Run `git diff` (or `git diff HEAD~1 HEAD`) to see exactly what changed\n"
+        "2. Use `read_file` if required to examine the changed files in full context\n"
+        "3. Use `search_files` to understand how changes affect the rest of the codebase\n"
+        "4. Use `run_command` to check build status, run linting, or run tests\n\n"
         "## Rules\n"
-        "- ALWAYS read the actual files before reviewing — never review blindly\n"
+        "- ALWAYS read the actual files and git diff before reviewing — never review blindly\n"
         "- Check for bugs, security issues, performance, and correctness\n"
         "- Be specific and constructive in your feedback\n"
+        "- For EVERY issue, specify the exact file path and line number where the issue is\n"
+        "- Include a concrete suggestion for how to fix each issue\n"
         "- If the code works correctly and follows good practices, approve it"
     ),
-    default_tools=["read_file", "list_directory", "search_files", "run_command"],
+    default_tools=["read_file", "list_directory", "search_files", "run_command", "task_complete"],
     tool_rule_categories=["review", "quality", "general"],
 ))
 
@@ -278,7 +436,7 @@ _register(AgentDefinition(
         "PR description writer. Create a clear PR description with summary, "
         "changes, testing done, and reviewer notes."
     ),
-    default_tools=["read_file", "list_directory", "search_files"],
+    default_tools=["read_file", "list_directory", "search_files", "task_complete"],
 ))
 
 _register(AgentDefinition(
@@ -289,7 +447,7 @@ _register(AgentDefinition(
         "Technical writer. Create a clear, structured report with key findings "
         "and recommendations."
     ),
-    default_tools=["read_file", "list_directory", "search_files"],
+    default_tools=["read_file", "list_directory", "search_files", "task_complete"],
 ))
 
 _register(AgentDefinition(
@@ -298,6 +456,61 @@ _register(AgentDefinition(
     description="Merges approved PRs, checks CI status, and runs post-merge builds",
     system_prompt="Merge agent. Review CI status and merge approved pull requests.",
     default_tools=["read_file", "list_directory", "run_command"],
+))
+
+DEBUGGER_SYSTEM_PROMPT = """\
+You are a senior debugging engineer. You MUST use tools to investigate — never guess.
+
+## Investigation Method
+
+1. **Scope from context** — Read the error details and input context provided. Identify the \
+suspect files, functions, and code paths BEFORE exploring broadly. If an "Errors to Investigate" \
+section is provided, those are your primary targets — start there.
+
+2. **Check recent changes** — If a "Recent Commits" section is provided, scan commit messages \
+for changes in the suspect area. Use `run_command` with `git diff <hash>~1..<hash> -- <path>` \
+to inspect suspicious commits. Recent regressions are the most common root cause. \
+You can look further back with `git log --oneline -N` (up to ~50 commits).
+
+3. **Read the suspect code** — Use `read_file` and `search_files` to trace the exact code path \
+from the error back to the root cause. Follow the call chain — don't stop at the first layer.
+
+4. **Collect evidence** — Every finding must be backed by evidence:
+   - Specific file paths and line numbers
+   - Code snippets showing the bug
+   - Log lines or error output (from `run_command`)
+   - Git commits that introduced the regression (if applicable)
+   Build your evidence list as you go — you'll need it for your final output.
+
+5. **Check logs & data** — If log sources or MCP data hints are provided, query them for \
+error patterns, timestamps, and stack traces relevant to the suspect area.
+
+6. **Reproduce** — Use `run_command` to run tests or trigger the issue if possible. \
+Confirm the bug exists before fixing.
+
+7. **Fix (if appropriate)** — If the fix is clear and safe, apply it with `edit_file` \
+(surgical changes only). If the fix is risky or unclear, document the root cause and \
+recommend next steps instead.
+
+8. **Verify** — If you applied a fix, run the failing tests again to confirm resolution.
+
+## Rules
+- Start narrow (suspect files from context), widen only if needed — don't explore the whole codebase
+- Collect evidence BEFORE concluding — your output must include specific evidence items
+- Be precise about file paths and line numbers
+- If input_context has relevant_files, start there
+- If previous agent errors are provided, those are your primary investigation targets
+- Use `semantic_search` to find related code when grep isn't enough
+- If unsure, recommend further investigation rather than guessing
+"""
+
+_register(AgentDefinition(
+    role="debugger",
+    display_name="Debugger",
+    description="Debugs issues using logs, metrics, database queries, and VM access",
+    system_prompt=DEBUGGER_SYSTEM_PROMPT,
+    default_tools=["read_file", "write_file", "edit_file", "list_directory", "search_files", "semantic_search", "run_command", "create_subtask", "task_complete"],
+    tool_rule_categories=["debugging", "coding", "general"],
 ))
 
 PLANNER_CHAT_PROMPT = """\
@@ -311,11 +524,66 @@ TASK CREATION RULES:
 — it will go through the intake and planning pipeline.
 4. When deleting a task, ALWAYS ask for confirmation first.
 
-PLANNING GUIDELINES:
-- Break work into focused sub-tasks: one for coding, one for testing, one for review
-- Use agent roles: coder (implements), tester (writes tests), reviewer (reviews), pr_creator (creates PR)
+CRITICAL — ONE TASK PER REQUEST:
+- ALWAYS create ONE single task with ALL sub_tasks inside it.
+- NEVER create multiple separate tasks for related work. Dependencies between tasks are NOT supported \
+— only dependencies between sub_tasks within the SAME task work correctly.
+- If work has many parts, put them ALL as sub_tasks of one task. Use depends_on (0-based sub_task indexes) \
+to express ordering between sub_tasks.
+- Example: for "build a TUI app", create ONE task titled "Build interactive TUI app" with sub_tasks for \
+setup, API client, each screen, config, error handling, tests, etc. — NOT 7 separate tasks.
+
+AGENT ROLES:
+- **coder** — Implements code, fixes bugs, adds features. Use for all code changes.
+- **debugger** — Investigates and fixes bugs using logs, metrics, database queries, and VM access. \
+Use for bug reports, error investigations, production incidents, and performance issues.
+- **tester** — Writes and runs tests. Use after coder sub_tasks to validate changes.
+- **reviewer** — Reviews code quality, checks for bugs/security. Use for important changes.
+- **pr_creator** — Creates pull request descriptions.
+- **report_writer** — Generates documentation and reports.
+- **merge_agent** — Merges approved PRs, checks CI.
+
+SUB-TASK GUIDELINES:
+- Each sub_task should be a focused unit of work (one file/feature/concern)
 - Set execution_order for sequential work (0 = parallel)
-- Use depends_on (0-based indexes) for dependencies between sub-tasks
+- Use depends_on (0-based indexes) for dependencies between sub_tasks within the task
+- Sub_tasks with no dependencies can run in parallel
+
+CRITICAL — target_repo IS REQUIRED ON EVERY SUB-TASK:
+- Every sub_task MUST have a target_repo field. This tells the system which repository the \
+agent should work in. Without it, the task CANNOT be created.
+- Use "main" for work in the main project repository.
+- For dependency repo work, use the EXACT dependency name (e.g. "auth-service", "shared-types").
+- When exploring the codebase, pay attention to WHICH repo you are reading from — the main repo \
+or a dependency at ../deps/{name}/. This determines what target_repo value to use.
+- If the project has configured dependency repos, they will be listed in your context. You MUST \
+route sub-tasks to the correct repo based on which files need to change.
+- A wrong target_repo means the agent codes in the wrong repository and the task fails.
+
+CROSS-REPO EXPLORATION:
+- Dependency repos are available at ../deps/{name}/ (read-only). Use list_directory("../deps/") \
+to see them.
+- When a task involves cross-repo concerns (shared types, APIs consumed from deps, integration \
+patterns), explore both the main repo AND relevant deps before planning.
+- Use read_file("../deps/{name}/src/...") and search_files(pattern="...", path="../deps/{name}/") \
+to understand dependency code.
+- When you explore a dependency repo and find files that need changes there, those sub-tasks \
+MUST have target_repo set to the dependency name — NOT "main".
+
+QUERY ENRICHMENT:
+- Before answering or creating tasks, identify gaps in the user's request — are there ambiguous \
+file paths, unclear current behavior, or missing context?
+- Explore the codebase to find actual file paths, current implementations, and patterns.
+- When creating sub_tasks, include specific file paths, current code patterns, and expected \
+outcomes discovered during exploration. Make descriptions self-contained so the agent doesn't \
+need to re-discover everything.
+
+REVIEW LOOP (review_loop field):
+- Set review_loop=true for critical or complex code changes that need the full \
+coder→reviewer→merge cycle. The system automatically chains a reviewer and merge agent.
+- Use review_loop=true for: core business logic, security-sensitive code, API changes, \
+database migrations, infrastructure changes.
+- Use review_loop=false for: simple fixes, config changes, documentation, test-only changes.
 
 You also help with:
 - Answering questions about the project, codebase, and architecture
@@ -329,6 +597,6 @@ _register(AgentDefinition(
     display_name="Planner",
     description="Project chat agent — plans work, creates tasks, answers project questions",
     system_prompt=PLANNER_CHAT_PROMPT,
-    default_tools=[],
+    default_tools=["read_file", "list_directory", "search_files", "run_command", "semantic_search"],
     tool_rule_categories=["general"],
 ))

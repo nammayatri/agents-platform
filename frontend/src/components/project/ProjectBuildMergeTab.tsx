@@ -8,11 +8,18 @@ interface ProjectBuildMergeTabProps {
   setBuildCommands: (cmds: string[]) => void
   mergeMethod: 'merge' | 'squash' | 'rebase'
   setMergeMethod: (method: 'merge' | 'squash' | 'rebase') => void
+  requireMergeApproval: boolean
+  setRequireMergeApproval: (v: boolean) => void
+  requirePlanApproval: boolean
+  setRequirePlanApproval: (v: boolean) => void
   setError: (err: string) => void
 }
 
 export default function ProjectBuildMergeTab({
-  projectId, buildCommands, setBuildCommands, mergeMethod, setMergeMethod, setError,
+  projectId, buildCommands, setBuildCommands, mergeMethod, setMergeMethod,
+  requireMergeApproval, setRequireMergeApproval,
+  requirePlanApproval, setRequirePlanApproval,
+  setError,
 }: ProjectBuildMergeTabProps) {
   const [saving, setSaving] = useState(false)
 
@@ -21,8 +28,55 @@ export default function ProjectBuildMergeTab({
       <div>
         <p className="text-sm text-gray-300">Build & Merge Configuration</p>
         <p className="text-[11px] text-gray-600 mt-0.5">
-          Configure how PRs are merged and what build commands run after merge.
+          Configure how plans are approved, PRs are merged, and what build commands run after merge.
         </p>
+      </div>
+
+      <div>
+        <label className="flex items-center gap-3 cursor-pointer group">
+          <div className="relative">
+            <input
+              type="checkbox"
+              checked={requirePlanApproval}
+              onChange={(e) => setRequirePlanApproval(e.target.checked)}
+              className="sr-only peer"
+            />
+            <div className="w-9 h-5 bg-gray-800 border border-gray-700 rounded-full peer-checked:bg-indigo-600 peer-checked:border-indigo-500 transition-colors" />
+            <div className="absolute top-0.5 left-0.5 w-4 h-4 bg-gray-500 rounded-full peer-checked:translate-x-4 peer-checked:bg-white transition-all" />
+          </div>
+          <div>
+            <span className="text-sm text-gray-300 group-hover:text-white transition-colors">
+              Require approval before executing plans
+            </span>
+            <p className="text-[11px] text-gray-600">
+              When enabled, plans will be reviewed by AI but pause for your approval before execution begins.
+              When disabled, plans are auto-approved after passing AI review.
+            </p>
+          </div>
+        </label>
+      </div>
+
+      <div>
+        <label className="flex items-center gap-3 cursor-pointer group">
+          <div className="relative">
+            <input
+              type="checkbox"
+              checked={requireMergeApproval}
+              onChange={(e) => setRequireMergeApproval(e.target.checked)}
+              className="sr-only peer"
+            />
+            <div className="w-9 h-5 bg-gray-800 border border-gray-700 rounded-full peer-checked:bg-indigo-600 peer-checked:border-indigo-500 transition-colors" />
+            <div className="absolute top-0.5 left-0.5 w-4 h-4 bg-gray-500 rounded-full peer-checked:translate-x-4 peer-checked:bg-white transition-all" />
+          </div>
+          <div>
+            <span className="text-sm text-gray-300 group-hover:text-white transition-colors">
+              Require approval before merge
+            </span>
+            <p className="text-[11px] text-gray-600">
+              When enabled, PRs are created but not auto-merged. You review and merge manually.
+            </p>
+          </div>
+        </label>
       </div>
 
       <div>
@@ -90,11 +144,11 @@ export default function ProjectBuildMergeTab({
             setError('')
             try {
               const cleanedCmds = buildCommands.filter((c) => c.trim())
-              await projectsApi.update(projectId, {
-                settings_json: {
-                  build_commands: cleanedCmds,
-                  merge_method: mergeMethod,
-                },
+              await projectsApi.buildSettings.update(projectId, {
+                build_commands: cleanedCmds,
+                merge_method: mergeMethod,
+                require_merge_approval: requireMergeApproval,
+                require_plan_approval: requirePlanApproval,
               })
               setBuildCommands(cleanedCmds)
             } catch (e) {

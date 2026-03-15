@@ -7,7 +7,12 @@ interface Props {
   isAdmin: boolean
 }
 
-const notifEventOptions = ['stuck', 'failed', 'completed', 'review', 'in_progress']
+const notifEventOptions = [
+  'stuck', 'failed', 'completed', 'review', 'in_progress',
+  'build_started', 'build_completed', 'build_failed',
+  'release_test_completed', 'release_test_failed',
+  'release_prod_completed', 'release_prod_failed',
+]
 
 export default function NotificationsTab({ isAdmin: _isAdmin }: Props) {
   const [notifList, setNotifList] = useState<NotificationChannel[]>([])

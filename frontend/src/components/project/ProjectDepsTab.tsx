@@ -1,4 +1,5 @@
-import type { ProjectDependency, GitProviderConfig } from '../../types'
+import type { ProjectDependency, GitProviderConfig, RepoInfo } from '../../types'
+import RepoPicker from './RepoPicker'
 
 interface ProjectDepsTabProps {
   dependencies: ProjectDependency[]
@@ -14,6 +15,20 @@ export default function ProjectDepsTab({ dependencies, setDependencies, gitProvi
     setDependencies(updated)
   }
   const removeDependency = (i: number) => setDependencies(dependencies.filter((_, idx) => idx !== i))
+
+  const handleDepRepoSelect = (i: number, repo: RepoInfo, providerId: string) => {
+    const updated = [...dependencies]
+    updated[i] = {
+      ...updated[i],
+      repo_url: repo.clone_url,
+      git_provider_id: providerId,
+    }
+    // Auto-fill name if empty
+    if (!updated[i].name.trim()) {
+      updated[i] = { ...updated[i], name: repo.name }
+    }
+    setDependencies(updated)
+  }
 
   return (
     <>
@@ -32,7 +47,15 @@ export default function ProjectDepsTab({ dependencies, setDependencies, gitProvi
           <div key={i} className="p-3 bg-gray-900 border border-gray-800 rounded-lg">
             <div className="grid grid-cols-3 gap-2 mb-2">
               <input className="px-2 py-1.5 bg-gray-950 border border-gray-800 rounded text-white text-sm focus:outline-none focus:border-indigo-500 transition-colors" placeholder="Name" value={dep.name} onChange={(e) => updateDependency(i, 'name', e.target.value)} />
-              <input className="col-span-2 px-2 py-1.5 bg-gray-950 border border-gray-800 rounded text-white text-sm focus:outline-none focus:border-indigo-500 transition-colors" placeholder="Repository URL (optional)" value={dep.repo_url || ''} onChange={(e) => updateDependency(i, 'repo_url', e.target.value)} />
+              <div className="col-span-2">
+                <RepoPicker
+                  value={dep.repo_url || ''}
+                  onChange={(url) => updateDependency(i, 'repo_url', url)}
+                  onRepoSelect={(repo, pid) => handleDepRepoSelect(i, repo, pid)}
+                  gitProviderList={gitProviderList}
+                  placeholder="Repository URL (optional)"
+                />
+              </div>
             </div>
             <div className="flex gap-2">
               <input className="flex-1 px-2 py-1.5 bg-gray-950 border border-gray-800 rounded text-white text-sm focus:outline-none focus:border-indigo-500 transition-colors" placeholder="Short description (optional)" value={dep.description || ''} onChange={(e) => updateDependency(i, 'description', e.target.value)} />

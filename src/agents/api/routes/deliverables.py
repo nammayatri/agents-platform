@@ -60,7 +60,29 @@ async def get_deliverable_diff(deliverable_id: str, user: CurrentUser, db: DB):
         raise HTTPException(status_code=404, detail="No workspace available")
 
     task_workspace = os.path.join(project["workspace_path"], "tasks", str(row["todo_id"]))
+
+    # Check if this deliverable targets a dependency repo
     repo_dir = os.path.join(task_workspace, "repo")
+    if row.get("target_repo_name"):
+        dep_name = row["target_repo_name"].replace("/", "_").replace(" ", "_")
+        dep_repo = os.path.join(task_workspace, f"dep_{dep_name}", "repo")
+        if os.path.isdir(dep_repo):
+            repo_dir = dep_repo
+    elif row.get("sub_task_id"):
+        # Fallback: look up target_repo from the sub_task
+        st = await db.fetchrow(
+            "SELECT target_repo FROM sub_tasks WHERE id = $1", row["sub_task_id"]
+        )
+        if st and st.get("target_repo"):
+            tr = st["target_repo"]
+            if isinstance(tr, str):
+                tr = json.loads(tr)
+            if isinstance(tr, dict) and tr.get("name"):
+                dep_name = tr["name"].replace("/", "_").replace(" ", "_")
+                dep_repo = os.path.join(task_workspace, f"dep_{dep_name}", "repo")
+                if os.path.isdir(dep_repo):
+                    repo_dir = dep_repo
+
     if not os.path.isdir(repo_dir):
         raise HTTPException(status_code=404, detail="Workspace not found")
 
@@ -94,9 +116,9 @@ async def get_deliverable_diff(deliverable_id: str, user: CurrentUser, db: DB):
 
     # Cache it for next time
     await db.execute(
-        "UPDATE deliverables SET content_json = $2::jsonb WHERE id = $1",
+        "UPDATE deliverables SET content_json = $2 WHERE id = $1",
         deliverable_id,
-        json.dumps(result),
+        result,
     )
 
     return result

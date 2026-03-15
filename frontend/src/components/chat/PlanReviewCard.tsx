@@ -1,4 +1,5 @@
 import { useState } from 'react'
+import { ChevronDown, ChevronRight } from 'lucide-react'
 import type { ChatPlanData } from '../../types'
 
 const ROLE_LABELS: Record<string, string> = {
@@ -8,6 +9,9 @@ const ROLE_LABELS: Record<string, string> = {
   pr_creator: 'PR',
   report_writer: 'Report',
   merge_agent: 'Merge',
+  debugger: 'Debug',
+  release_build_watcher: 'Build',
+  release_deployer: 'Deploy',
 }
 
 const PRIORITY_COLORS: Record<string, string> = {
@@ -20,6 +24,7 @@ const PRIORITY_COLORS: Record<string, string> = {
 interface PlanReviewCardProps {
   planData: ChatPlanData
   isAccepted: boolean
+  isLatest?: boolean
   onAccept: () => void
   onReject: (feedback: string) => void
   disabled?: boolean
@@ -28,15 +33,25 @@ interface PlanReviewCardProps {
 export default function PlanReviewCard({
   planData,
   isAccepted,
+  isLatest,
   onAccept,
   onReject,
   disabled,
 }: PlanReviewCardProps) {
   const [showRejectInput, setShowRejectInput] = useState(false)
   const [feedback, setFeedback] = useState('')
+  const [expandedSubtasks, setExpandedSubtasks] = useState<Set<number>>(new Set())
 
   const tasks = planData.tasks || []
   const title = planData.plan_title || 'Execution Plan'
+
+  const toggleSubtask = (idx: number) => {
+    setExpandedSubtasks(prev => {
+      const next = new Set(prev)
+      if (next.has(idx)) next.delete(idx); else next.add(idx)
+      return next
+    })
+  }
 
   const handleRejectSubmit = () => {
     if (!feedback.trim()) return
@@ -108,23 +123,103 @@ export default function PlanReviewCard({
 
             {/* Subtasks */}
             {task.subtasks && task.subtasks.length > 0 && (
-              <div className="ml-6 space-y-1">
-                {task.subtasks.map((st, stIdx) => (
-                  <div key={stIdx} className="flex items-start gap-2 py-1">
-                    <span className="text-[10px] text-gray-700 font-mono w-3 text-right shrink-0 mt-0.5">
-                      {stIdx + 1}
-                    </span>
-                    <span className="text-[11px] px-1.5 py-0.5 bg-gray-800 rounded text-gray-500 shrink-0">
-                      {ROLE_LABELS[st.agent_role] || st.agent_role}
-                    </span>
-                    <span className="text-xs text-gray-400 flex-1">{st.title}</span>
-                    {st.depends_on && st.depends_on.length > 0 && (
-                      <span className="text-[10px] text-gray-700 font-mono shrink-0">
-                        {'\u2192'} #{st.depends_on.map((d) => d + 1).join(', #')}
-                      </span>
-                    )}
-                  </div>
-                ))}
+              <div className="ml-6 space-y-0.5">
+                {task.subtasks.map((st, stIdx) => {
+                  const globalIdx = taskIdx * 100 + stIdx
+                  const isExpanded = expandedSubtasks.has(globalIdx)
+                  const hasDetails = st.description || (st.context && Object.keys(st.context).length > 0)
+
+                  return (
+                    <div key={stIdx}>
+                      <div
+                        className={`flex items-start gap-2 py-1 ${hasDetails ? 'cursor-pointer hover:bg-gray-800/30 rounded px-1 -mx-1' : ''}`}
+                        onClick={() => hasDetails && toggleSubtask(globalIdx)}
+                      >
+                        {hasDetails ? (
+                          <span className="text-gray-600 mt-0.5 shrink-0">
+                            {isExpanded ? <ChevronDown className="w-3 h-3" /> : <ChevronRight className="w-3 h-3" />}
+                          </span>
+                        ) : (
+                          <span className="text-[10px] text-gray-700 font-mono w-3 text-right shrink-0 mt-0.5">
+                            {stIdx + 1}
+                          </span>
+                        )}
+                        <span className="text-[11px] px-1.5 py-0.5 bg-gray-800 rounded text-gray-500 shrink-0">
+                          {ROLE_LABELS[st.agent_role] || st.agent_role}
+                        </span>
+                        <span className="text-xs text-gray-400 flex-1">{st.title}</span>
+                        {st.review_loop && (
+                          <span className="px-1 py-0.5 bg-cyan-500/10 border border-cyan-500/20 rounded text-[10px] text-cyan-400/80 shrink-0">review</span>
+                        )}
+                        <span className={`px-1 py-0.5 rounded text-[10px] font-mono shrink-0 ${
+                          st.target_repo && String(st.target_repo) !== 'main'
+                            ? 'bg-purple-500/10 border border-purple-500/20 text-purple-400/80'
+                            : 'bg-gray-800 text-gray-500'
+                        }`}>
+                          {String(st.target_repo || 'main')}
+                        </span>
+                        {st.depends_on && st.depends_on.length > 0 && (
+                          <span className="text-[10px] text-gray-700 font-mono shrink-0">
+                            {'\u2192'} #{st.depends_on.map((d) => d + 1).join(', #')}
+                          </span>
+                        )}
+                      </div>
+                      {isExpanded && (
+                        <div className="ml-5 pl-3 border-l border-gray-800 mb-2 space-y-1.5 py-1.5">
+                          {st.description && (
+                            <p className="text-[11px] text-gray-500 leading-relaxed">{String(st.description)}</p>
+                          )}
+                          {st.context && typeof st.context === 'object' && (
+                            <>
+                              {Array.isArray(st.context.relevant_files) && st.context.relevant_files.length > 0 && (
+                                <div>
+                                  <span className="text-[10px] text-gray-600 uppercase tracking-wider">Files</span>
+                                  <div className="mt-0.5 flex flex-wrap gap-1">
+                                    {st.context.relevant_files.map((f, fi) => (
+                                      <span key={fi} className="text-[11px] font-mono text-indigo-400/70 bg-indigo-500/5 px-1.5 py-0.5 rounded">
+                                        {String(f)}
+                                      </span>
+                                    ))}
+                                  </div>
+                                </div>
+                              )}
+                              {st.context.what_to_change && (
+                                <div>
+                                  <span className="text-[10px] text-gray-600 uppercase tracking-wider">What to change</span>
+                                  <p className="text-[11px] text-gray-500 mt-0.5 leading-relaxed">{String(st.context.what_to_change)}</p>
+                                </div>
+                              )}
+                              {st.context.current_state && (
+                                <div>
+                                  <span className="text-[10px] text-gray-600 uppercase tracking-wider">Current state</span>
+                                  <p className="text-[11px] text-gray-500 mt-0.5 leading-relaxed">{String(st.context.current_state)}</p>
+                                </div>
+                              )}
+                              {st.context.patterns_to_follow && (
+                                <div>
+                                  <span className="text-[10px] text-gray-600 uppercase tracking-wider">Patterns to follow</span>
+                                  <p className="text-[11px] text-gray-500 mt-0.5 leading-relaxed">{String(st.context.patterns_to_follow)}</p>
+                                </div>
+                              )}
+                              {st.context.related_code && (
+                                <div>
+                                  <span className="text-[10px] text-gray-600 uppercase tracking-wider">Related code</span>
+                                  <pre className="text-[11px] text-gray-500 mt-0.5 font-mono whitespace-pre-wrap leading-relaxed bg-gray-950 rounded px-2 py-1.5 border border-gray-800/50 max-h-32 overflow-y-auto">{String(st.context.related_code)}</pre>
+                                </div>
+                              )}
+                              {st.context.integration_points && (
+                                <div>
+                                  <span className="text-[10px] text-gray-600 uppercase tracking-wider">Integration points</span>
+                                  <p className="text-[11px] text-gray-500 mt-0.5 leading-relaxed">{String(st.context.integration_points)}</p>
+                                </div>
+                              )}
+                            </>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  )
+                })}
               </div>
             )}
           </div>
@@ -132,7 +227,12 @@ export default function PlanReviewCard({
       </div>
 
       {/* Action buttons */}
-      {!isAccepted && (
+      {!isAccepted && isLatest === false && (
+        <div className="px-4 py-2 border-t border-gray-800">
+          <span className="text-[11px] text-gray-600">Earlier version — see latest plan below</span>
+        </div>
+      )}
+      {!isAccepted && isLatest !== false && (
         <div className="px-4 py-2.5 border-t border-gray-800">
           {showRejectInput ? (
             <div className="flex items-center gap-2">

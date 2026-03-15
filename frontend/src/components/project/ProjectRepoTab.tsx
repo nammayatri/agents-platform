@@ -1,5 +1,6 @@
-import type { GitProviderConfig } from '../../types'
+import type { GitProviderConfig, RepoInfo } from '../../types'
 import { inputClass, selectClass } from '../../styles/classes'
+import RepoPicker from './RepoPicker'
 
 interface ProjectRepoTabProps {
   repoUrl: string
@@ -14,12 +15,24 @@ interface ProjectRepoTabProps {
 export default function ProjectRepoTab({
   repoUrl, setRepoUrl, defaultBranch, setDefaultBranch, gitProviderId, setGitProviderId, gitProviderList,
 }: ProjectRepoTabProps) {
+  const handleRepoSelect = (repo: RepoInfo, providerId: string) => {
+    setRepoUrl(repo.clone_url)
+    setDefaultBranch(repo.default_branch)
+    setGitProviderId(providerId)
+  }
+
   return (
     <>
       <div className="grid grid-cols-2 gap-3">
         <div>
           <label className="block text-xs text-gray-500 mb-1">Repository URL</label>
-          <input className={inputClass} placeholder="https://github.com/org/repo" value={repoUrl} onChange={(e) => setRepoUrl(e.target.value)} />
+          <RepoPicker
+            value={repoUrl}
+            onChange={setRepoUrl}
+            onRepoSelect={handleRepoSelect}
+            gitProviderList={gitProviderList}
+            placeholder="Search repos or paste URL..."
+          />
         </div>
         <div>
           <label className="block text-xs text-gray-500 mb-1">Default Branch</label>
@@ -35,7 +48,7 @@ export default function ProjectRepoTab({
               <option key={g.id} value={g.id}>{g.display_name} ({g.provider_type})</option>
             ))}
           </select>
-          <p className="text-[11px] text-gray-600 mt-1">For private repositories. Configure providers in Settings.</p>
+          <p className="text-[11px] text-gray-600 mt-1">Auto-set when picking a repo. Configure providers in Settings.</p>
         </div>
       )}
     </>

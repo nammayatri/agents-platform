@@ -131,13 +131,13 @@ async def put_system_setting(
     row = await db.fetchrow(
         """
         INSERT INTO system_settings (key, value_json, updated_by)
-        VALUES ($1, $2::jsonb, $3)
+        VALUES ($1, $2, $3)
         ON CONFLICT (key) DO UPDATE
-            SET value_json = $2::jsonb, updated_by = $3, updated_at = NOW()
+            SET value_json = $2, updated_by = $3, updated_at = NOW()
         RETURNING *
         """,
         key,
-        json.dumps(body.value_json),
+        body.value_json,
         user["id"],
     )
     return dict(row)

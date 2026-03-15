@@ -145,14 +145,14 @@ async def create_mcp_server(body: McpServerInput, user: CurrentUser, db: DB):
     row = await db.fetchrow(
         """
         INSERT INTO mcp_servers (owner_id, name, description, command, args, env_json, transport, url)
-        VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8) RETURNING *
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *
         """,
         user["id"],
         body.name,
         body.description,
         body.command,
         body.args,
-        json.dumps(body.env_json),
+        body.env_json,
         body.transport,
         body.url,
     )
@@ -172,16 +172,10 @@ async def update_mcp_server(server_id: str, body: McpServerUpdate, user: Current
         return dict(existing)
 
     # Handle env_json serialization
-    if "env_json" in updates:
-        updates["env_json"] = json.dumps(updates["env_json"])
-
     set_parts = []
     values = []
     for i, (k, v) in enumerate(updates.items()):
-        if k == "env_json":
-            set_parts.append(f"{k} = ${i+2}::jsonb")
-        else:
-            set_parts.append(f"{k} = ${i+2}")
+        set_parts.append(f"{k} = ${i+2}")
         values.append(v)
 
     row = await db.fetchrow(
@@ -227,22 +221,37 @@ async def discover_mcp_tools(server_id: str, user: CurrentUser, db: DB):
             url = server.get("url")
             if not url:
                 raise ValueError("URL is required for SSE/HTTP transport")
-            tools = await _discover_tools_http(url, transport)
+            tools, new_transport, new_url = await _discover_tools_http_with_fallback(url, transport)
+            # If transport/URL changed via fallback, update the server config
+            if new_transport != transport or new_url != url:
+                logger.info("MCP discovery: auto-detected transport change for %s: %s %s -> %s %s",
+                            server_id, transport, url, new_transport, new_url)
+                await db.execute(
+                    "UPDATE mcp_servers SET transport = $2, url = $3, updated_at = NOW() WHERE id = $1",
+                    server_id, new_transport, new_url,
+                )
+                transport = new_transport
+                url = new_url
         else:
             raise ValueError(f"Unknown transport: {transport}")
 
         # Store discovered tools
         await db.execute(
-            "UPDATE mcp_servers SET tools_json = $2::jsonb, updated_at = NOW() WHERE id = $1",
+            "UPDATE mcp_servers SET tools_json = $2, updated_at = NOW() WHERE id = $1",
             server_id,
-            json.dumps(tools),
+            tools,
         )
 
-        return {"status": "ok", "tools": tools}
+        result = {"status": "ok", "tools": tools}
+        if transport != server.get("transport") or url != server.get("url"):
+            result["transport_updated"] = transport
+            result["url_updated"] = url
+        return result
 
     except Exception as e:
-        logger.warning("MCP tool discovery failed for %s: %s", server_id, e)
-        return {"status": "error", "detail": str(e), "tools": []}
+        logger.warning("MCP tool discovery failed for %s: %s: %s", server_id, type(e).__name__, e)
+        detail = str(e) or f"{type(e).__name__}"
+        return {"status": "error", "detail": detail, "tools": []}
 
 
 async def _discover_tools_stdio(
@@ -341,6 +350,54 @@ async def _read_jsonrpc_line(stdout: asyncio.StreamReader) -> dict:
             continue
 
 
+async def _discover_tools_http_with_fallback(
+    url: str, transport: str,
+) -> tuple[list[dict], str, str]:
+    """Discover tools, falling back to alternate transport if primary fails.
+
+    Returns (tools, effective_transport, effective_url).
+    """
+    from urllib.parse import urlparse, urlunparse
+
+    parsed = urlparse(url)
+    base_url = urlunparse((parsed.scheme, parsed.netloc, "", "", "", ""))
+
+    # Primary attempt
+    primary_error = None
+    try:
+        tools = await _discover_tools_http(url, transport)
+        return tools, transport, url
+    except Exception as e:
+        primary_error = e
+        logger.warning("MCP discovery primary (%s @ %s) failed: %s", transport, url, e)
+
+    # Fallback: try the other transport at common paths
+    fallback_attempts: list[tuple[str, str]] = []
+    if transport == "sse":
+        # SSE failed — try streamable-http at /mcp and base URL
+        fallback_attempts.append(("streamable-http", base_url + "/mcp"))
+        if parsed.path != "/mcp":
+            fallback_attempts.append(("streamable-http", base_url))
+    else:
+        # streamable-http failed — try SSE at /sse
+        fallback_attempts.append(("sse", base_url + "/sse"))
+        if parsed.path != "/sse":
+            fallback_attempts.append(("sse", base_url))
+
+    for fb_transport, fb_url in fallback_attempts:
+        try:
+            logger.info("MCP discovery fallback: trying %s @ %s", fb_transport, fb_url)
+            tools = await _discover_tools_http(fb_url, fb_transport)
+            logger.info("MCP discovery fallback succeeded: %s @ %s", fb_transport, fb_url)
+            return tools, fb_transport, fb_url
+        except Exception as fb_err:
+            logger.debug("MCP discovery fallback (%s @ %s) failed: %s", fb_transport, fb_url, fb_err)
+            continue
+
+    # All attempts failed — raise the primary error
+    raise primary_error
+
+
 async def _discover_tools_http(url: str, transport: str) -> list[dict]:
     """Discover tools from an SSE or streamable-http MCP server."""
     import httpx
@@ -348,34 +405,55 @@ async def _discover_tools_http(url: str, transport: str) -> list[dict]:
     if transport == "sse":
         return await _discover_tools_sse(url)
 
-    # streamable-http: POST JSON-RPC directly
-    async with httpx.AsyncClient(timeout=30) as client:
-        init_body = {
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "initialize",
+    return await _discover_tools_streamable_http(url)
+
+
+async def _discover_tools_streamable_http(url: str) -> list[dict]:
+    """Discover tools from a streamable-http MCP server.
+
+    Streamable-HTTP servers may return responses as SSE streams (text/event-stream)
+    which stay open. We must use streaming reads to avoid hanging.
+    """
+    import httpx
+
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream",
+    }
+
+    async with httpx.AsyncClient(
+        timeout=httpx.Timeout(30.0, connect=30.0), verify=False,
+    ) as client:
+        # 1. Initialize
+        init_resp, init_headers = await _streamable_post(client, url, {
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
             "params": {
-                "protocolVersion": "2024-11-05",
+                "protocolVersion": "2025-03-26",
                 "capabilities": {},
                 "clientInfo": {"name": "agents-platform", "version": "0.1.0"},
             },
-        }
-        resp = await client.post(url, json=init_body)
-        resp.raise_for_status()
-        init_resp = resp.json()
+        }, headers)
         if "error" in init_resp:
             raise ValueError(f"MCP initialize error: {init_resp['error']}")
 
-        # Send tools/list
-        tools_body = {
-            "jsonrpc": "2.0",
-            "id": 2,
-            "method": "tools/list",
-            "params": {},
-        }
-        resp = await client.post(url, json=tools_body)
-        resp.raise_for_status()
-        tools_resp = resp.json()
+        # Capture session ID for subsequent requests (MCP spec requirement)
+        session_id = init_headers.get("mcp-session-id")
+        if session_id:
+            headers = {**headers, "mcp-session-id": session_id}
+            logger.info("MCP streamable-http: session_id=%s", session_id)
+
+        # 2. Send initialized notification (fire-and-forget, no response expected)
+        try:
+            await _streamable_post(client, url, {
+                "jsonrpc": "2.0", "method": "notifications/initialized",
+            }, headers, expect_response=False)
+        except Exception:
+            pass  # Notifications may not return anything
+
+        # 3. tools/list
+        tools_resp, _ = await _streamable_post(client, url, {
+            "jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {},
+        }, headers)
         if "error" in tools_resp:
             raise ValueError(f"MCP tools/list error: {tools_resp['error']}")
 
@@ -388,6 +466,55 @@ async def _discover_tools_http(url: str, transport: str) -> list[dict]:
             }
             for t in tools
         ]
+
+
+async def _streamable_post(
+    client, url: str, body: dict, headers: dict, *,
+    expect_response: bool = True, timeout: float = 15,
+) -> tuple[dict, dict]:
+    """POST a JSON-RPC message and handle both JSON and SSE-stream responses.
+
+    Returns (json_response, response_headers_dict).
+    For SSE streams, reads line-by-line until a JSON-RPC response arrives,
+    then closes the stream immediately to avoid hanging.
+    """
+
+    req = client.build_request("POST", url, content=json.dumps(body), headers=headers)
+    resp = await client.send(req, stream=True)
+    resp.raise_for_status()
+
+    content_type = resp.headers.get("content-type", "")
+    resp_headers = dict(resp.headers)
+
+    try:
+        if "text/event-stream" in content_type:
+            if not expect_response:
+                return {}, resp_headers
+            deadline = asyncio.get_event_loop().time() + timeout
+            async for raw_line in resp.aiter_lines():
+                if asyncio.get_event_loop().time() > deadline:
+                    raise TimeoutError("Timed out reading SSE response")
+                line = raw_line.strip()
+                if line.startswith("data:"):
+                    data = line[5:].strip()
+                    if not data:
+                        continue
+                    try:
+                        msg = json.loads(data)
+                        if "id" in msg:
+                            return msg, resp_headers
+                    except json.JSONDecodeError:
+                        continue
+            if not expect_response:
+                return {}, resp_headers
+            raise ValueError("SSE stream ended without JSON-RPC response")
+        else:
+            raw = await resp.aread()
+            if not expect_response:
+                return {}, resp_headers
+            return json.loads(raw), resp_headers
+    finally:
+        await resp.aclose()
 
 
 async def _discover_tools_sse(url: str) -> list[dict]:
@@ -413,21 +540,29 @@ async def _discover_tools_sse(url: str) -> list[dict]:
         try:
             async for chunk in resp.aiter_bytes():
                 buf += chunk
+                # Normalize CRLF → LF (SSE spec allows both)
+                buf = buf.replace(b"\r\n", b"\n")
                 while b"\n\n" in buf:
                     block, buf = buf.split(b"\n\n", 1)
-                    etype = edata = None
+                    etype = None
+                    data_lines: list[str] = []
                     for line in block.decode(errors="replace").strip().split("\n"):
+                        if line.startswith(":"):
+                            continue  # SSE comment
                         if line.startswith("event:"):
                             etype = line[6:].strip()
                         elif line.startswith("data:"):
-                            edata = line[5:].strip()
-                    if etype and edata:
-                        await events.put((etype, edata))
+                            data_lines.append(line[5:].strip())
+                    edata = "\n".join(data_lines) if data_lines else None
+                    # SSE spec: default event type is "message"
+                    if edata is not None:
+                        await events.put((etype or "message", edata))
         except Exception as exc:
             await events.put(("error", str(exc)))
 
     async with httpx.AsyncClient(
-        timeout=httpx.Timeout(60.0, connect=10.0), follow_redirects=True,
+        timeout=httpx.Timeout(60.0, connect=30.0), follow_redirects=True,
+        verify=False,
     ) as client:
         # Open the SSE stream
         req = client.build_request("GET", url, headers={"Accept": "text/event-stream"})
@@ -509,6 +644,120 @@ async def _wait_for_jsonrpc_response(
                     return msg
             except json.JSONDecodeError:
                 continue
+
+
+@router.post("/mcp-servers/{server_id}/test-connection")
+async def test_mcp_connection(server_id: str, user: CurrentUser, db: DB):
+    """Test connectivity to an MCP server and return diagnostic info."""
+    import httpx
+
+    row = await db.fetchrow("SELECT * FROM mcp_servers WHERE id = $1", server_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="MCP server not found")
+    if str(row["owner_id"]) != str(user["id"]):
+        raise HTTPException(status_code=403, detail="Access denied")
+
+    server = dict(row)
+    transport = server.get("transport", "stdio")
+    url = server.get("url", "")
+
+    if transport == "stdio":
+        return {"status": "ok", "transport": "stdio", "message": "Stdio servers are tested during tool discovery"}
+
+    if not url:
+        return {"status": "error", "message": "No URL configured"}
+
+    from urllib.parse import urlparse, urlunparse
+    parsed = urlparse(url)
+    base_url = urlunparse((parsed.scheme, parsed.netloc, "", "", "", ""))
+
+    results = []
+
+    # Probe common endpoints
+    probe_paths = [
+        parsed.path,  # configured path
+        "/mcp",
+        "/sse",
+        "/health",
+        "/ping",
+    ]
+    # Deduplicate while preserving order
+    seen = set()
+    unique_paths = []
+    for p in probe_paths:
+        if p and p not in seen:
+            seen.add(p)
+            unique_paths.append(p)
+
+    async with httpx.AsyncClient(timeout=30, verify=False, follow_redirects=True) as client:
+        for path in unique_paths:
+            probe_url = base_url + path
+            try:
+                resp = await client.get(probe_url, headers={"Accept": "text/event-stream, application/json, */*"})
+                content_type = resp.headers.get("content-type", "")
+                results.append({
+                    "path": path,
+                    "url": probe_url,
+                    "status": resp.status_code,
+                    "content_type": content_type,
+                    "body_preview": resp.text[:200] if resp.status_code < 400 else resp.text[:500],
+                    "supports_sse": "text/event-stream" in content_type,
+                })
+            except Exception as e:
+                results.append({
+                    "path": path,
+                    "url": probe_url,
+                    "status": None,
+                    "error": str(e),
+                })
+
+        # Try streamable-http POST to /mcp
+        mcp_url = base_url + "/mcp"
+        try:
+            resp = await client.post(
+                mcp_url,
+                content=json.dumps({
+                    "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2024-11-05",
+                        "capabilities": {},
+                        "clientInfo": {"name": "agents-platform", "version": "0.1.0"},
+                    },
+                }),
+                headers={"Content-Type": "application/json", "Accept": "application/json, text/event-stream"},
+            )
+            results.append({
+                "path": "/mcp (POST initialize)",
+                "url": mcp_url,
+                "status": resp.status_code,
+                "content_type": resp.headers.get("content-type", ""),
+                "body_preview": resp.text[:500],
+                "supports_streamable_http": resp.status_code == 200,
+            })
+        except Exception as e:
+            results.append({
+                "path": "/mcp (POST initialize)",
+                "url": mcp_url,
+                "error": str(e),
+            })
+
+    # Determine recommendation
+    recommendation = None
+    for r in results:
+        if r.get("supports_streamable_http"):
+            recommendation = {"transport": "streamable-http", "url": mcp_url}
+            break
+        if r.get("supports_sse") and r.get("status") == 200:
+            recommendation = {"transport": "sse", "url": r["url"]}
+            break
+
+    return {
+        "status": "ok",
+        "current_transport": transport,
+        "current_url": url,
+        "probes": results,
+        "recommendation": recommendation,
+    }
 
 
 # ── Per-project enablement ──────────────────────────────────────────
@@ -604,17 +853,20 @@ class GitProviderUpdate(BaseModel):
 
 
 def _sanitize_git_provider(row: dict) -> dict:
-    """Remove encrypted token, add has_token indicator."""
+    """Remove encrypted token, add has_token and is_shared indicators."""
     result = dict(row)
     has_token = bool(result.pop("token_enc", None))
     result["has_token"] = has_token
+    result["is_shared"] = result.get("owner_id") is None
     return result
 
 
 @router.get("/git-providers")
 async def list_git_providers(user: CurrentUser, db: DB):
     rows = await db.fetch(
-        "SELECT * FROM git_provider_configs WHERE owner_id = $1 ORDER BY created_at DESC",
+        "SELECT * FROM git_provider_configs "
+        "WHERE owner_id = $1 OR owner_id IS NULL "
+        "ORDER BY owner_id NULLS FIRST, created_at DESC",
         user["id"],
     )
     return [_sanitize_git_provider(dict(r)) for r in rows]
@@ -622,13 +874,14 @@ async def list_git_providers(user: CurrentUser, db: DB):
 
 @router.post("/git-providers", status_code=status.HTTP_201_CREATED)
 async def create_git_provider(body: GitProviderInput, user: CurrentUser, db: DB):
+    if user["role"] != "admin":
+        raise HTTPException(status_code=403, detail="Only admins can manage git providers")
     token_enc = encrypt(body.token) if body.token else None
     row = await db.fetchrow(
         """
         INSERT INTO git_provider_configs (owner_id, provider_type, display_name, api_base_url, token_enc)
-        VALUES ($1, $2, $3, $4, $5) RETURNING *
+        VALUES (NULL, $1, $2, $3, $4) RETURNING *
         """,
-        user["id"],
         body.provider_type,
         body.display_name,
         body.api_base_url,
@@ -639,11 +892,11 @@ async def create_git_provider(body: GitProviderInput, user: CurrentUser, db: DB)
 
 @router.put("/git-providers/{gp_id}")
 async def update_git_provider(gp_id: str, body: GitProviderUpdate, user: CurrentUser, db: DB):
+    if user["role"] != "admin":
+        raise HTTPException(status_code=403, detail="Only admins can manage git providers")
     existing = await db.fetchrow("SELECT * FROM git_provider_configs WHERE id = $1", gp_id)
     if not existing:
         raise HTTPException(status_code=404, detail="Git provider not found")
-    if str(existing["owner_id"]) != str(user["id"]):
-        raise HTTPException(status_code=403, detail="Access denied")
 
     updates = {k: v for k, v in body.model_dump().items() if v is not None}
     if not updates:
@@ -672,13 +925,264 @@ async def update_git_provider(gp_id: str, body: GitProviderUpdate, user: Current
     return _sanitize_git_provider(dict(row))
 
 
+@router.post("/git-providers/{gp_id}/test")
+async def test_git_provider(gp_id: str, user: CurrentUser, db: DB):
+    """Test git provider credentials by calling the provider's API."""
+    import httpx
+
+    row = await db.fetchrow("SELECT * FROM git_provider_configs WHERE id = $1", gp_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Git provider not found")
+
+    token = decrypt(row["token_enc"]) if row.get("token_enc") else None
+    if not token:
+        return {"status": "error", "detail": "No token configured for this provider"}
+
+    provider_type = row["provider_type"]
+    api_base_url = row.get("api_base_url") or ""
+
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            if provider_type == "github":
+                base = api_base_url or "https://api.github.com"
+                resp = await client.get(
+                    f"{base.rstrip('/')}/user",
+                    headers={
+                        "Authorization": f"Bearer {token}",
+                        "Accept": "application/vnd.github.v3+json",
+                    },
+                )
+                if resp.status_code == 200:
+                    user_data = resp.json()
+                    return {
+                        "status": "ok",
+                        "detail": f"Authenticated as {user_data.get('login', 'unknown')}",
+                    }
+                return {
+                    "status": "error",
+                    "detail": f"GitHub API returned {resp.status_code}: {resp.text[:200]}",
+                }
+
+            elif provider_type == "gitlab":
+                base = api_base_url or "https://gitlab.com"
+                resp = await client.get(
+                    f"{base.rstrip('/')}/api/v4/user",
+                    headers={"PRIVATE-TOKEN": token},
+                )
+                if resp.status_code == 200:
+                    user_data = resp.json()
+                    return {
+                        "status": "ok",
+                        "detail": f"Authenticated as {user_data.get('username', 'unknown')}",
+                    }
+                return {
+                    "status": "error",
+                    "detail": f"GitLab API returned {resp.status_code}: {resp.text[:200]}",
+                }
+
+            elif provider_type == "bitbucket":
+                base = api_base_url or "https://api.bitbucket.org"
+                resp = await client.get(
+                    f"{base.rstrip('/')}/2.0/user",
+                    headers={"Authorization": f"Bearer {token}"},
+                )
+                if resp.status_code == 200:
+                    user_data = resp.json()
+                    return {
+                        "status": "ok",
+                        "detail": f"Authenticated as {user_data.get('display_name', 'unknown')}",
+                    }
+                return {
+                    "status": "error",
+                    "detail": f"Bitbucket API returned {resp.status_code}: {resp.text[:200]}",
+                }
+
+            else:
+                return {"status": "error", "detail": f"Test not supported for provider type: {provider_type}"}
+
+    except httpx.ConnectError as e:
+        return {"status": "error", "detail": f"Connection failed: {e}"}
+    except Exception as e:
+        return {"status": "error", "detail": str(e)}
+
+
 @router.delete("/git-providers/{gp_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_git_provider(gp_id: str, user: CurrentUser, db: DB):
+    if user["role"] != "admin":
+        raise HTTPException(status_code=403, detail="Only admins can manage git providers")
     existing = await db.fetchrow(
-        "SELECT owner_id FROM git_provider_configs WHERE id = $1", gp_id
+        "SELECT id FROM git_provider_configs WHERE id = $1", gp_id
     )
     if not existing:
         raise HTTPException(status_code=404, detail="Git provider not found")
-    if str(existing["owner_id"]) != str(user["id"]):
-        raise HTTPException(status_code=403, detail="Access denied")
     await db.execute("DELETE FROM git_provider_configs WHERE id = $1", gp_id)
+
+
+# ── Git Provider: List Repositories ────────────────────────────────
+
+
+@router.get("/git-providers/repos")
+async def list_all_repos(user: CurrentUser, db: DB):
+    """Fetch repositories from all active git providers concurrently."""
+    import httpx
+
+    rows = await db.fetch(
+        "SELECT * FROM git_provider_configs "
+        "WHERE (owner_id = $1 OR owner_id IS NULL) AND is_active = TRUE "
+        "ORDER BY created_at",
+        user["id"],
+    )
+
+    async def _fetch_for_provider(row):
+        provider_type = row["provider_type"]
+        token = decrypt(row["token_enc"]) if row.get("token_enc") else None
+        if not token:
+            return {
+                "provider_id": str(row["id"]),
+                "provider_name": row["display_name"],
+                "provider_type": provider_type,
+                "repos": [],
+                "error": "No token configured",
+            }
+        if provider_type == "custom":
+            return {
+                "provider_id": str(row["id"]),
+                "provider_name": row["display_name"],
+                "provider_type": provider_type,
+                "repos": [],
+                "error": "Repository listing not supported for custom providers",
+            }
+        try:
+            base_url = row.get("api_base_url") or ""
+            if provider_type == "github":
+                repos = await _fetch_github_repos(base_url or "https://api.github.com", token)
+            elif provider_type == "gitlab":
+                repos = await _fetch_gitlab_repos(base_url or "https://gitlab.com", token)
+            elif provider_type == "bitbucket":
+                repos = await _fetch_bitbucket_repos(base_url or "https://api.bitbucket.org", token)
+            else:
+                repos = []
+            return {
+                "provider_id": str(row["id"]),
+                "provider_name": row["display_name"],
+                "provider_type": provider_type,
+                "repos": repos,
+            }
+        except Exception as e:
+            logger.warning("Failed to fetch repos for provider %s: %s", row["id"], e)
+            return {
+                "provider_id": str(row["id"]),
+                "provider_name": row["display_name"],
+                "provider_type": provider_type,
+                "repos": [],
+                "error": str(e),
+            }
+
+    results = await asyncio.gather(*[_fetch_for_provider(r) for r in rows])
+    return list(results)
+
+
+async def _fetch_github_repos(base_url: str, token: str) -> list[dict]:
+    import httpx
+
+    repos = []
+    page = 1
+    async with httpx.AsyncClient(timeout=30) as client:
+        while True:
+            resp = await client.get(
+                f"{base_url.rstrip('/')}/user/repos",
+                params={"per_page": 100, "page": page, "sort": "updated", "direction": "desc"},
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Accept": "application/vnd.github.v3+json",
+                },
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            if not data:
+                break
+            for r in data:
+                repos.append({
+                    "name": r["name"],
+                    "full_name": r["full_name"],
+                    "clone_url": r["clone_url"],
+                    "html_url": r["html_url"],
+                    "default_branch": r.get("default_branch", "main"),
+                    "private": r.get("private", False),
+                    "description": r.get("description"),
+                })
+            if len(data) < 100 or len(repos) >= 200:
+                break
+            page += 1
+    return repos[:200]
+
+
+async def _fetch_gitlab_repos(base_url: str, token: str) -> list[dict]:
+    import httpx
+
+    repos = []
+    page = 1
+    async with httpx.AsyncClient(timeout=30) as client:
+        while True:
+            resp = await client.get(
+                f"{base_url.rstrip('/')}/api/v4/projects",
+                params={"membership": "true", "per_page": 100, "page": page, "order_by": "last_activity_at"},
+                headers={"PRIVATE-TOKEN": token},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            if not data:
+                break
+            for r in data:
+                repos.append({
+                    "name": r["name"],
+                    "full_name": r["path_with_namespace"],
+                    "clone_url": r.get("http_url_to_repo", ""),
+                    "html_url": r.get("web_url", ""),
+                    "default_branch": r.get("default_branch", "main"),
+                    "private": r.get("visibility", "private") != "public",
+                    "description": r.get("description"),
+                })
+            if len(data) < 100 or len(repos) >= 200:
+                break
+            page += 1
+    return repos[:200]
+
+
+async def _fetch_bitbucket_repos(base_url: str, token: str) -> list[dict]:
+    import httpx
+
+    repos = []
+    async with httpx.AsyncClient(timeout=30) as client:
+        user_resp = await client.get(
+            f"{base_url.rstrip('/')}/2.0/user",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        user_resp.raise_for_status()
+        username = user_resp.json().get("username", "")
+
+        url = f"{base_url.rstrip('/')}/2.0/repositories/{username}"
+        params: dict = {"pagelen": 100, "sort": "-updated_on"}
+        while url and len(repos) < 200:
+            resp = await client.get(url, params=params, headers={"Authorization": f"Bearer {token}"})
+            resp.raise_for_status()
+            data = resp.json()
+            for r in data.get("values", []):
+                clone_url = ""
+                for link in r.get("links", {}).get("clone", []):
+                    if link.get("name") == "https":
+                        clone_url = link["href"]
+                        break
+                html_url = r.get("links", {}).get("html", {}).get("href", "")
+                repos.append({
+                    "name": r["name"],
+                    "full_name": r["full_name"],
+                    "clone_url": clone_url,
+                    "html_url": html_url,
+                    "default_branch": r.get("mainbranch", {}).get("name", "main"),
+                    "private": r.get("is_private", True),
+                    "description": r.get("description"),
+                })
+            url = data.get("next")
+            params = {}  # next URL includes params
+    return repos[:200]

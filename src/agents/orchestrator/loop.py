@@ -19,11 +19,13 @@ import redis.asyncio as aioredis
 
 from agents.config.settings import settings
 from agents.infra.notifier import Notifier
-from agents.orchestrator.coordinator import AgentCoordinator
 from agents.orchestrator.events import EventBus, TaskEvent
+from agents.orchestrator.run_context import RunContext
+from agents.orchestrator.scheduler import TaskScheduler
 from agents.orchestrator.locks import LockManager
 from agents.orchestrator.state_machine import transition_todo
-from agents.providers.registry import ProviderRegistry
+from agents.orchestrator.workspace import WorkspaceManager
+from agents.providers.registry import ProviderRegistry, get_registry
 
 logger = logging.getLogger(__name__)
 
@@ -41,8 +43,9 @@ class EventDrivenOrchestrator:
         self.redis = redis
         self.event_bus = event_bus
         self.locks = LockManager(db_pool, worker_id, settings.orchestrator_lock_ttl)
-        self.provider_registry = ProviderRegistry(db_pool)
+        self.provider_registry = get_registry(db_pool)
         self.notifier = Notifier(db_pool)
+        self.workspace_mgr = WorkspaceManager(db_pool, settings.workspace_root)
         self.active_tasks: dict[str, asyncio.Task] = {}
         self.shutdown_event = asyncio.Event()
         self.max_concurrent = settings.orchestrator_max_concurrent
@@ -51,6 +54,7 @@ class EventDrivenOrchestrator:
     async def run_forever(self) -> None:
         """Main entry point. Runs event consumer + health check concurrently."""
         await self.event_bus.ensure_consumer_group()
+        await self._recover_orphaned_tasks()
         logger.info(
             "EventDrivenOrchestrator %s starting (max_concurrent=%d, health_check=%ds)",
             self.worker_id, self.max_concurrent, self.health_check_interval,
@@ -78,15 +82,46 @@ class EventDrivenOrchestrator:
             event_loop.cancel()
             health_loop.cancel()
 
-        # Graceful shutdown: wait for active tasks
+        # Graceful shutdown: drain active tasks before force-cancelling
         if self.active_tasks:
-            logger.info("Shutting down: waiting for %d active tasks", len(self.active_tasks))
-            for task in self.active_tasks.values():
-                task.cancel()
-            await asyncio.gather(*self.active_tasks.values(), return_exceptions=True)
+            logger.info("Draining %d active tasks (30s grace)...", len(self.active_tasks))
+            _, still_running = await asyncio.wait(
+                self.active_tasks.values(), timeout=30,
+            )
+            if still_running:
+                logger.warning("Force-cancelling %d tasks", len(still_running))
+                for task in still_running:
+                    task.cancel()
+                await asyncio.gather(*still_running, return_exceptions=True)
 
         await self.notifier.close()
         logger.info("EventDrivenOrchestrator %s stopped", self.worker_id)
+
+    # ── Startup Recovery ────────────────────────────────────────────
+
+    async def _recover_orphaned_tasks(self) -> None:
+        """On startup, reset sub-tasks left in running/assigned by dead workers.
+
+        Targets sub-tasks whose parent todo is in_progress but has no valid
+        (non-expired) lock — meaning the previous worker died.
+        """
+        try:
+            result = await self.db.execute("""
+                UPDATE sub_tasks SET status = 'pending', progress_pct = 0,
+                       progress_message = 'Reset after worker restart'
+                WHERE status IN ('assigned', 'running')
+                  AND todo_id IN (
+                      SELECT id FROM todo_items
+                      WHERE state IN ('in_progress', 'testing')
+                        AND id NOT IN (
+                            SELECT todo_id FROM orchestrator_locks
+                            WHERE expires_at > NOW()
+                        )
+                  )
+            """)
+            logger.info("Orphan recovery: %s", result)
+        except Exception:
+            logger.warning("Orphan recovery failed", exc_info=True)
 
     # ── Event Consumer Loop ──────────────────────────────────────────
 
@@ -137,27 +172,26 @@ class EventDrivenOrchestrator:
 
         # Verify the task is still actionable (DB is source of truth)
         todo = await self.db.fetchrow("SELECT * FROM todo_items WHERE id = $1", todo_id)
-        if not todo or todo["state"] not in ("intake", "planning", "in_progress"):
+        if not todo or todo["state"] not in ("intake", "planning", "in_progress", "testing"):
             logger.info("Task %s not actionable (state=%s), releasing lock",
                         todo_id[:8], todo["state"] if todo else "NOT_FOUND")
             await self.locks.release(todo_id)
             await self.event_bus.ack(msg_id)
             return
 
-        # Don't dispatch if awaiting user response
-        if todo.get("sub_state") == "awaiting_response":
-            logger.info("Task %s awaiting user response, skipping", todo_id[:8])
+        # Don't dispatch if awaiting user response, merge approval, or workspace edit review
+        if todo.get("sub_state") in ("awaiting_response", "awaiting_merge_approval", "awaiting_release_approval", "awaiting_external_merge", "workspace_edited"):
+            logger.info("Task %s awaiting user input (sub_state=%s), skipping", todo_id[:8], todo.get("sub_state"))
             await self.locks.release(todo_id)
             await self.event_bus.ack(msg_id)
             return
 
-        # Dispatch
+        # Dispatch — ack is deferred to _run_todo finally block
         task = asyncio.create_task(
-            self._run_todo(dict(todo)),
+            self._run_todo(dict(todo), msg_id=msg_id),
             name=f"todo-{todo_id[:8]}",
         )
         self.active_tasks[todo_id] = task
-        await self.event_bus.ack(msg_id)
         logger.info("Dispatched task %s (state=%s, sub_state=%s) from event %s",
                      todo_id[:8], todo["state"], todo.get("sub_state"), event.event_type)
 
@@ -189,6 +223,14 @@ class EventDrivenOrchestrator:
 
                 # 7. Fallback poll: catch anything events missed
                 await self._fallback_poll()
+
+                # 8. LRU-evict old task workspaces when disk usage exceeds 10GB
+                try:
+                    evicted = await self.workspace_mgr.evict_old_workspaces()
+                    if evicted:
+                        logger.info("Evicted %d old task workspaces", evicted)
+                except Exception:
+                    logger.debug("Workspace eviction failed", exc_info=True)
 
             except asyncio.CancelledError:
                 raise
@@ -223,6 +265,7 @@ class EventDrivenOrchestrator:
                 result = await transition_todo(
                     self.db, todo_id, "intake",
                     event_bus=self.event_bus,
+                    redis=self.redis,
                 )
                 if result:
                     logger.info("Scheduled task %s activated (was due)", todo_id[:8])
@@ -241,9 +284,9 @@ class EventDrivenOrchestrator:
                 SELECT t.* FROM todo_items t
                 LEFT JOIN orchestrator_locks l ON t.id = l.todo_id
                     AND l.expires_at > NOW()
-                WHERE t.state IN ('intake', 'planning', 'in_progress')
+                WHERE t.state IN ('intake', 'planning', 'in_progress', 'testing')
                   AND l.todo_id IS NULL
-                  AND (t.sub_state IS DISTINCT FROM 'awaiting_response')
+                  AND (t.sub_state IS NULL OR t.sub_state NOT IN ('awaiting_response', 'awaiting_merge_approval', 'awaiting_release_approval', 'awaiting_external_merge', 'workspace_edited'))
                 ORDER BY
                     CASE t.priority
                         WHEN 'critical' THEN 0
@@ -276,20 +319,27 @@ class EventDrivenOrchestrator:
 
     # ── Task Execution ───────────────────────────────────────────────
 
-    async def _run_todo(self, todo: dict) -> None:
+    async def _run_todo(self, todo: dict, *, msg_id: str | None = None) -> None:
         """Process a single TODO through its lifecycle."""
         todo_id = str(todo["id"])
         logger.info("_run_todo START: %s (state=%s, sub_state=%s, title=%s)",
                      todo_id[:8], todo.get("state"), todo.get("sub_state"), todo.get("title"))
         try:
-            coordinator = AgentCoordinator(
+            from agents.providers.mcp_executor import McpToolExecutor
+            from agents.providers.tools_registry import ToolsRegistry
+
+            ctx = RunContext(
                 todo_id=todo_id,
                 db=self.db,
                 redis=self.redis,
+                workspace_mgr=self.workspace_mgr,
                 provider_registry=self.provider_registry,
+                mcp_executor=McpToolExecutor(self.db),
+                tools_registry=ToolsRegistry(self.db),
                 notifier=self.notifier,
             )
-            await coordinator.run()
+            scheduler = TaskScheduler(todo_id=todo_id, ctx=ctx)
+            await scheduler.run()
             # Log final state after run
             final = await self.db.fetchrow(
                 "SELECT state, sub_state FROM todo_items WHERE id = $1", todo_id
@@ -299,9 +349,13 @@ class EventDrivenOrchestrator:
                             todo_id[:8], final["state"], final.get("sub_state"))
         except Exception as e:
             logger.exception("Task %s failed: %s", todo_id[:8], e)
+            error_msg = f"{type(e).__name__}: {e}"
+            if len(error_msg) > 1500:
+                error_msg = error_msg[:1500] + "..."
             try:
                 await transition_todo(
-                    self.db, todo_id, "failed", error_message=str(e),
+                    self.db, todo_id, "failed", error_message=error_msg,
+                    redis=self.redis,
                 )
                 todo_data = await self.db.fetchrow(
                     "SELECT title, creator_id FROM todo_items WHERE id = $1", todo_id,
@@ -313,12 +367,17 @@ class EventDrivenOrchestrator:
                         {
                             "todo_id": todo_id,
                             "title": todo_data["title"],
-                            "detail": str(e),
+                            "detail": error_msg,
                         },
                     )
             except Exception:
                 logger.exception("Failed to transition task %s to failed", todo_id[:8])
         finally:
+            if msg_id:
+                try:
+                    await self.event_bus.ack(msg_id)
+                except Exception:
+                    logger.warning("Failed to ack event %s for task %s", msg_id, todo_id[:8])
             await self.locks.release(todo_id)
             self.active_tasks.pop(todo_id, None)
 
@@ -337,7 +396,7 @@ class EventDrivenOrchestrator:
             """
             SELECT t.id, t.title, t.creator_id, t.sub_state, t.updated_at
             FROM todo_items t
-            WHERE t.state = 'in_progress'
+            WHERE t.state IN ('in_progress', 'testing')
               AND t.updated_at < NOW() - INTERVAL '30 minutes'
               AND (t.stuck_notified_at IS NULL
                    OR t.stuck_notified_at < NOW() - INTERVAL '2 hours')

@@ -57,12 +57,12 @@ async def create_channel(body: NotificationChannelInput, user: CurrentUser, db: 
     row = await db.fetchrow(
         """
         INSERT INTO notification_channels (user_id, channel_type, display_name, config_json, notify_on)
-        VALUES ($1, $2, $3, $4::jsonb, $5) RETURNING *
+        VALUES ($1, $2, $3, $4, $5) RETURNING *
         """,
         user["id"],
         body.channel_type,
         body.display_name,
-        json.dumps(body.config_json),
+        body.config_json,
         body.notify_on,
     )
     return dict(row)
@@ -87,8 +87,8 @@ async def update_channel(channel_id: str, body: NotificationChannelUpdate, user:
         idx += 1
 
     if body.config_json is not None:
-        set_parts.append(f"config_json = ${idx}::jsonb")
-        values.append(json.dumps(body.config_json))
+        set_parts.append(f"config_json = ${idx}")
+        values.append(body.config_json)
         idx += 1
 
     if body.notify_on is not None:
