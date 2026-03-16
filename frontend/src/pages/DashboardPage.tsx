@@ -35,7 +35,7 @@ export default function DashboardPage() {
   ]
 
   return (
-    <div className="p-6 max-w-5xl mx-auto">
+    <div className="p-4 md:p-6 max-w-5xl mx-auto">
       <div className="mb-8">
         <h1 className="text-lg font-semibold text-white">Dashboard</h1>
         <p className="text-xs text-gray-600 mt-0.5">
@@ -45,7 +45,7 @@ export default function DashboardPage() {
 
       {user?.role === 'admin' && (
         <>
-          <div className="grid grid-cols-4 gap-3 mb-8">
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-8">
             {statCards.map((s) => (
               <div key={s.label} className={`p-4 bg-gray-900 rounded-lg border-l-2 ${s.accent} border border-gray-800/50`}>
                 <div className="text-2xl font-semibold text-white tabular-nums">{s.value ?? '-'}</div>

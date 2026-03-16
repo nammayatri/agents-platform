@@ -5,8 +5,33 @@ import type { WSEvent, ChatMessage } from '../types'
 export function useTaskWebSocket(todoId: string | null) {
   const ws = useRef<WebSocket | null>(null)
   const [reconnectCount, setReconnectCount] = useState(0)
-  const { updateTodoState, appendChatMessage, updateSubTaskProgress, appendActivity, fetchTodo } = useTodoStore()
+  const { updateTodoState, appendChatMessage, updateSubTaskProgress, batchAppendActivity, setLlmResponse, fetchTodo } = useTodoStore()
   const fetchDebounce = useRef<ReturnType<typeof setTimeout> | null>(null)
+
+  // Batch activity events: collect them and flush via rAF to avoid per-event re-renders
+  const activityBuffer = useRef<Record<string, string[]>>({})
+  const activityFlushScheduled = useRef(false)
+
+  const flushActivity = useCallback(() => {
+    activityFlushScheduled.current = false
+    const buf = activityBuffer.current
+    activityBuffer.current = {}
+    const entries = Object.entries(buf)
+    if (entries.length > 0) {
+      batchAppendActivity(entries)
+    }
+  }, [batchAppendActivity])
+
+  const queueActivity = useCallback((subTaskId: string, activity: string) => {
+    if (!activityBuffer.current[subTaskId]) {
+      activityBuffer.current[subTaskId] = []
+    }
+    activityBuffer.current[subTaskId].push(activity)
+    if (!activityFlushScheduled.current) {
+      activityFlushScheduled.current = true
+      requestAnimationFrame(flushActivity)
+    }
+  }, [flushActivity])
 
   // Debounced fetchTodo to avoid hammering API on rapid subtask transitions
   const debouncedFetchTodo = useCallback((id: string) => {
@@ -31,7 +56,7 @@ export function useTaskWebSocket(todoId: string | null) {
         switch (data.type) {
           case 'state_change':
             if (data.state) {
-              updateTodoState(todoId, data.state)
+              updateTodoState(todoId, data.state, data.error_message)
               // Refetch full todo to get updated sub-tasks
               fetchTodo(todoId)
             }
@@ -65,8 +90,19 @@ export function useTaskWebSocket(todoId: string | null) {
 
           case 'activity':
             if (data.sub_task_id && data.activity) {
-              appendActivity(data.sub_task_id, data.activity)
+              queueActivity(data.sub_task_id, data.activity)
             }
+            break
+
+          case 'llm_response':
+            if (data.sub_task_id && data.content) {
+              setLlmResponse(data.sub_task_id, data.content, data.iteration ?? 0)
+            }
+            break
+
+          case 'task_cancelled':
+            // Task was cancelled — refetch to get updated state and subtask statuses
+            fetchTodo(todoId)
             break
 
           case 'ping':
@@ -91,5 +127,5 @@ export function useTaskWebSocket(todoId: string | null) {
       ws.current = null
       if (fetchDebounce.current) clearTimeout(fetchDebounce.current)
     }
-  }, [todoId, reconnectCount, updateTodoState, appendChatMessage, updateSubTaskProgress, appendActivity, fetchTodo, debouncedFetchTodo])
+  }, [todoId, reconnectCount, updateTodoState, appendChatMessage, updateSubTaskProgress, setLlmResponse, fetchTodo, debouncedFetchTodo, queueActivity])
 }

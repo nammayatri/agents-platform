@@ -22,9 +22,9 @@ VALID_TRANSITIONS: dict[str, set[str]] = {
     "plan_ready": {"in_progress", "planning", "failed", "cancelled"},
     "in_progress": {"review", "failed", "planning", "cancelled"},
     "review": {"completed", "in_progress", "failed", "cancelled"},
-    "failed": {"intake"},
+    "failed": {"intake", "in_progress"},  # in_progress for subtask-level retry (e.g. PR creation)
     "cancelled": {"intake"},
-    "completed": {"intake"},  # user-initiated retry
+    "completed": {"intake", "in_progress"},  # in_progress for subtask-level retry (e.g. PR creation)
 }
 
 # Valid sub-task transitions
@@ -110,9 +110,12 @@ async def transition_todo(
     # Publish to WebSocket channel for real-time UI updates
     if updated and redis:
         try:
+            event: dict = {"type": "state_change", "state": target_state}
+            if error_message:
+                event["error_message"] = error_message
             await redis.publish(
                 f"task:{todo_id}:events",
-                json.dumps({"type": "state_change", "state": target_state}),
+                json.dumps(event),
             )
         except Exception:
             logger.debug("Failed to publish WS state_change for %s", todo_id[:8])
@@ -174,13 +177,16 @@ async def transition_subtask(
         todo_id = str(updated.get("todo_id", ""))
         if todo_id:
             try:
+                event: dict = {
+                    "type": "subtask_update",
+                    "sub_task_id": subtask_id,
+                    "status": target_status,
+                }
+                if error_message:
+                    event["error_message"] = error_message
                 await redis.publish(
                     f"task:{todo_id}:events",
-                    json.dumps({
-                        "type": "subtask_update",
-                        "sub_task_id": subtask_id,
-                        "status": target_status,
-                    }),
+                    json.dumps(event),
                 )
             except Exception:
                 logger.debug("Failed to publish WS subtask_update for %s", subtask_id[:8])

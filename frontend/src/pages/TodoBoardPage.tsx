@@ -1,7 +1,8 @@
 import { useEffect, useState, useRef } from 'react'
 import { useParams, Link, useNavigate, useSearchParams } from 'react-router-dom'
 import { useTodoStore } from '../stores/todoStore'
-import type { TodoItem, TodoState, ProviderConfig } from '../types'
+import { providers as providersApi } from '../services/api'
+import type { TodoItem, TodoState, ProviderConfig, ModelInfo } from '../types'
 
 const COLUMNS: { state: TodoState; label: string; accent: string }[] = [
   { state: 'scheduled', label: 'Scheduled', accent: 'border-l-indigo-500' },
@@ -48,6 +49,9 @@ export default function TodoBoardPage() {
   const [newPriority, setNewPriority] = useState('medium')
   const [newType, setNewType] = useState('code')
   const [newProviderId, setNewProviderId] = useState('')
+  const [newModel, setNewModel] = useState('')
+  const [availableModels, setAvailableModels] = useState<ModelInfo[]>([])
+  const [loadingModels, setLoadingModels] = useState(false)
   const [scheduleEnabled, setScheduleEnabled] = useState(false)
   const [scheduledAt, setScheduledAt] = useState('')
   const [showTrouble, setShowTrouble] = useState(true)
@@ -75,6 +79,26 @@ export default function TodoBoardPage() {
   }, [projectId, fetchTodos, fetchProviders])
 
   const activeProviders = providers.filter((p: ProviderConfig) => p.is_active)
+
+  useEffect(() => {
+    if (!newProviderId) {
+      setAvailableModels([])
+      setNewModel('')
+      return
+    }
+    setLoadingModels(true)
+    providersApi.listModels(newProviderId)
+      .then(res => {
+        setAvailableModels(res.models)
+        const defaultModel = res.models.find(m => m.is_default)
+        setNewModel(defaultModel?.id || '')
+      })
+      .catch(() => {
+        setAvailableModels([])
+        setNewModel('')
+      })
+      .finally(() => setLoadingModels(false))
+  }, [newProviderId])
 
   useEffect(() => {
     if (showCreate && titleRef.current) titleRef.current.focus()
@@ -124,6 +148,7 @@ export default function TodoBoardPage() {
         priority: newPriority,
         task_type: newType,
         ai_provider_id: newProviderId || undefined,
+        ai_model: newModel || undefined,
         scheduled_at: scheduleEnabled && scheduledAt ? new Date(scheduledAt).toISOString() : undefined,
       })
       setNewTitle('')
@@ -131,6 +156,8 @@ export default function TodoBoardPage() {
       setNewPriority('medium')
       setNewType('code')
       setNewProviderId('')
+      setNewModel('')
+      setAvailableModels([])
       setScheduleEnabled(false)
       setScheduledAt('')
       setShowCreate(false)
@@ -145,9 +172,9 @@ export default function TodoBoardPage() {
   }
 
   return (
-    <div className="p-6 h-full flex flex-col">
+    <div className="p-4 md:p-6 h-full flex flex-col">
       {/* Header */}
-      <div className="flex items-center justify-between mb-4">
+      <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between mb-4">
         <div>
           <h1 className="text-lg font-semibold text-white">Tasks</h1>
           <p className="text-xs text-gray-600 mt-0.5">
@@ -183,7 +210,7 @@ export default function TodoBoardPage() {
       </div>
 
       {/* Filters */}
-      <div className="flex items-center justify-between mb-4">
+      <div className="flex flex-col gap-2 md:flex-row md:items-center md:justify-between mb-4">
         <div className="flex items-center gap-1">
           {(['active', 'all', 'completed'] as const).map((v) => (
             <button
@@ -218,7 +245,7 @@ export default function TodoBoardPage() {
 
       {/* Create Task Panel */}
       {showCreate && (
-        <div className="mb-5 p-5 bg-gray-900 rounded-xl border border-gray-800" onKeyDown={handleKeyDown}>
+        <div className="mb-5 p-4 md:p-5 bg-gray-900 rounded-xl border border-gray-800" onKeyDown={handleKeyDown}>
           <div className="flex items-center justify-between mb-4">
             <h2 className="text-sm font-medium text-gray-300">New Task</h2>
             <span className="text-[11px] text-gray-600">
@@ -269,7 +296,7 @@ export default function TodoBoardPage() {
           </div>
 
           <div className="mb-4">
-            <label className="block text-[11px] text-gray-600 mb-1">AI Model</label>
+            <label className="block text-[11px] text-gray-600 mb-1">AI Provider</label>
             <select
               value={newProviderId}
               onChange={(e) => setNewProviderId(e.target.value)}
@@ -280,6 +307,27 @@ export default function TodoBoardPage() {
                 <option key={p.id} value={p.id}>{p.display_name} -- {p.default_model}</option>
               ))}
             </select>
+            {newProviderId && (
+              <div className="mt-2">
+                <label className="block text-[11px] text-gray-600 mb-1">Model</label>
+                <select
+                  value={newModel}
+                  onChange={(e) => setNewModel(e.target.value)}
+                  disabled={loadingModels}
+                  className="w-full px-3 py-1.5 bg-gray-950 border border-gray-800 rounded-lg text-sm text-white focus:outline-none focus:border-indigo-500 transition-colors disabled:opacity-40"
+                >
+                  {loadingModels ? (
+                    <option>Loading models...</option>
+                  ) : (
+                    availableModels.map(m => (
+                      <option key={m.id} value={m.id}>
+                        {m.name}{m.is_default ? ' (default)' : ''}
+                      </option>
+                    ))
+                  )}
+                </select>
+              </div>
+            )}
           </div>
 
           <div className="mb-4">
@@ -358,12 +406,12 @@ export default function TodoBoardPage() {
       )}
 
       {/* Kanban Columns */}
-      <div className="flex-1 flex gap-3 overflow-x-auto pb-4">
+      <div className="flex-1 flex flex-col gap-4 overflow-y-auto md:flex-row md:gap-3 md:overflow-x-auto pb-4">
         {visibleColumns.map((col) => {
           const items = mainTodos.filter((t) => t.state === col.state)
           const isSlim = col.state === 'scheduled'
           return (
-            <div key={col.state} className={`flex flex-col ${isSlim ? 'w-[160px] shrink-0' : 'flex-1 min-w-[220px]'}`}>
+            <div key={col.state} className={`flex flex-col ${isSlim ? 'w-full md:w-[160px] md:shrink-0' : 'w-full md:flex-1 md:min-w-[220px]'}`}>
               <div className={`mb-3 pb-2 border-l-2 ${col.accent} pl-3 flex items-center justify-between`}>
                 <span className="text-xs font-medium text-gray-400 uppercase tracking-wider">{col.label}</span>
                 <span className="text-[11px] text-gray-600 tabular-nums">{items.length}</span>

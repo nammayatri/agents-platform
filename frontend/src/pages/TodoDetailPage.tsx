@@ -3,7 +3,7 @@ import { useParams } from 'react-router-dom'
 import { useTodoStore } from '../stores/todoStore'
 import { useTaskWebSocket } from '../hooks/useTaskWebSocket'
 import DiffViewer from '../components/DiffViewer'
-import type { SubTask, ChatMessage, Deliverable, PlanSubTask, IterationLogEntry, ProgressLogEntry } from '../types'
+import type { SubTask, ChatMessage, Deliverable, AgentRun, PlanSubTask, IterationLogEntry, ProgressLogEntry } from '../types'
 
 const STATE_COLORS: Record<string, string> = {
   intake: 'bg-violet-600',
@@ -22,10 +22,12 @@ const SUBTASK_COLORS: Record<string, string> = {
   running: 'bg-amber-600',
   completed: 'bg-emerald-600',
   failed: 'bg-red-600',
+  cancelled: 'bg-gray-600',
 }
 
 const ROLE_LABELS: Record<string, string> = {
   coder: 'Code',
+  debugger: 'Debug',
   tester: 'Test',
   reviewer: 'Review',
   pr_creator: 'PR',
@@ -40,12 +42,25 @@ const VERDICT_COLORS: Record<string, string> = {
 
 export default function TodoDetailPage() {
   const { todoId } = useParams<{ todoId: string }>()
-  const {
-    todos, chatMessages, deliverablesByTodo, activityLogs,
-    fetchTodo, fetchChat, fetchDeliverables, sendChat,
-    cancelTodo, retryTodo, triggerSubTask, acceptDeliverables, requestChanges,
-    approvePlan, rejectPlan, appendActivity,
-  } = useTodoStore()
+  const todos = useTodoStore((s) => s.todos)
+  const chatMessages = useTodoStore((s) => s.chatMessages)
+  const deliverablesByTodo = useTodoStore((s) => s.deliverablesByTodo)
+  const activityLogs = useTodoStore((s) => s.activityLogs)
+  const fetchTodo = useTodoStore((s) => s.fetchTodo)
+  const fetchChat = useTodoStore((s) => s.fetchChat)
+  const fetchDeliverables = useTodoStore((s) => s.fetchDeliverables)
+  const sendChat = useTodoStore((s) => s.sendChat)
+  const cancelTodo = useTodoStore((s) => s.cancelTodo)
+  const retryTodo = useTodoStore((s) => s.retryTodo)
+  const triggerSubTask = useTodoStore((s) => s.triggerSubTask)
+  const acceptDeliverables = useTodoStore((s) => s.acceptDeliverables)
+  const requestChanges = useTodoStore((s) => s.requestChanges)
+  const approvePlan = useTodoStore((s) => s.approvePlan)
+  const rejectPlan = useTodoStore((s) => s.rejectPlan)
+  const appendActivity = useTodoStore((s) => s.appendActivity)
+  const llmResponses = useTodoStore((s) => s.llmResponses)
+  const agentRunsByTodo = useTodoStore((s) => s.agentRunsByTodo)
+  const fetchAgentRuns = useTodoStore((s) => s.fetchAgentRuns)
 
   useTaskWebSocket(todoId || null)
 
@@ -55,6 +70,8 @@ export default function TodoDetailPage() {
   const [showRejectForm, setShowRejectForm] = useState(false)
   const [expandedSubTasks, setExpandedSubTasks] = useState<Set<string>>(new Set())
   const [expandedActivity, setExpandedActivity] = useState<Set<string>>(new Set())
+  const [expandedLlmResponse, setExpandedLlmResponse] = useState<Set<string>>(new Set())
+  const [showMobileChat, setShowMobileChat] = useState(false)
   const activityEndRefs = useRef<Record<string, HTMLDivElement | null>>({})
   const chatEndRef = useRef<HTMLDivElement>(null)
 
@@ -71,12 +88,14 @@ export default function TodoDetailPage() {
       fetchTodo(todoId)
       fetchChat(todoId)
       fetchDeliverables(todoId)
+      fetchAgentRuns(todoId)
     }
-  }, [todoId, fetchTodo, fetchChat, fetchDeliverables])
+  }, [todoId, fetchTodo, fetchChat, fetchDeliverables, fetchAgentRuns])
 
   const todo = todoId ? todos[todoId] : undefined
   const messages = todoId ? chatMessages[todoId] || [] : []
   const taskDeliverables = todoId ? deliverablesByTodo[todoId] || []  : []
+  const agentRuns = todoId ? agentRunsByTodo[todoId] || [] : []
 
   // Previous-run detection: when a todo is retried, items from before the last
   // state change are considered "previous run" and greyed out.
@@ -106,12 +125,22 @@ export default function TodoDetailPage() {
     }
   }, [todo?.sub_tasks]) // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Auto-scroll activity logs when new entries arrive
+  // Auto-scroll activity logs when new entries arrive (debounced)
+  const activityScrollTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const prevActivityCounts = useRef<Record<string, number>>({})
   useEffect(() => {
-    for (const [stId, entries] of Object.entries(activityLogs)) {
-      if (entries.length > 0 && expandedActivity.has(stId)) {
-        activityEndRefs.current[stId]?.scrollIntoView({ behavior: 'smooth', block: 'end' })
+    if (activityScrollTimer.current) clearTimeout(activityScrollTimer.current)
+    activityScrollTimer.current = setTimeout(() => {
+      for (const [stId, entries] of Object.entries(activityLogs)) {
+        const prevLen = prevActivityCounts.current[stId] || 0
+        if (entries.length > prevLen && expandedActivity.has(stId)) {
+          activityEndRefs.current[stId]?.scrollIntoView({ behavior: 'smooth', block: 'end' })
+        }
+        prevActivityCounts.current[stId] = entries.length
       }
+    }, 300)
+    return () => {
+      if (activityScrollTimer.current) clearTimeout(activityScrollTimer.current)
     }
   }, [activityLogs, expandedActivity])
 
@@ -126,9 +155,9 @@ export default function TodoDetailPage() {
   }
 
   return (
-    <div className="flex h-full">
+    <div className="flex flex-col md:flex-row h-full">
       {/* Main content */}
-      <div className="flex-1 p-6 overflow-y-auto">
+      <div className="flex-1 p-4 md:p-6 overflow-y-auto">
         {/* Header */}
         <div className="mb-6">
           <div className="flex items-center gap-2.5 mb-2">
@@ -164,7 +193,33 @@ export default function TodoDetailPage() {
               <span className="w-1.5 h-1.5 rounded-full bg-red-400" />
               <span className="text-sm font-medium text-red-300/80">Task Failed</span>
             </div>
-            <p className="text-sm text-red-300/60 font-mono break-words">{todo.error_message}</p>
+            <pre className="text-sm text-red-300/60 font-mono break-words whitespace-pre-wrap max-h-40 overflow-y-auto">{todo.error_message}</pre>
+            {/* Show failed agent runs with detailed errors */}
+            {(() => {
+              const failedRuns = agentRuns.filter((r: AgentRun) => r.status === 'failed' && r.error_detail)
+              if (failedRuns.length === 0) return null
+              return (
+                <details className="mt-3 border-t border-red-500/10 pt-2">
+                  <summary className="text-[11px] text-red-400/70 cursor-pointer hover:text-red-400">
+                    Agent run details ({failedRuns.length} failed)
+                  </summary>
+                  <div className="mt-2 space-y-2">
+                    {failedRuns.map((run: AgentRun) => (
+                      <div key={run.id} className="bg-red-950/30 rounded px-3 py-2">
+                        <div className="flex items-center gap-2 text-[11px] mb-1">
+                          <span className="text-red-400 font-medium">{run.agent_role}</span>
+                          {run.error_type && run.error_type !== 'transient' && (
+                            <span className="px-1.5 py-0.5 bg-red-500/10 rounded text-[10px] text-red-300">{run.error_type}</span>
+                          )}
+                          <span className="ml-auto text-gray-600 font-mono">{run.duration_ms ? `${(run.duration_ms / 1000).toFixed(1)}s` : ''}</span>
+                        </div>
+                        <pre className="text-[11px] text-red-300/50 font-mono whitespace-pre-wrap max-h-48 overflow-y-auto leading-relaxed">{run.error_detail}</pre>
+                      </div>
+                    ))}
+                  </div>
+                </details>
+              )
+            })()}
           </div>
         )}
 
@@ -269,7 +324,7 @@ export default function TodoDetailPage() {
         )}
 
         {/* Actions */}
-        <div className="flex gap-2 mb-6">
+        <div className="flex gap-2 mb-6 flex-wrap">
           {todo.state === 'review' && (
             <>
               <button
@@ -278,7 +333,7 @@ export default function TodoDetailPage() {
               >
                 Accept & Complete
               </button>
-              <div className="flex gap-1">
+              <div className="flex flex-col gap-2 md:flex-row md:gap-1">
                 <input
                   className="px-3 py-1.5 bg-gray-900 border border-gray-800 rounded-lg text-sm text-white placeholder-gray-600 focus:outline-none focus:border-indigo-500 transition-colors"
                   placeholder="Feedback..."
@@ -520,6 +575,39 @@ export default function TodoDetailPage() {
                           })()}
                         </div>
                       )}
+                      {/* LLM Response */}
+                      {(() => {
+                        const lr = llmResponses[st.id]
+                        if (!lr) return null
+                        const isOpen = expandedLlmResponse.has(st.id)
+                        const preview = lr.content.length > 120 ? lr.content.slice(0, 120) + '...' : lr.content
+                        return (
+                          <div className="mt-2">
+                            <button
+                              type="button"
+                              className="flex items-center gap-1.5 text-[11px] text-indigo-400/70 hover:text-indigo-400 transition-colors"
+                              onClick={(e) => {
+                                e.stopPropagation()
+                                setExpandedLlmResponse((prev) => {
+                                  const next = new Set(prev)
+                                  if (next.has(st.id)) next.delete(st.id); else next.add(st.id)
+                                  return next
+                                })
+                              }}
+                            >
+                              <span className="w-3">{isOpen ? '\u25BC' : '\u25B6'}</span>
+                              <span className="shrink-0">LLM Response</span>
+                              <span className="text-gray-700">(iter {lr.iteration})</span>
+                              {!isOpen && <span className="text-gray-600 truncate max-w-xs font-mono">{preview}</span>}
+                            </button>
+                            {isOpen && (
+                              <div className="mt-1.5 max-h-60 overflow-y-auto bg-gray-950 border border-indigo-500/10 rounded px-3 py-2">
+                                <pre className="text-[11px] text-gray-400 whitespace-pre-wrap font-mono leading-relaxed">{lr.content}</pre>
+                              </div>
+                            )}
+                          </div>
+                        )
+                      })()}
                       {st.error_message && (
                         <div className="text-[11px] text-red-400/60 mt-1 font-mono">{st.error_message}</div>
                       )}
@@ -598,6 +686,16 @@ export default function TodoDetailPage() {
                                     </div>
                                   ))}
                                 </div>
+                              )}
+                              {entry.llm_response && (
+                                <details className="mt-1 pl-8">
+                                  <summary className="text-indigo-400/60 cursor-pointer hover:text-indigo-400/80 text-[10px]">
+                                    LLM Response ({entry.llm_response.length} chars)
+                                  </summary>
+                                  <pre className="mt-1 text-gray-500 font-mono whitespace-pre-wrap max-h-40 overflow-y-auto leading-relaxed">
+                                    {entry.llm_response}
+                                  </pre>
+                                </details>
                               )}
                               {entry.error_output && (
                                 <pre className="mt-1 pl-8 text-red-400/50 font-mono whitespace-pre-wrap max-h-20 overflow-y-auto">
@@ -770,10 +868,24 @@ export default function TodoDetailPage() {
           <span>cost: ${todo.cost_usd.toFixed(4)}</span>
           <span>retries: {todo.retry_count}</span>
         </div>
+
+        {/* Mobile chat toggle */}
+        <button
+          onClick={() => setShowMobileChat(!showMobileChat)}
+          className="md:hidden mt-4 w-full flex items-center justify-center gap-2 px-4 py-2.5 bg-gray-900 border border-gray-800 rounded-lg text-sm text-gray-400 hover:text-white transition-colors"
+        >
+          <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
+            <path strokeLinecap="round" strokeLinejoin="round" d="M7.5 8.25h9m-9 3H12m-9.75 1.51c0 1.6 1.123 2.994 2.707 3.227 1.129.166 2.27.293 3.423.379.35.026.67.21.865.501L12 21l2.755-4.133a1.14 1.14 0 01.865-.501 48.172 48.172 0 003.423-.379c1.584-.233 2.707-1.626 2.707-3.228V6.741c0-1.602-1.123-2.995-2.707-3.228A48.394 48.394 0 0012 3c-2.392 0-4.744.175-7.043.513C3.373 3.746 2.25 5.14 2.25 6.741v6.018z" />
+          </svg>
+          {showMobileChat ? 'Hide Chat' : 'Show Chat'}
+          {messages.length > 0 && (
+            <span className="px-1.5 py-0.5 bg-gray-800 rounded text-[10px] text-gray-500">{messages.length}</span>
+          )}
+        </button>
       </div>
 
       {/* Chat sidebar */}
-      <div className="w-96 border-l border-gray-900 flex flex-col bg-gray-950">
+      <div className={`${showMobileChat ? 'flex' : 'hidden'} md:flex w-full md:w-96 border-t md:border-t-0 md:border-l border-gray-900 flex-col bg-gray-950 ${showMobileChat ? 'h-[50vh] md:h-auto' : ''}`}>
         <div className="px-4 py-3 border-b border-gray-900">
           <h2 className="text-sm font-medium text-gray-300">Chat</h2>
         </div>

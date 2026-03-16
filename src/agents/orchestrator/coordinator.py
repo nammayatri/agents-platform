@@ -85,16 +85,19 @@ CRITICAL — ONE TASK, MANY SUB-TASKS:
 
 AGENT ROLES:
 - **coder** — Implements code, fixes bugs, adds features. Use for all code changes.
+- **debugger** — Investigates and fixes bugs using logs, metrics, database queries, and VM access. \
+Use for bug reports, error investigations, production incidents, and performance issues.
 - **tester** — Writes and runs tests. Use after coder sub-tasks to validate changes.
 - **reviewer** — Reviews code quality, checks for bugs/security. Use for important changes.
-- **pr_creator** — Creates pull request descriptions.
 - **report_writer** — Generates documentation and reports.
-- **merge_agent** — Merges approved PRs, checks CI.
+
+NOTE: Do NOT create pr_creator or merge_agent sub-tasks in your plan. \
+PR creation and merging are handled automatically by the system after coder work completes.
 
 REVIEW LOOP (review_loop field):
 - Set review_loop=true for critical or complex code changes that need the full \
-coder→reviewer→merge cycle. The system will automatically chain a reviewer and merge \
-agent after the coder completes.
+coder→reviewer→PR→merge cycle. The system will automatically chain a reviewer, PR creator, \
+and merge agent after the coder completes.
 - Use review_loop=true for: core business logic, security-sensitive code, API changes, \
 database migrations, infrastructure changes.
 - Use review_loop=false for: simple fixes, config changes, documentation, test-only changes, \
@@ -132,6 +135,25 @@ Output JSON: {"approved": true/false, "issues": [...], "summary": "..."}
 """
 
 
+def _classify_error(exc: Exception) -> str:
+    """Classify an exception into a category for error_type field."""
+    name = type(exc).__name__.lower()
+    msg = str(exc).lower()
+    if any(k in name for k in ("timeout", "timedout")):
+        return "timeout"
+    if any(k in name for k in ("ratelimit", "rate_limit", "429")):
+        return "rate_limit"
+    if "401" in msg or "unauthorized" in msg or "authentication" in msg:
+        return "auth_error"
+    if "context" in msg and ("long" in msg or "length" in msg or "tokens" in msg):
+        return "context_length"
+    if any(k in name for k in ("connection", "network", "dns")):
+        return "network"
+    if "json" in name or "parse" in name or "decode" in name:
+        return "parse_error"
+    return "transient"
+
+
 class AgentCoordinator:
     def __init__(
         self,
@@ -149,6 +171,9 @@ class AgentCoordinator:
         self.workspace_mgr = WorkspaceManager(db, settings.workspace_root)
         self.tools_registry = ToolsRegistry(db)
         self.mcp_executor = McpToolExecutor(db)
+        # Activity throttle state (per-subtask timestamps)
+        self._last_activity_publish: dict[str, float] = {}
+        self._last_activity_persist: dict[str, float] = {}
 
     async def _transition_todo(self, target_state: str, **kwargs) -> dict | None:
         """Wrapper that auto-passes db, todo_id, and redis for WS publishing."""
@@ -181,6 +206,12 @@ class AgentCoordinator:
         todo = await self._load_todo()
         logger.info("[%s] coordinator.run(): state=%s sub_state=%s title=%s",
                     self.todo_id, todo["state"], todo.get("sub_state"), todo.get("title"))
+
+        # Resolve linked chat session for message routing
+        self._chat_session_id = str(todo["chat_session_id"]) if todo.get("chat_session_id") else None
+        self._chat_project_id = str(todo["project_id"]) if self._chat_session_id else None
+        self._chat_user_id = str(todo["creator_id"]) if self._chat_session_id else None
+
         provider = await self.provider_registry.resolve_for_todo(self.todo_id)
         logger.info("[%s] Provider resolved: %s/%s",
                     self.todo_id, provider.provider_type, provider.default_model)
@@ -257,9 +288,9 @@ class AgentCoordinator:
                 "auto_answers": result.get("auto_answerable", []),
             }
             await self.db.execute(
-                "UPDATE todo_items SET intake_data = $2::jsonb WHERE id = $1",
+                "UPDATE todo_items SET intake_data = $2 WHERE id = $1",
                 self.todo_id,
-                json.dumps(intake_data),
+                intake_data,
             )
             await self._post_system_message(
                 f"**Intake complete.** Moving to planning.\n\n"
@@ -306,7 +337,7 @@ class AgentCoordinator:
             "WHERE owner_id = $1 AND is_active = TRUE",
             todo["creator_id"],
         )
-        available_roles = "coder, tester, reviewer, pr_creator, report_writer, merge_agent"
+        available_roles = "coder, debugger, tester, reviewer, report_writer"
         if custom_agents:
             custom_lines = [f"  - {a['role']}: {a['name']} — {a['description'] or 'no description'}" for a in custom_agents]
             available_roles += "\n\nCustom agents available:\n" + "\n".join(custom_lines)
@@ -421,10 +452,11 @@ class AgentCoordinator:
                     max_rounds=8,
                     on_activity=lambda msg: self._report_planning_activity(msg),
                     temperature=0.1,
+                    max_tokens=16384,
                 )
             else:
                 # No workspace — simple LLM call
-                response = await provider.send_message(messages, temperature=0.1)
+                response = await provider.send_message(messages, temperature=0.1, max_tokens=16384)
                 content = response.content
             await self._track_tokens(response)
 
@@ -450,14 +482,18 @@ class AgentCoordinator:
                                    self.todo_id, content)
                 break
 
-            # Parse failed — retry with correction prompt (no tool loop, just JSON output)
+            # Parse failed — log the raw LLM response for debugging
+            content_len = len(content or "")
+            logger.warning(
+                "[%s] Plan parse attempt %d/%d failed. content_length=%d, "
+                "stop_reason=%s, model=%s\nFull LLM response:\n%s",
+                self.todo_id, attempt + 1, max_retries, content_len,
+                response.stop_reason, response.model,
+                content or "(empty)",
+            )
+
             if attempt < max_retries - 1:
-                logger.warning(
-                    "Plan parse attempt %d/%d failed for todo %s, retrying",
-                    attempt + 1, max_retries, self.todo_id,
-                )
-                # Replace messages with fresh context + correction instruction
-                # (no tools on retry — the planner already explored, just needs valid JSON)
+                # Retry with correction prompt (no tool loop, just JSON output)
                 planner_tools = None
                 messages = [
                     LLMMessage(role="system", content=PLANNER_SYSTEM_PROMPT),
@@ -476,17 +512,24 @@ class AgentCoordinator:
                     ),
                 ]
             else:
-                # Final attempt failed
+                # Final attempt failed — surface the raw response in chat for visibility
+                truncated = (content or "")[-2000:]
+                if content_len > 2000:
+                    truncated = f"…(truncated, full length={content_len})\n{truncated}"
                 await self._post_system_message(
-                    "**Planning failed** — could not parse plan after multiple attempts. Retrying on next cycle."
+                    f"**Planning failed** — could not parse plan after {max_retries} attempts.\n\n"
+                    f"**Stop reason:** `{response.stop_reason}` | **Model:** `{response.model}` | "
+                    f"**Response length:** {content_len} chars\n\n"
+                    f"<details><summary>Raw LLM response (last 2000 chars)</summary>\n\n"
+                    f"```\n{truncated}\n```\n</details>"
                 )
                 raise ValueError("Failed to parse execution plan from LLM after retries")
 
         # Store plan as structured JSON for human review
         await self.db.execute(
-            "UPDATE todo_items SET plan_json = $2::jsonb, updated_at = NOW() WHERE id = $1",
+            "UPDATE todo_items SET plan_json = $2, updated_at = NOW() WHERE id = $1",
             self.todo_id,
-            json.dumps(plan),
+            plan,
         )
 
         sub_tasks_text = "\n".join(
@@ -526,7 +569,7 @@ class AgentCoordinator:
                         execution_order, input_context,
                         review_loop, target_repo
                     )
-                    VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8::jsonb)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
                     RETURNING id
                     """,
                     self.todo_id,
@@ -534,9 +577,9 @@ class AgentCoordinator:
                     st.get("description", ""),
                     st["agent_role"],
                     st.get("execution_order", 0),
-                    json.dumps(st.get("context", {})),
+                    st.get("context", {}),
                     bool(st.get("review_loop", False)),
-                    json.dumps(target_repo) if target_repo else None,
+                    target_repo,
                 )
                 st_id = str(row["id"])
                 sub_task_ids.append(st_id)
@@ -692,6 +735,11 @@ class AgentCoordinator:
         logger.info("[%s] %d runnable sub-tasks: %s", self.todo_id, len(runnable),
                     [(r["id"], r["agent_role"], r["title"]) for r in runnable])
 
+        # Check for cancellation before dispatching
+        if await self._is_cancelled():
+            logger.info("[%s] Task cancelled before dispatch, aborting execution", self.todo_id)
+            return
+
         if not runnable:
             # Check if all done
             logger.warning("[%s] No runnable sub-tasks found (total=%d). Checking if all done...",
@@ -744,6 +792,9 @@ class AgentCoordinator:
             if st["agent_role"] == "merge_agent":
                 logger.info("[%s] Sub-task %s: merge_agent path", self.todo_id, st["id"])
                 tasks.append(self._execute_merge_subtask(st, provider, st_workspace))
+            elif st["agent_role"] == "pr_creator":
+                logger.info("[%s] Sub-task %s: pr_creator path", self.todo_id, st["id"])
+                tasks.append(self._execute_pr_creator_subtask(st, provider, st_workspace))
             elif has_quality_rules:
                 logger.info("[%s] Sub-task %s: iteration path (role=%s)", self.todo_id, st["id"], st["agent_role"])
                 tasks.append(self._execute_subtask_with_iterations(
@@ -763,10 +814,13 @@ class AgentCoordinator:
         for st, result in zip(runnable, results):
             if isinstance(result, Exception):
                 logger.error("Sub-task %s failed: %s", st["id"], result, exc_info=result)
+                error_msg = f"{type(result).__name__}: {result}"
+                if len(error_msg) > 1000:
+                    error_msg = error_msg[:1000] + "..."
                 await self._transition_subtask(
                     str(st["id"]),
                     "failed",
-                    error_message=str(result),
+                    error_message=error_msg,
                 )
             else:
                 # Handle review loop: create follow-up sub-tasks
@@ -777,6 +831,11 @@ class AgentCoordinator:
         user_msg = await self._check_for_user_messages()
         if user_msg:
             await self._handle_user_message(user_msg, provider)
+
+        # Check for cancellation after batch
+        if await self._is_cancelled():
+            logger.info("[%s] Task cancelled after batch, aborting execution", self.todo_id)
+            return
 
         # Re-scan for newly unblocked subtasks — completions above may have
         # unlocked dependents. Loop until no more runnable or all done.
@@ -807,6 +866,11 @@ class AgentCoordinator:
                 logger.info("[%s] Re-scan round %d: no more runnable subtasks", self.todo_id, rescan_round)
                 break
 
+            # Check for cancellation between re-scan rounds
+            if await self._is_cancelled():
+                logger.info("[%s] Task cancelled during re-scan, aborting", self.todo_id)
+                return
+
             logger.info("[%s] Re-scan round %d: found %d newly runnable subtasks",
                         self.todo_id, rescan_round, len(next_runnable))
             next_tasks = []
@@ -821,6 +885,8 @@ class AgentCoordinator:
 
                 if st2["agent_role"] == "merge_agent":
                     next_tasks.append(self._execute_merge_subtask(st2, provider, st2_ws))
+                elif st2["agent_role"] == "pr_creator":
+                    next_tasks.append(self._execute_pr_creator_subtask(st2, provider, st2_ws))
                 elif has_quality_rules:
                     next_tasks.append(self._execute_subtask_with_iterations(
                         st2, provider, workspace_path=st2_ws,
@@ -911,6 +977,23 @@ class AgentCoordinator:
                 # After guardrail execution, re-check completion
                 all_done, any_failed = await check_all_subtasks_done(self.db, self.todo_id)
                 if all_done and not any_failed:
+                    code_push_created = await self._ensure_code_push(workspace_path)
+                    if code_push_created:
+                        pr_st = await self.db.fetchrow(
+                            "SELECT * FROM sub_tasks WHERE todo_id = $1 AND agent_role = 'pr_creator' "
+                            "AND status = 'pending' ORDER BY created_at DESC LIMIT 1",
+                            self.todo_id,
+                        )
+                        if pr_st:
+                            await self._execute_pr_creator_subtask(dict(pr_st), provider, workspace_path)
+                        # pr_creator may have created a merge_agent — execute it too
+                        merge_st = await self.db.fetchrow(
+                            "SELECT * FROM sub_tasks WHERE todo_id = $1 AND agent_role = 'merge_agent' "
+                            "AND status = 'pending' ORDER BY created_at DESC LIMIT 1",
+                            self.todo_id,
+                        )
+                        if merge_st:
+                            await self._execute_merge_subtask(dict(merge_st), provider, workspace_path)
                     await self._phase_review(todo, provider)
                 elif all_done and any_failed:
                     failed_tasks = await self.db.fetch(
@@ -921,6 +1004,23 @@ class AgentCoordinator:
                     err = "; ".join(f"{f['title']}: {f['error_message']}" for f in failed_tasks)
                     await self._transition_todo( "failed", error_message=err)
             else:
+                code_push_created = await self._ensure_code_push(workspace_path)
+                if code_push_created:
+                    pr_st = await self.db.fetchrow(
+                        "SELECT * FROM sub_tasks WHERE todo_id = $1 AND agent_role = 'pr_creator' "
+                        "AND status = 'pending' ORDER BY created_at DESC LIMIT 1",
+                        self.todo_id,
+                    )
+                    if pr_st:
+                        await self._execute_pr_creator_subtask(dict(pr_st), provider, workspace_path)
+                    # pr_creator may have created a merge_agent — execute it too
+                    merge_st = await self.db.fetchrow(
+                        "SELECT * FROM sub_tasks WHERE todo_id = $1 AND agent_role = 'merge_agent' "
+                        "AND status = 'pending' ORDER BY created_at DESC LIMIT 1",
+                        self.todo_id,
+                    )
+                    if merge_st:
+                        await self._execute_merge_subtask(dict(merge_st), provider, workspace_path)
                 await self._phase_review(todo, provider)
         elif all_done and any_failed:
             # Check if we should retry
@@ -1015,6 +1115,8 @@ class AgentCoordinator:
 
         iteration_log: list[dict] = []
         unstuck_advice: str | None = None
+        agent_signaled_done = False
+        agent_done_summary: str | None = None
         role = sub_task["agent_role"]
         role_rules = self._filter_rules_for_role(work_rules or {}, role)
         has_quality_rules = bool(role_rules.get("quality"))
@@ -1022,9 +1124,20 @@ class AgentCoordinator:
         # Resolve custom agent config for this role
         todo_for_agent = await self._load_todo()
         agent_config = await self._resolve_agent_config(role, str(todo_for_agent["creator_id"]))
-        model_override = agent_config.get("model_preference") if agent_config else None
+        # Resolution: agent config > task-level > provider default
+        model_override = None
+        if agent_config and agent_config.get("model_preference"):
+            model_override = agent_config["model_preference"]
+        elif todo_for_agent.get("ai_model"):
+            model_override = todo_for_agent["ai_model"]
 
         for iteration in range(1, max_iterations + 1):
+            # Check for cancellation at the start of each iteration
+            if await self._is_cancelled():
+                logger.info("[%s] Task cancelled during iteration %d of %s, aborting",
+                            self.todo_id, iteration, st_id)
+                return
+
             start_time = time.monotonic()
 
             # Create agent run record
@@ -1103,14 +1216,43 @@ class AgentCoordinator:
                 if model_override:
                     send_kwargs["model"] = model_override
 
+                async def _iter_tool_exec(name: str, args: dict) -> str:
+                    nonlocal agent_signaled_done, agent_done_summary
+                    if name == "task_complete":
+                        agent_signaled_done = True
+                        agent_done_summary = args.get("summary", "")
+                        return "Task completion acknowledged. Wrapping up."
+                    if name == "create_subtask":
+                        return await self._handle_create_subtask_tool(
+                            sub_task, args, workspace_path,
+                        )
+                    return await self.mcp_executor.execute_tool(name, args, mcp_tools)
+
                 iter_content, response = await run_tool_loop(
                     provider, messages,
                     tools=tools_arg,
-                    tool_executor=lambda name, args: self.mcp_executor.execute_tool(name, args, mcp_tools),
+                    tool_executor=_iter_tool_exec,
                     max_rounds=10,
                     on_activity=lambda msg: self._report_activity(st_id, msg),
                     **send_kwargs,
                 )
+
+                # Broadcast the LLM's text response so the UI can display it
+                if response.content and response.content.strip():
+                    # Truncate for the activity stream (full content stored in iteration log)
+                    preview = response.content.strip()
+                    if len(preview) > 500:
+                        preview = preview[:500] + "..."
+                    await self.redis.publish(
+                        f"task:{self.todo_id}:progress",
+                        json.dumps({
+                            "type": "llm_response",
+                            "sub_task_id": st_id,
+                            "iteration": iteration,
+                            "content": response.content.strip(),
+                            "preview": preview,
+                        }),
+                    )
 
                 duration_ms = int((time.monotonic() - start_time) * 1000)
                 total_tokens = response.tokens_input + response.tokens_output
@@ -1119,13 +1261,13 @@ class AgentCoordinator:
                 await self.db.execute(
                     """
                     UPDATE agent_runs
-                    SET status = 'completed', output_result = $2::jsonb,
+                    SET status = 'completed', output_result = $2,
                         tokens_input = $3, tokens_output = $4,
                         duration_ms = $5, cost_usd = $6, completed_at = NOW()
                     WHERE id = $1
                     """,
                     run["id"],
-                    json.dumps({"content": response.content}),
+                    {"content": response.content},
                     response.tokens_input,
                     response.tokens_output,
                     duration_ms,
@@ -1155,14 +1297,15 @@ class AgentCoordinator:
                     "files_changed": [],
                     "stuck_check": None,
                     "tokens_used": total_tokens,
+                    "llm_response": response.content.strip()[:2000] if response.content else None,
                 }
                 iteration_log.append(entry)
 
                 # Persist iteration log
                 await self.db.execute(
-                    "UPDATE sub_tasks SET iteration_log = $2::jsonb WHERE id = $1",
+                    "UPDATE sub_tasks SET iteration_log = $2 WHERE id = $1",
                     sub_task["id"],
-                    json.dumps(iteration_log),
+                    iteration_log,
                 )
 
                 # 5. Quality checks passed -> validate output then DONE
@@ -1213,6 +1356,42 @@ class AgentCoordinator:
                     await self._report_progress(st_id, 100, f"Completed: {sub_task['title']}")
                     return
 
+                # 5b. Agent signaled done via task_complete — accept result
+                if agent_signaled_done:
+                    qc_note = ""
+                    if not qc_result["passed"]:
+                        qc_note = f" (quality checks did not pass: {qc_result.get('reason', 'unknown')})"
+                    logger.info(
+                        "[%s] Agent signaled task_complete on iteration %d%s",
+                        self.todo_id, iteration, qc_note,
+                    )
+
+                    from agents.orchestrator.output_validator import (
+                        validate_agent_output as _validate_output_done,
+                    )
+                    validated_output, _ = _validate_output_done(role, response.content)
+                    if validated_output is None:
+                        validated_output = {
+                            "content": response.content,
+                            "raw_content": response.content,
+                            "summary": agent_done_summary,
+                        }
+                    else:
+                        validated_output["summary"] = agent_done_summary
+
+                    await self._transition_subtask(
+                        st_id, "completed",
+                        progress_pct=100,
+                        progress_message=agent_done_summary or "Done",
+                        output_result=validated_output,
+                    )
+                    await self._maybe_create_deliverable(sub_task, response, run, workspace_path=workspace_path)
+                    await self._append_progress_log(
+                        sub_task, iteration, "completed_agent_signal", iteration_log,
+                    )
+                    await self._report_progress(st_id, 100, f"Completed: {sub_task['title']}")
+                    return
+
                 # Clear advice after use
                 unstuck_advice = None
 
@@ -1223,9 +1402,9 @@ class AgentCoordinator:
                     # Update the entry in log
                     iteration_log[-1] = entry
                     await self.db.execute(
-                        "UPDATE sub_tasks SET iteration_log = $2::jsonb WHERE id = $1",
+                        "UPDATE sub_tasks SET iteration_log = $2 WHERE id = $1",
                         sub_task["id"],
-                        json.dumps(iteration_log),
+                        iteration_log,
                     )
 
                     if stuck_result.get("stuck"):
@@ -1236,31 +1415,48 @@ class AgentCoordinator:
                         )
 
             except Exception as e:
+                import traceback as _tb
+
                 duration_ms = int((time.monotonic() - start_time) * 1000)
+                error_type = _classify_error(e)
+                error_detail = f"{type(e).__name__}: {e}"
+                error_traceback = "".join(_tb.format_exception(type(e), e, e.__traceback__))
+
                 await self.db.execute(
                     """
                     UPDATE agent_runs
-                    SET status = 'failed', error_type = 'transient',
-                        error_detail = $2, duration_ms = $3, completed_at = NOW()
+                    SET status = 'failed', error_type = $2,
+                        error_detail = $3, duration_ms = $4, completed_at = NOW()
                     WHERE id = $1
                     """,
                     run["id"],
-                    str(e),
+                    error_type,
+                    error_detail + "\n\n" + error_traceback[-2000:],
                     duration_ms,
                 )
-                # Record failure in iteration log
+                # Record failure in iteration log with full context
                 iteration_log.append({
                     "iteration": iteration,
                     "timestamp": datetime.now(timezone.utc).isoformat(),
                     "action": "error",
-                    "outcome": f"exception: {str(e)[:200]}",
+                    "outcome": f"exception: {error_detail[:500]}",
+                    "error_output": error_traceback[-3000:],
                     "learnings": [],
                     "tokens_used": 0,
                 })
                 await self.db.execute(
-                    "UPDATE sub_tasks SET iteration_log = $2::jsonb WHERE id = $1",
+                    "UPDATE sub_tasks SET iteration_log = $2 WHERE id = $1",
                     sub_task["id"],
-                    json.dumps(iteration_log),
+                    iteration_log,
+                )
+                # Report the error as activity so it appears in the UI immediately
+                await self.redis.publish(
+                    f"task:{self.todo_id}:progress",
+                    json.dumps({
+                        "type": "activity",
+                        "sub_task_id": st_id,
+                        "activity": f"ERROR: {error_detail[:300]}",
+                    }),
                 )
                 raise
 
@@ -1328,12 +1524,26 @@ class AgentCoordinator:
         system += workspace_context
         system += rules_block
 
+        # For debugger agents, inject debug context
+        if role == "debugger":
+            debug_block = await self._build_debug_context_block(todo)
+            if debug_block:
+                system += debug_block
+
         # Inject tool descriptions for models that need explicit instructions
         if workspace_path:
             system += build_tools_prompt_block(role)
 
         from agents.orchestrator.output_validator import build_structured_output_instruction
         system += build_structured_output_instruction(role)
+
+        # Completion instruction
+        system += (
+            "\n\n## IMPORTANT: Signaling Completion\n"
+            "When you have finished ALL your work (code written, tests passing, etc.), "
+            "you MUST call the `task_complete` tool with a summary of what you accomplished. "
+            "This stops the iteration loop. Do NOT keep working after you are done."
+        )
 
         # Iteration learnings (last 5 entries condensed)
         if iteration_log:
@@ -1488,12 +1698,12 @@ class AgentCoordinator:
         await self.db.execute(
             """
             UPDATE todo_items
-            SET progress_log = COALESCE(progress_log, '[]'::jsonb) || $2::jsonb,
+            SET progress_log = COALESCE(progress_log, '[]'::jsonb) || $2,
                 updated_at = NOW()
             WHERE id = $1
             """,
             self.todo_id,
-            json.dumps([record]),
+            [record],
         )
 
     # ---- REVIEW-MERGE LOOP ----
@@ -1538,7 +1748,7 @@ class AgentCoordinator:
         if role == "coder":
             # Coder finished → create reviewer to review the workspace changes.
             # Commit/push/PR happens later, after reviewer approval.
-            await self._create_reviewer_subtask(st, chain_id)
+            await self._create_reviewer_subtask(st, chain_id, workspace_path)
 
         elif role == "reviewer":
             # Parse verdict — prefer structured output field, fall back to heuristic
@@ -1558,54 +1768,112 @@ class AgentCoordinator:
                 )
 
             if verdict == "approved":
-                # Deterministically commit, push, and create PR — no LLM needed.
-                # Find the latest coder sub-task in this chain for commit context.
-                coder_st = await self.db.fetchrow(
-                    "SELECT * FROM sub_tasks WHERE review_chain_id = $1 "
-                    "AND agent_role = 'coder' ORDER BY created_at DESC LIMIT 1",
-                    chain_id,
+                # Create a pr_creator sub-task to handle commit+push+PR.
+                # It will in turn create a merge_agent sub-task on success.
+                await self._post_system_message(
+                    "**Review approved.** Creating PR sub-task..."
                 )
-                commit_st = coder_st or st
-                pr_info = await self._finalize_subtask_workspace(commit_st, workspace_path)
-                if pr_info:
-                    pr_url = pr_info.get("url", "N/A")
-                    await self._post_system_message(
-                        f"**Review approved.** Committed, pushed, and created PR: {pr_url}"
-                    )
-                    await self._create_merge_subtask(st, chain_id)
-                else:
-                    await self._post_system_message(
-                        "**Review approved.** No changes to commit or PR creation failed."
-                    )
+                await self._create_pr_creator_subtask(st, chain_id)
             else:
-                # needs_changes → create a new coder fix sub-task
-                reviewer_feedback = (
-                    (st.get("output_result") or {}).get("content", "")
-                    if isinstance(st.get("output_result"), dict)
-                    else str(st.get("output_result") or "")
+                # needs_changes → create a new coder fix sub-task with detailed issue info
+                output = st.get("output_result") or {}
+                if isinstance(output, dict):
+                    reviewer_feedback = output.get("content", "")
+                    structured_issues = output.get("issues", [])
+                else:
+                    reviewer_feedback = str(output)
+                    structured_issues = []
+                await self._create_fix_subtask(
+                    st, chain_id, reviewer_feedback, structured_issues,
                 )
-                await self._create_fix_subtask(st, chain_id, reviewer_feedback)
 
-    async def _create_reviewer_subtask(self, coder_st: dict, chain_id) -> None:
-        """Create a reviewer sub-task that depends on the completed coder sub-task."""
+    async def _create_reviewer_subtask(
+        self, coder_st: dict, chain_id, workspace_path: str | None = None,
+    ) -> None:
+        """Create a reviewer sub-task that depends on the completed coder sub-task.
+
+        Captures the git diff from the workspace and includes it in the
+        reviewer's description so it has full context of what changed.
+        """
         target_repo_json = coder_st.get("target_repo")
-        if target_repo_json and not isinstance(target_repo_json, str):
-            target_repo_json = json.dumps(target_repo_json)
+        if isinstance(target_repo_json, str):
+            target_repo_json = json.loads(target_repo_json)
+
+        # Build rich description with coder output + git diff
+        desc_parts = [
+            f"Review the changes from sub-task '{coder_st['title']}'.",
+            "Check for bugs, security issues, code quality, and adherence to requirements.",
+        ]
+
+        # Include coder's output info (files changed, approach)
+        coder_output = coder_st.get("output_result") or {}
+        if isinstance(coder_output, dict):
+            approach = coder_output.get("approach", "")
+            if approach:
+                desc_parts.append(f"\n## Implementation Approach\n{approach}")
+            files_changed = coder_output.get("files_changed", [])
+            if files_changed:
+                desc_parts.append("\n## Files Changed\n" + "\n".join(f"- {f}" for f in files_changed))
+
+        # Capture git diff from workspace
+        if workspace_path:
+            try:
+                repo_dir = os.path.join(workspace_path, "repo")
+                if not os.path.isdir(repo_dir):
+                    repo_dir = workspace_path
+
+                async def _git(args):
+                    proc = await asyncio.create_subprocess_exec(
+                        "git", *args, cwd=repo_dir,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                    )
+                    out, _ = await proc.communicate()
+                    return out.decode(errors="replace").strip()
+
+                # Get diff stat and full diff (uncommitted + staged)
+                diff_stat = await _git(["diff", "--stat", "HEAD"])
+                diff_full = await _git(["diff", "HEAD"])
+
+                # Fallback: diff against last commit if no uncommitted changes
+                if not diff_full:
+                    diff_stat = await _git(["diff", "--stat", "HEAD~1", "HEAD"])
+                    diff_full = await _git(["diff", "HEAD~1", "HEAD"])
+
+                if diff_stat:
+                    desc_parts.append(f"\n## Git Diff Summary\n```\n{diff_stat}\n```")
+                if diff_full:
+                    # Truncate large diffs
+                    if len(diff_full) > 10_000:
+                        diff_full = diff_full[:10_000] + "\n... (truncated, use git diff to see full changes)"
+                    desc_parts.append(f"\n## Full Diff\n```diff\n{diff_full}\n```")
+            except Exception:
+                logger.warning("[%s] Failed to capture git diff for reviewer", self.todo_id, exc_info=True)
+
+        desc_parts.append(
+            "\n## Instructions\n"
+            "Review the diff above carefully. For each issue found, specify the exact "
+            "file path and line number.\n\n"
+            "You MUST output a JSON verdict at the end of your response:\n"
+            '{"verdict": "approved"} or {"verdict": "needs_changes", "issues": ['
+            '{"severity": "major", "file": "path/to/file.py", "line": 42, '
+            '"description": "what is wrong", "suggestion": "how to fix it"}]}'
+        )
+
+        description = "\n".join(desc_parts)
+
         row = await self.db.fetchrow(
             """
             INSERT INTO sub_tasks (
                 todo_id, title, description, agent_role,
                 execution_order, depends_on, review_chain_id, target_repo
             )
-            VALUES ($1, $2, $3, 'reviewer', $4, $5, $6, $7::jsonb)
+            VALUES ($1, $2, $3, 'reviewer', $4, $5, $6, $7)
             RETURNING id
             """,
             self.todo_id,
             f"Review: {coder_st['title']}",
-            f"Review the changes from sub-task '{coder_st['title']}'. "
-            "Check for bugs, security issues, code quality, and adherence to requirements.\n\n"
-            "You MUST output a JSON verdict at the end of your response:\n"
-            '{"verdict": "approved"} or {"verdict": "needs_changes", "issues": ["issue1", ...]}',
+            description,
             (coder_st.get("execution_order") or 0) + 1,
             [str(coder_st["id"])],
             chain_id,
@@ -1618,23 +1886,70 @@ class AgentCoordinator:
 
     async def _create_fix_subtask(
         self, reviewer_st: dict, chain_id, feedback: str,
+        structured_issues: list | None = None,
     ) -> None:
-        """Create a coder fix sub-task with reviewer feedback."""
+        """Create a coder fix sub-task with detailed reviewer feedback.
+
+        Extracts file paths, line numbers, and specific suggestions from
+        the reviewer's structured output so the coder knows exactly what
+        to fix and where.
+        """
         target_repo_json = reviewer_st.get("target_repo")
-        if target_repo_json and not isinstance(target_repo_json, str):
-            target_repo_json = json.dumps(target_repo_json)
+        if isinstance(target_repo_json, str):
+            target_repo_json = json.loads(target_repo_json)
+
+        # Build detailed fix description from structured issues
+        desc_parts = ["Address the reviewer's feedback and fix the following issues:\n"]
+
+        if structured_issues:
+            for i, issue in enumerate(structured_issues, 1):
+                if isinstance(issue, dict):
+                    severity = issue.get("severity", "major").upper()
+                    file_path = issue.get("file", "")
+                    line = issue.get("line")
+                    issue_desc = issue.get("description", "")
+                    suggestion = issue.get("suggestion", "")
+
+                    location = ""
+                    if file_path:
+                        location = f" in `{file_path}`"
+                        if line:
+                            location += f" (line {line})"
+
+                    desc_parts.append(f"### Issue {i} [{severity}]{location}")
+                    if issue_desc:
+                        desc_parts.append(f"**Problem:** {issue_desc}")
+                    if suggestion:
+                        desc_parts.append(f"**Fix:** {suggestion}")
+                    desc_parts.append("")
+                else:
+                    desc_parts.append(f"- {str(issue)}")
+
+        # Also include reviewer summary if available
+        reviewer_output = reviewer_st.get("output_result") or {}
+        if isinstance(reviewer_output, dict):
+            summary = reviewer_output.get("summary", "")
+            if summary:
+                desc_parts.append(f"\n## Reviewer Summary\n{summary}")
+
+        # Include raw feedback as fallback context (truncated)
+        if feedback and not structured_issues:
+            desc_parts.append(f"\n## Reviewer Feedback\n{feedback[:3000]}")
+
+        description = "\n".join(desc_parts)
+
         row = await self.db.fetchrow(
             """
             INSERT INTO sub_tasks (
                 todo_id, title, description, agent_role,
                 execution_order, depends_on, review_loop, review_chain_id, target_repo
             )
-            VALUES ($1, $2, $3, 'coder', $4, $5, TRUE, $6, $7::jsonb)
+            VALUES ($1, $2, $3, 'coder', $4, $5, TRUE, $6, $7)
             RETURNING id
             """,
             self.todo_id,
             f"Fix: {reviewer_st['title'].removeprefix('Review: ')}",
-            f"Address the reviewer's feedback and fix the issues:\n\n{feedback[:2000]}",
+            description,
             (reviewer_st.get("execution_order") or 0) + 1,
             [str(reviewer_st["id"])],
             chain_id,
@@ -1666,15 +1981,15 @@ class AgentCoordinator:
             depends_on.append(approved_id)
 
         target_repo_json = approved_st.get("target_repo")
-        if target_repo_json and not isinstance(target_repo_json, str):
-            target_repo_json = json.dumps(target_repo_json)
+        if isinstance(target_repo_json, str):
+            target_repo_json = json.loads(target_repo_json)
         row = await self.db.fetchrow(
             """
             INSERT INTO sub_tasks (
                 todo_id, title, description, agent_role,
                 execution_order, depends_on, review_chain_id, target_repo
             )
-            VALUES ($1, $2, $3, 'merge_agent', $4, $5, $6, $7::jsonb)
+            VALUES ($1, $2, $3, 'merge_agent', $4, $5, $6, $7)
             RETURNING id
             """,
             self.todo_id,
@@ -1688,6 +2003,53 @@ class AgentCoordinator:
         logger.info("Created merge_agent sub-task %s for chain %s (depends on %d tasks)", row["id"], chain_id, len(depends_on))
         await self._post_system_message(
             "**Review loop:** Reviewer approved. Created merge sub-task."
+        )
+
+    async def _create_pr_creator_subtask(self, approved_st: dict, chain_id=None) -> None:
+        """Create a pr_creator sub-task after reviewer approval (review chain flow).
+
+        The pr_creator depends on ALL subtasks in the review chain so it only
+        runs after everything is complete. It will create a merge_agent on success.
+        """
+        depends_on = []
+        if chain_id:
+            chain_tasks = await self.db.fetch(
+                "SELECT id FROM sub_tasks WHERE todo_id = $1 AND "
+                "(review_chain_id = $2 OR id = $2)",
+                self.todo_id,
+                chain_id,
+            )
+            depends_on = [str(t["id"]) for t in chain_tasks]
+
+        # Ensure the approved subtask is included
+        approved_id = str(approved_st["id"])
+        if approved_id not in depends_on:
+            depends_on.append(approved_id)
+
+        target_repo_json = approved_st.get("target_repo")
+        if isinstance(target_repo_json, str):
+            target_repo_json = json.loads(target_repo_json)
+
+        row = await self.db.fetchrow(
+            """
+            INSERT INTO sub_tasks (
+                todo_id, title, description, agent_role,
+                execution_order, depends_on, review_chain_id, target_repo
+            )
+            VALUES ($1, $2, $3, 'pr_creator', $4, $5, $6, $7)
+            RETURNING id
+            """,
+            self.todo_id,
+            "Create Pull Request",
+            "Commit all workspace changes, push to a feature branch, and create a pull request.",
+            (approved_st.get("execution_order") or 0) + 1,
+            depends_on,
+            chain_id,
+            target_repo_json,
+        )
+        logger.info("Created pr_creator sub-task %s for chain %s", row["id"], chain_id)
+        await self._post_system_message(
+            "**Review loop:** Reviewer approved. Created PR sub-task."
         )
 
     # ---- CODING GUARDRAILS ----
@@ -1820,6 +2182,65 @@ class AgentCoordinator:
         )
         return st_id
 
+    async def _handle_create_subtask_tool(
+        self, parent_subtask: dict, args: dict, workspace_path: str | None,
+    ) -> str:
+        """Handle the create_subtask builtin tool called by a coder agent.
+
+        Creates a new subtask under the same todo. The new subtask will be
+        picked up by the re-scan loop after the current batch completes.
+        """
+        title = args.get("title", "").strip()
+        description = args.get("description", "").strip()
+        agent_role = args.get("agent_role", "coder").strip()
+
+        if not title:
+            return json.dumps({"error": "title is required"})
+        if not description:
+            return json.dumps({"error": "description is required"})
+        if agent_role not in ("coder", "tester", "reviewer", "debugger"):
+            return json.dumps({"error": f"Invalid agent_role: {agent_role}. Use coder, tester, reviewer, or debugger."})
+
+        # New subtask gets execution_order after the parent
+        parent_order = parent_subtask.get("execution_order") or 0
+
+        try:
+            row = await self.db.fetchrow(
+                """
+                INSERT INTO sub_tasks (
+                    todo_id, title, description, agent_role,
+                    execution_order, depends_on
+                )
+                VALUES ($1, $2, $3, $4, $5, $6)
+                RETURNING id
+                """,
+                self.todo_id,
+                title,
+                description,
+                agent_role,
+                parent_order,
+                [],  # no dependencies — available immediately for parallel execution
+            )
+            st_id = str(row["id"])
+            logger.info(
+                "[%s] Coder created child subtask %s: role=%s title=%s (parent=%s)",
+                self.todo_id, st_id, agent_role, title, parent_subtask["id"],
+            )
+            await self._post_system_message(
+                f"**Subtask created by {parent_subtask['agent_role']}:** "
+                f"[{agent_role}] {title}"
+            )
+            return json.dumps({
+                "status": "created",
+                "subtask_id": st_id,
+                "title": title,
+                "agent_role": agent_role,
+                "message": f"Subtask created. It will be executed after current batch completes.",
+            })
+        except Exception as e:
+            logger.error("[%s] Failed to create child subtask: %s", self.todo_id, e)
+            return json.dumps({"error": f"Failed to create subtask: {str(e)}"})
+
     async def _finalize_subtask_workspace(
         self, sub_task: dict, workspace_path: str | None,
     ) -> dict | None:
@@ -1951,6 +2372,100 @@ class AgentCoordinator:
 
         # Default to needs_changes if ambiguous — conservative safety
         return "needs_changes"
+
+    # ---- PR CREATOR ----
+
+    async def _execute_pr_creator_subtask(
+        self, sub_task: dict, provider: AIProvider, workspace_path: str | None,
+    ) -> None:
+        """Procedural PR creator: commit, push, create PR, then spawn merge_agent.
+
+        No LLM needed — this is a deterministic git operation.
+        """
+        st_id = str(sub_task["id"])
+        await self._transition_subtask(st_id, "assigned")
+        await self._transition_subtask(st_id, "running")
+
+        await self.db.execute(
+            "UPDATE todo_items SET sub_state = 'creating_pr', updated_at = NOW() WHERE id = $1",
+            self.todo_id,
+        )
+
+        try:
+            if not workspace_path:
+                raise ValueError("No workspace path available for PR creation")
+
+            # Use the sub-task itself as context for _finalize_subtask_workspace
+            # (it will determine branch name and PR details from the todo)
+            await self._report_progress(st_id, 10, "Preparing to commit and push")
+
+            # Find the latest coder subtask for commit context
+            coder_st = await self.db.fetchrow(
+                "SELECT * FROM sub_tasks WHERE todo_id = $1 AND agent_role = 'coder' "
+                "AND status = 'completed' ORDER BY created_at DESC LIMIT 1",
+                self.todo_id,
+            )
+            commit_st = coder_st or sub_task
+
+            await self._report_progress(st_id, 30, "Committing and pushing changes")
+            pr_info = await self._finalize_subtask_workspace(commit_st, workspace_path)
+
+            if not pr_info:
+                raise ValueError("PR creation failed — no PR data returned")
+
+            pr_url = pr_info.get("url", "N/A")
+            await self._report_progress(st_id, 80, f"PR created: {pr_url}")
+            await self._post_system_message(
+                f"**PR created:** {pr_url}. Creating merge sub-task."
+            )
+
+            # Create a merge_agent subtask that depends on this pr_creator
+            all_coder_ids = [str(sub_task["id"])]
+            if coder_st:
+                # Also depend on the coder subtask
+                all_coder_ids.append(str(coder_st["id"]))
+
+            target_repo_json = sub_task.get("target_repo")
+            if isinstance(target_repo_json, str):
+                target_repo_json = json.loads(target_repo_json)
+
+            max_order = await self.db.fetchval(
+                "SELECT COALESCE(MAX(execution_order), 0) FROM sub_tasks WHERE todo_id = $1",
+                self.todo_id,
+            )
+
+            await self.db.fetchrow(
+                """
+                INSERT INTO sub_tasks (
+                    todo_id, title, description, agent_role,
+                    execution_order, depends_on, target_repo
+                )
+                VALUES ($1, $2, $3, 'merge_agent', $4, $5, $6)
+                RETURNING id
+                """,
+                self.todo_id,
+                "Merge PR",
+                "Merge the PR. Check CI status, merge, and run post-merge builds if configured.",
+                max_order + 1,
+                all_coder_ids,
+                target_repo_json,
+            )
+
+            await self._report_progress(st_id, 100, "PR created successfully")
+            await self._transition_subtask(
+                st_id, "completed",
+                progress_pct=100, progress_message=f"PR: {pr_url}",
+            )
+
+        except Exception as e:
+            logger.error("[%s] PR creator failed: %s", self.todo_id, e, exc_info=True)
+            await self._post_system_message(
+                f"**PR creation failed:** {str(e)[:500]}. You can retry this sub-task."
+            )
+            await self._transition_subtask(
+                st_id, "failed",
+                error_message=str(e)[:500],
+            )
 
     # ---- MERGE AGENT ----
 
@@ -2280,10 +2795,17 @@ class AgentCoordinator:
                     f"Using tool: {resp.tool_calls[0].get('name', '?') if resp.tool_calls else '?'}",
                 )
 
+            async def _tool_exec(name: str, args: dict) -> str:
+                if name == "create_subtask":
+                    return await self._handle_create_subtask_tool(
+                        sub_task, args, workspace_path,
+                    )
+                return await self.mcp_executor.execute_tool(name, args, mcp_tools)
+
             content, response = await run_tool_loop(
                 provider, messages,
                 tools=tools_arg,
-                tool_executor=lambda name, args: self.mcp_executor.execute_tool(name, args, mcp_tools),
+                tool_executor=_tool_exec,
                 max_rounds=10,
                 on_tool_round=_on_tool_round,
                 on_activity=lambda msg: self._report_activity(st_id, msg),
@@ -2332,13 +2854,13 @@ class AgentCoordinator:
             await self.db.execute(
                 """
                 UPDATE agent_runs
-                SET status = 'completed', output_result = $2::jsonb,
+                SET status = 'completed', output_result = $2,
                     tokens_input = $3, tokens_output = $4,
                     duration_ms = $5, cost_usd = $6, completed_at = NOW()
                 WHERE id = $1
                 """,
                 run["id"],
-                json.dumps(validated_output),
+                validated_output,
                 response.tokens_input,
                 response.tokens_output,
                 duration_ms,
@@ -2374,16 +2896,23 @@ class AgentCoordinator:
             await self._report_progress(st_id, 100, f"Completed: {sub_task['title']}")
 
         except Exception as e:
+            import traceback as _tb
+
             duration_ms = int((time.monotonic() - start_time) * 1000)
+            error_type = _classify_error(e)
+            error_detail = f"{type(e).__name__}: {e}"
+            error_traceback = "".join(_tb.format_exception(type(e), e, e.__traceback__))
+
             await self.db.execute(
                 """
                 UPDATE agent_runs
-                SET status = 'failed', error_type = 'transient',
-                    error_detail = $2, duration_ms = $3, completed_at = NOW()
+                SET status = 'failed', error_type = $2,
+                    error_detail = $3, duration_ms = $4, completed_at = NOW()
                 WHERE id = $1
                 """,
                 run["id"],
-                str(e),
+                error_type,
+                error_detail + "\n\n" + error_traceback[-2000:],
                 duration_ms,
             )
             raise
@@ -2638,14 +3167,26 @@ class AgentCoordinator:
             understanding = settings.get("project_understanding")
             if understanding:
                 context["project_understanding"] = understanding
+            # Include debug context so the planner knows debugging capabilities
+            debug_ctx = settings.get("debug_context")
+            if debug_ctx:
+                context["debug_context"] = debug_ctx
 
         return context
 
     async def _load_chat_history(self) -> list[dict]:
-        rows = await self.db.fetch(
-            "SELECT role, content FROM chat_messages WHERE todo_id = $1 ORDER BY created_at ASC",
-            self.todo_id,
-        )
+        session_id = getattr(self, "_chat_session_id", None)
+        if session_id:
+            rows = await self.db.fetch(
+                "SELECT role, content FROM project_chat_messages "
+                "WHERE session_id = $1 ORDER BY created_at ASC",
+                session_id,
+            )
+        else:
+            rows = await self.db.fetch(
+                "SELECT role, content FROM chat_messages WHERE todo_id = $1 ORDER BY created_at ASC",
+                self.todo_id,
+            )
         return [dict(r) for r in rows]
 
     async def _check_for_user_messages(self) -> str | None:
@@ -2679,29 +3220,38 @@ class AgentCoordinator:
         await self._post_assistant_message(response.content)
 
     async def _post_system_message(self, content: str) -> None:
-        await self.db.execute(
-            "INSERT INTO chat_messages (todo_id, role, content) VALUES ($1, 'system', $2)",
-            self.todo_id,
-            content,
-        )
-        await self.redis.publish(
-            f"task:{self.todo_id}:events",
-            json.dumps({"type": "chat_message", "message": {"role": "system", "content": content}}),
-        )
+        await self._post_chat_message("system", content)
 
     async def _post_assistant_message(self, content: str) -> None:
-        await self.db.execute(
-            "INSERT INTO chat_messages (todo_id, role, content) VALUES ($1, 'assistant', $2)",
-            self.todo_id,
-            content,
-        )
-        await self.redis.publish(
-            f"task:{self.todo_id}:events",
-            json.dumps({
-                "type": "chat_message",
-                "message": {"role": "assistant", "content": content},
-            }),
-        )
+        await self._post_chat_message("assistant", content)
+
+    async def _post_chat_message(self, role: str, content: str) -> None:
+        """Write a chat message to the correct table and publish to relevant channels."""
+        session_id = getattr(self, "_chat_session_id", None)
+
+        if session_id:
+            # Linked session: write to project_chat_messages
+            await self.db.execute(
+                "INSERT INTO project_chat_messages (project_id, user_id, role, content, session_id) "
+                "VALUES ($1, $2, $3, $4, $5)",
+                self._chat_project_id, self._chat_user_id, role, content, session_id,
+            )
+        else:
+            # Standard: write to chat_messages
+            await self.db.execute(
+                "INSERT INTO chat_messages (todo_id, role, content) VALUES ($1, $2, $3)",
+                self.todo_id, role, content,
+            )
+
+        # Always publish to the task events channel for the todo detail WS
+        event_data = json.dumps({
+            "type": "chat_message",
+            "message": {"role": role, "content": content},
+        })
+        await self.redis.publish(f"task:{self.todo_id}:events", event_data)
+        # Also publish to session channel if linked
+        if session_id:
+            await self.redis.publish(f"chat:session:{session_id}:activity", event_data)
 
     async def _report_progress(self, subtask_id: str, pct: int, message: str) -> None:
         logger.info("[%s] st=%s progress=%d%% %s", self.todo_id, subtask_id[:8], pct, message)
@@ -2721,23 +3271,48 @@ class AgentCoordinator:
         )
 
     async def _report_activity(self, subtask_id: str, activity: str) -> None:
-        """Publish a granular activity event for live UI display."""
-        # Persist latest activity as progress_message so it shows on refresh
-        await self.db.execute(
-            "UPDATE sub_tasks SET progress_message = $2 WHERE id = $1",
-            subtask_id, activity,
-        )
-        await self.redis.publish(
-            f"task:{self.todo_id}:progress",
-            json.dumps({
-                "type": "activity",
-                "sub_task_id": subtask_id,
-                "activity": activity,
-            }),
-        )
+        """Publish a granular activity event for live UI display.
+
+        Throttled to avoid flooding WebSocket clients:
+        - Redis publish: at most once per second per subtask
+        - DB persist: at most once per 3 seconds per subtask
+        """
+        import time
+
+        now = time.monotonic()
+
+        # Persist to DB at most every 3s
+        last_persist = self._last_activity_persist.get(subtask_id, 0)
+        if now - last_persist >= 3.0:
+            await self.db.execute(
+                "UPDATE sub_tasks SET progress_message = $2 WHERE id = $1",
+                subtask_id, activity,
+            )
+            self._last_activity_persist[subtask_id] = now
+
+        # Publish to Redis at most every 1s
+        last_publish = self._last_activity_publish.get(subtask_id, 0)
+        if now - last_publish >= 1.0:
+            await self.redis.publish(
+                f"task:{self.todo_id}:progress",
+                json.dumps({
+                    "type": "activity",
+                    "sub_task_id": subtask_id,
+                    "activity": activity,
+                }),
+            )
+            self._last_activity_publish[subtask_id] = now
 
     async def _report_planning_activity(self, activity: str) -> None:
-        """Publish a planning-phase activity event for live UI display."""
+        """Publish a planning-phase activity event for live UI display (throttled)."""
+        import time
+
+        now = time.monotonic()
+        last = self._last_activity_publish.get("_planning", 0)
+        if now - last < 1.0:
+            return
+        self._last_activity_publish["_planning"] = now
+
         await self.redis.publish(
             f"task:{self.todo_id}:progress",
             json.dumps({
@@ -2817,10 +3392,9 @@ class AgentCoordinator:
     ) -> None:
         """Create a deliverable if the agent role produces one."""
         role = sub_task["agent_role"]
-        if role in ("coder", "pr_creator", "report_writer"):
+        if role in ("coder", "report_writer"):
             d_type = {
                 "coder": "code_diff",
-                "pr_creator": "pull_request",
                 "report_writer": "report",
             }.get(role, "document")
 
@@ -2837,7 +3411,7 @@ class AgentCoordinator:
                 INSERT INTO deliverables (
                     todo_id, agent_run_id, sub_task_id, type, title, content_md, content_json
                 )
-                VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
+                VALUES ($1, $2, $3, $4, $5, $6, $7)
                 """,
                 self.todo_id,
                 run["id"],
@@ -2845,7 +3419,7 @@ class AgentCoordinator:
                 d_type,
                 f"{d_type}: {sub_task['title']}",
                 response.content,
-                json.dumps(diff_json) if diff_json else None,
+                diff_json,
             )
 
     async def _build_agent_prompt(
@@ -2883,6 +3457,18 @@ class AgentCoordinator:
             system = get_default_system_prompt(role) + workspace_context
 
         system += rules_block
+
+        # For debugger agents, inject project-level debug context
+        if role == "debugger":
+            debug_block = await self._build_debug_context_block(todo)
+            if debug_block:
+                system += debug_block
+
+        # For tester agents, inject project build/test commands
+        if role == "tester":
+            build_block = await self._build_tester_context(todo)
+            if build_block:
+                system += build_block
 
         # Inject tool descriptions into prompt so all models know what's available
         if workspace_path:
@@ -2925,4 +3511,209 @@ class AgentCoordinator:
                 f"{prev_context}"
             ),
         }
+
+    # ---- DEBUG CONTEXT ----
+
+    async def _build_debug_context_block(self, todo: dict) -> str:
+        """Build a markdown block with debug context for debugger agents.
+
+        Pulls log sources, MCP data hints, and custom instructions from
+        the project's settings_json.debug_context. Also checks dependency-level
+        debug contexts from context_docs.
+        """
+        project = await self.db.fetchrow(
+            "SELECT settings_json, context_docs FROM projects WHERE id = $1",
+            todo["project_id"],
+        )
+        if not project:
+            return ""
+
+        settings = project.get("settings_json") or {}
+        if isinstance(settings, str):
+            settings = json.loads(settings)
+        debug_ctx = settings.get("debug_context") or {}
+
+        parts: list[str] = []
+
+        # Log sources
+        log_sources = debug_ctx.get("log_sources") or []
+        if log_sources:
+            parts.append("\n\n## Log Sources")
+            for src in log_sources:
+                parts.append(f"### {src.get('service_name', 'Service')}")
+                if src.get("log_path"):
+                    parts.append(f"- **Log path:** `{src['log_path']}`")
+                if src.get("log_command"):
+                    parts.append(f"- **Log command:** `{src['log_command']}`")
+                if src.get("description"):
+                    parts.append(f"- **Description:** {src['description']}")
+
+        # MCP data hints
+        mcp_hints = debug_ctx.get("mcp_hints") or []
+        if mcp_hints:
+            parts.append("\n\n## MCP Data Sources")
+            for hint in mcp_hints:
+                name = hint.get("mcp_server_name", "MCP Server")
+                parts.append(f"### {name}")
+                available = hint.get("available_data") or []
+                if available:
+                    parts.append("**Available data:** " + ", ".join(available))
+                queries = hint.get("example_queries") or []
+                if queries:
+                    parts.append("**Example queries:**")
+                    for q in queries:
+                        parts.append(f"  ```\n  {q}\n  ```")
+                if hint.get("notes"):
+                    parts.append(f"**Notes:** {hint['notes']}")
+
+        # Custom instructions
+        custom = debug_ctx.get("custom_instructions") or ""
+        if custom:
+            parts.append(f"\n\n## Debug Instructions\n{custom}")
+
+        # Dependency-level debug contexts
+        deps = project.get("context_docs") or []
+        if isinstance(deps, str):
+            deps = json.loads(deps)
+        for dep in deps:
+            dep_debug = dep.get("debug_context") if isinstance(dep, dict) else None
+            if dep_debug:
+                dep_name = dep.get("name", "Dependency")
+                parts.append(f"\n\n## Debug Context: {dep_name}")
+                for src in dep_debug.get("log_sources", []):
+                    if src.get("log_path"):
+                        parts.append(f"- Log: `{src['log_path']}`")
+                    if src.get("log_command"):
+                        parts.append(f"- Command: `{src['log_command']}`")
+                for hint in dep_debug.get("mcp_hints", []):
+                    parts.append(f"- MCP: {hint.get('mcp_server_name', '?')} — {', '.join(hint.get('available_data', []))}")
+                if dep_debug.get("custom_instructions"):
+                    parts.append(f"- Instructions: {dep_debug['custom_instructions']}")
+
+        if not parts:
+            parts.append(
+                "\n\n## Debug Context\n"
+                "No debug context is configured for this project. "
+                "Use codebase exploration, error messages, and available MCP tools "
+                "to investigate the issue."
+            )
+
+        return "\n".join(parts)
+
+    async def _build_tester_context(self, todo: dict) -> str:
+        """Build a context block with build/test commands for tester agents.
+
+        If the project has configured build_commands, inject them.
+        Otherwise, provide discovery instructions.
+        """
+        project = await self.db.fetchrow(
+            "SELECT settings_json FROM projects WHERE id = $1",
+            todo["project_id"],
+        )
+        settings = safe_json(project.get("settings_json")) if project else {}
+        build_commands = settings.get("build_commands", [])
+
+        if build_commands:
+            cmds = "\n".join(f"  - `{cmd}`" for cmd in build_commands)
+            return (
+                f"\n\n## Project Build & Test Commands\n"
+                f"The project has these configured build/test commands:\n{cmds}\n"
+                f"You MUST run these commands to validate the implementation. "
+                f"If any fail, investigate and fix the issues before reporting success."
+            )
+        else:
+            return (
+                "\n\n## Build & Test Discovery\n"
+                "No build/test commands are configured for this project. "
+                "Discover them by checking:\n"
+                "- `package.json` → `scripts.test`, `scripts.build`, `scripts.lint`\n"
+                "- `Makefile` or `Taskfile.yml`\n"
+                "- `pyproject.toml` / `setup.py` / `tox.ini`\n"
+                "- `Cargo.toml` (cargo test)\n"
+                "- CI config files (`.github/workflows/`, `.gitlab-ci.yml`)\n\n"
+                "Run the discovered test/build commands to validate the implementation."
+            )
+
+    # ---- CODE PUSH (PR + MERGE) ----
+
+    async def _ensure_code_push(self, workspace_path: str | None) -> bool:
+        """Create a pr_creator subtask if coder work completed without a PR.
+
+        Called after all subtasks complete successfully, before _phase_review.
+        Skips if a PR already exists (e.g. created by the review-loop flow)
+        or if a pr_creator subtask is already pending/running.
+
+        Returns True if a pr_creator subtask was created (caller should execute it).
+        """
+        if not workspace_path:
+            return False
+
+        # Skip if a PR deliverable already exists (review-loop already handled it)
+        existing_pr = await self.db.fetchrow(
+            "SELECT id FROM deliverables WHERE todo_id = $1 AND type = 'pull_request'",
+            self.todo_id,
+        )
+        if existing_pr:
+            return False
+
+        # Skip if a pr_creator subtask already exists
+        existing_pr_task = await self.db.fetchrow(
+            "SELECT id FROM sub_tasks WHERE todo_id = $1 AND agent_role = 'pr_creator' "
+            "AND status IN ('pending', 'assigned', 'running')",
+            self.todo_id,
+        )
+        if existing_pr_task:
+            return False
+
+        # Check for completed coder subtasks (the ones that produced code)
+        coder_subtasks = await self.db.fetch(
+            "SELECT * FROM sub_tasks WHERE todo_id = $1 AND agent_role = 'coder' "
+            "AND status = 'completed' ORDER BY created_at DESC",
+            self.todo_id,
+        )
+        if not coder_subtasks:
+            return False
+
+        all_coder_ids = [str(st["id"]) for st in coder_subtasks]
+        latest_coder = coder_subtasks[0]
+        target_repo_json = latest_coder.get("target_repo")
+        if isinstance(target_repo_json, str):
+            target_repo_json = json.loads(target_repo_json)
+
+        max_order = await self.db.fetchval(
+            "SELECT COALESCE(MAX(execution_order), 0) FROM sub_tasks WHERE todo_id = $1",
+            self.todo_id,
+        )
+
+        await self._post_system_message(
+            "**Code push:** Creating PR sub-task for completed code changes..."
+        )
+
+        await self.db.fetchrow(
+            """
+            INSERT INTO sub_tasks (
+                todo_id, title, description, agent_role,
+                execution_order, depends_on, target_repo
+            )
+            VALUES ($1, $2, $3, 'pr_creator', $4, $5, $6)
+            RETURNING id
+            """,
+            self.todo_id,
+            "Create Pull Request",
+            "Commit all workspace changes, push to a feature branch, and create a pull request.",
+            max_order + 1,
+            all_coder_ids,
+            target_repo_json,
+        )
+
+        return True
+
+    # ---- CANCELLATION CHECK ----
+
+    async def _is_cancelled(self) -> bool:
+        """Check if the todo has been cancelled (e.g., by the user via the API)."""
+        state = await self.db.fetchval(
+            "SELECT state FROM todo_items WHERE id = $1", self.todo_id,
+        )
+        return state == "cancelled"
 

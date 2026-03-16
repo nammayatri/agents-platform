@@ -275,3 +275,21 @@ class SelfHostedProvider(AIProvider):
 
     def estimate_cost(self, tokens_input: int, tokens_output: int, model: str) -> float:
         return 0.0  # self-hosted
+
+    async def list_models(self) -> list[dict]:
+        try:
+            response = await self.client.models.list()
+            models = []
+            for m in response.data:
+                models.append({
+                    "id": m.id,
+                    "name": m.id,
+                    "is_default": m.id == self.default_model,
+                })
+            return sorted(models, key=lambda x: x["id"])
+        except Exception:
+            logger.warning("Failed to list models from self-hosted API, returning configured models")
+            result = [{"id": self.default_model, "name": self.default_model, "is_default": True}]
+            if self.fast_model:
+                result.append({"id": self.fast_model, "name": self.fast_model, "is_default": False})
+            return result

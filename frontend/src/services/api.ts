@@ -8,7 +8,7 @@ import type {
   ProviderCreatePayload, ProviderUpdatePayload,
   GitProviderPayload, SkillPayload, McpServerPayload,
   NotificationChannelPayload, AgentCreatePayload, AgentUpdatePayload,
-  ProjectMember,
+  ProjectMember, DebugContext,
 } from '../types'
 
 const API_BASE = '/api'
@@ -79,6 +79,15 @@ export const projects = {
       request<Record<string, string[]>>(`/projects/${projectId}/rules`, {
         method: 'PUT',
         body: JSON.stringify(rules),
+      }),
+  },
+  debugContext: {
+    get: (projectId: string) =>
+      request<DebugContext>(`/projects/${projectId}/debug-context`),
+    update: (projectId: string, data: DebugContext) =>
+      request<DebugContext>(`/projects/${projectId}/debug-context`, {
+        method: 'PUT',
+        body: JSON.stringify(data),
       }),
   },
   members: {
@@ -178,6 +187,11 @@ export const projectChat = {
         `/projects/${projectId}/chat/sessions/${sessionId}/toggle-plan`,
         { method: 'POST' },
       ),
+    setChatMode: (projectId: string, sessionId: string, mode: string) =>
+      request<{ chat_mode: string; plan_mode: boolean }>(
+        `/projects/${projectId}/chat/sessions/${sessionId}/mode`,
+        { method: 'POST', body: JSON.stringify({ mode }) },
+      ),
     get: (projectId: string, sessionId: string) =>
       request<ChatSession & { messages: ProjectChatMessage[] }>(`/projects/${projectId}/chat/sessions/${sessionId}`),
     update: (projectId: string, sessionId: string, data: { title: string }) =>
@@ -188,10 +202,10 @@ export const projectChat = {
     delete: (projectId: string, sessionId: string) =>
       request<void>(`/projects/${projectId}/chat/sessions/${sessionId}`, { method: 'DELETE' }),
   },
-  sendInSession: (projectId: string, sessionId: string, content: string, intent?: string) =>
+  sendInSession: (projectId: string, sessionId: string, content: string, intent?: string, model?: string) =>
     request<{ user_message: ProjectChatMessage; assistant_message: ProjectChatMessage }>(
       `/projects/${projectId}/chat/sessions/${sessionId}/messages`,
-      { method: 'POST', body: JSON.stringify({ content, intent }) },
+      { method: 'POST', body: JSON.stringify({ content, intent, model: model || undefined }) },
     ),
   deleteSessionMessage: (projectId: string, sessionId: string, messageId: string) =>
     request<{ status: string }>(
@@ -224,6 +238,8 @@ export const providers = {
     request<ProviderConfig>(`/providers/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
   delete: (id: string) => request<void>(`/providers/${id}`, { method: 'DELETE' }),
   test: (id: string) => request<{ status: string; detail?: string }>(`/providers/${id}/test`, { method: 'POST' }),
+  listModels: (id: string) =>
+    request<{ provider_id: string; models: Array<{ id: string; name: string; is_default: boolean }> }>(`/providers/${id}/models`),
 }
 
 // Git Providers
@@ -255,8 +271,12 @@ export const mcpServers = {
     request<McpServer>(`/config/mcp-servers/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
   delete: (id: string) => request<void>(`/config/mcp-servers/${id}`, { method: 'DELETE' }),
   discoverTools: (id: string) =>
-    request<{ status: string; detail?: string; tools: { name: string; description: string }[] }>(
+    request<{ status: string; detail?: string; tools: { name: string; description: string }[]; transport_updated?: string; url_updated?: string }>(
       `/config/mcp-servers/${id}/discover-tools`, { method: 'POST' }
+    ),
+  testConnection: (id: string) =>
+    request<{ status: string; current_transport: string; current_url: string; probes: Record<string, unknown>[]; recommendation: { transport: string; url: string } | null }>(
+      `/config/mcp-servers/${id}/test-connection`, { method: 'POST' }
     ),
 }
 

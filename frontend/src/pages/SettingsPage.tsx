@@ -38,19 +38,19 @@ export default function SettingsPage() {
   ]
 
   return (
-    <div className="p-6 max-w-3xl mx-auto">
+    <div className="p-4 md:p-6 max-w-3xl mx-auto">
       <div className="mb-6">
         <h1 className="text-xl font-semibold text-white">Settings</h1>
         <p className="text-sm text-gray-500 mt-1">Manage providers, skills, MCP servers, and users.</p>
       </div>
 
       {/* Tab bar */}
-      <div className="flex gap-1 mb-6 border-b border-gray-800">
+      <div className="flex gap-1 mb-6 border-b border-gray-800 overflow-x-auto">
         {tabs.map((tab) => (
           <button
             key={tab.key}
             onClick={() => setActiveTab(tab.key)}
-            className={`px-4 py-2 text-sm font-medium transition-colors border-b-2 -mb-px ${
+            className={`px-4 py-2 text-sm font-medium transition-colors border-b-2 -mb-px shrink-0 whitespace-nowrap ${
               activeTab === tab.key
                 ? 'text-indigo-400 border-indigo-400'
                 : 'text-gray-500 border-transparent hover:text-gray-300 hover:border-gray-700'

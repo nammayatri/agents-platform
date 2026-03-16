@@ -1,11 +1,12 @@
 import { create } from 'zustand'
-import type { TodoItem, ChatMessage, Deliverable, SubTask, ProviderConfig } from '../types'
-import { todos as todosApi, chat as chatApi, deliverables as delApi, providers as providersApi } from '../services/api'
+import type { TodoItem, ChatMessage, Deliverable, AgentRun, SubTask, ProviderConfig } from '../types'
+import { todos as todosApi, chat as chatApi, deliverables as delApi, agentRuns as agentRunsApi, providers as providersApi } from '../services/api'
 
 interface TodoState {
   todos: Record<string, TodoItem>
   chatMessages: Record<string, ChatMessage[]>
   deliverablesByTodo: Record<string, Deliverable[]>
+  agentRunsByTodo: Record<string, AgentRun[]>
   providers: ProviderConfig[]
   activeTodoId: string | null
   isLoading: boolean
@@ -13,11 +14,13 @@ interface TodoState {
   createError: string | null
   /** Per-subtask activity log: subtaskId → recent activity strings */
   activityLogs: Record<string, string[]>
+  /** Per-subtask latest LLM response: subtaskId → { content, iteration } */
+  llmResponses: Record<string, { content: string; iteration: number }>
 
   fetchProviders: () => Promise<void>
   fetchTodos: (projectId: string) => Promise<void>
   fetchTodo: (todoId: string) => Promise<void>
-  createTodo: (projectId: string, data: { title: string; description?: string; priority?: string; task_type?: string; ai_provider_id?: string; scheduled_at?: string }) => Promise<TodoItem>
+  createTodo: (projectId: string, data: { title: string; description?: string; priority?: string; task_type?: string; ai_provider_id?: string; ai_model?: string; scheduled_at?: string }) => Promise<TodoItem>
   clearCreateError: () => void
   cancelTodo: (todoId: string) => Promise<void>
   retryTodo: (todoId: string, withContext?: boolean) => Promise<void>
@@ -31,12 +34,15 @@ interface TodoState {
   sendChat: (todoId: string, content: string) => Promise<void>
   appendChatMessage: (todoId: string, msg: ChatMessage) => void
 
+  fetchAgentRuns: (todoId: string) => Promise<void>
   fetchDeliverables: (todoId: string) => Promise<void>
 
-  updateTodoState: (todoId: string, state: string) => void
+  updateTodoState: (todoId: string, state: string, errorMessage?: string) => void
   updateSubTaskProgress: (todoId: string, subTaskId: string, pct: number, message: string) => void
   appendActivity: (subTaskId: string, activity: string) => void
+  batchAppendActivity: (entries: [string, string[]][]) => void
   clearActivity: (subTaskId: string) => void
+  setLlmResponse: (subTaskId: string, content: string, iteration: number) => void
   setActiveTodo: (todoId: string | null) => void
 }
 
@@ -46,12 +52,14 @@ export const useTodoStore = create<TodoState>((set, get) => ({
   todos: {},
   chatMessages: {},
   deliverablesByTodo: {},
+  agentRunsByTodo: {},
   providers: [],
   activeTodoId: null,
   isLoading: false,
   isCreating: false,
   createError: null,
   activityLogs: {},
+  llmResponses: {},
 
   fetchProviders: async () => {
     const items = await providersApi.list() as ProviderConfig[]
@@ -165,15 +173,24 @@ export const useTodoStore = create<TodoState>((set, get) => ({
     set({ chatMessages: { ...get().chatMessages, [todoId]: [...current, msg] } })
   },
 
+  fetchAgentRuns: async (todoId) => {
+    const items = await agentRunsApi.list(todoId) as AgentRun[]
+    set({ agentRunsByTodo: { ...get().agentRunsByTodo, [todoId]: items } })
+  },
+
   fetchDeliverables: async (todoId) => {
     const items = await delApi.list(todoId) as Deliverable[]
     set({ deliverablesByTodo: { ...get().deliverablesByTodo, [todoId]: items } })
   },
 
-  updateTodoState: (todoId, state) => {
+  updateTodoState: (todoId, state, errorMessage) => {
     const { todos } = get()
     if (todos[todoId]) {
-      set({ todos: { ...todos, [todoId]: { ...todos[todoId], state: state as TodoItem['state'] } } })
+      const updated = { ...todos[todoId], state: state as TodoItem['state'] }
+      if (errorMessage) {
+        updated.error_message = errorMessage
+      }
+      set({ todos: { ...todos, [todoId]: updated } })
     }
   },
 
@@ -194,10 +211,25 @@ export const useTodoStore = create<TodoState>((set, get) => ({
     set({ activityLogs: { ...activityLogs, [subTaskId]: updated } })
   },
 
+  batchAppendActivity: (entries) => {
+    const { activityLogs } = get()
+    const next = { ...activityLogs }
+    for (const [subTaskId, newEntries] of entries) {
+      const current = next[subTaskId] || []
+      next[subTaskId] = [...current, ...newEntries].slice(-MAX_ACTIVITY_ENTRIES)
+    }
+    set({ activityLogs: next })
+  },
+
   clearActivity: (subTaskId) => {
     const { activityLogs } = get()
     const { [subTaskId]: _, ...rest } = activityLogs
     set({ activityLogs: rest })
+  },
+
+  setLlmResponse: (subTaskId, content, iteration) => {
+    const { llmResponses } = get()
+    set({ llmResponses: { ...llmResponses, [subTaskId]: { content, iteration } } })
   },
 
   setActiveTodo: (todoId) => set({ activeTodoId: todoId }),

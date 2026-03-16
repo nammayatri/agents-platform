@@ -22,7 +22,9 @@ export default function McpServersTab({ isAdmin: _isAdmin }: Props) {
   })
 
   const [discoveringMcpId, setDiscoveringMcpId] = useState<string | null>(null)
-  const [mcpToolsResult, setMcpToolsResult] = useState<{ id: string; tools: McpTool[]; error?: string } | null>(null)
+  const [testingMcpId, setTestingMcpId] = useState<string | null>(null)
+  const [mcpToolsResult, setMcpToolsResult] = useState<{ id: string; tools: McpTool[]; error?: string; transportUpdated?: string; urlUpdated?: string } | null>(null)
+  const [mcpTestResult, setMcpTestResult] = useState<{ id: string; probes: { path?: string; status?: number; content_type?: string; supports_sse?: boolean; supports_streamable_http?: boolean; error?: string }[]; recommendation: { transport: string; url: string } | null } | null>(null)
   const [expandedMcpId, setExpandedMcpId] = useState<string | null>(null)
 
   useEffect(() => {
@@ -32,13 +34,19 @@ export default function McpServersTab({ isAdmin: _isAdmin }: Props) {
   const handleDiscoverTools = async (id: string) => {
     setDiscoveringMcpId(id)
     setMcpToolsResult(null)
+    setMcpTestResult(null)
     try {
       const result = await mcpApi.discoverTools(id)
       if (result.status === 'ok') {
-        setMcpToolsResult({ id, tools: result.tools })
-        // Update the local list with discovered tools
+        setMcpToolsResult({ id, tools: result.tools, transportUpdated: result.transport_updated, urlUpdated: result.url_updated })
+        // Update the local list with discovered tools (and transport/url if auto-detected)
         setMcpList(mcpList.map((m) =>
-          m.id === id ? { ...m, tools_json: result.tools } : m
+          m.id === id ? {
+            ...m,
+            tools_json: result.tools,
+            ...(result.transport_updated ? { transport: result.transport_updated as McpServer['transport'] } : {}),
+            ...(result.url_updated ? { url: result.url_updated } : {}),
+          } : m
         ))
       } else {
         setMcpToolsResult({ id, tools: [], error: result.detail || 'Discovery failed' })
@@ -47,6 +55,21 @@ export default function McpServersTab({ isAdmin: _isAdmin }: Props) {
       setMcpToolsResult({ id, tools: [], error: err instanceof Error ? err.message : 'Request failed' })
     } finally {
       setDiscoveringMcpId(null)
+    }
+  }
+
+  const handleTestConnection = async (id: string) => {
+    setTestingMcpId(id)
+    setMcpTestResult(null)
+    setMcpToolsResult(null)
+    try {
+      const result = await mcpApi.testConnection(id)
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      setMcpTestResult({ id, probes: result.probes as any, recommendation: result.recommendation })
+    } catch {
+      setMcpTestResult({ id, probes: [], recommendation: null })
+    } finally {
+      setTestingMcpId(null)
     }
   }
 
@@ -137,6 +160,9 @@ export default function McpServersTab({ isAdmin: _isAdmin }: Props) {
               : []
           const isExpanded = expandedMcpId === m.id
           const discoveryError = mcpToolsResult?.id === m.id ? mcpToolsResult.error : undefined
+          const transportUpdated = mcpToolsResult?.id === m.id ? mcpToolsResult.transportUpdated : undefined
+          const testResult = mcpTestResult?.id === m.id ? mcpTestResult : null
+          const isHttpTransport = m.transport === 'sse' || m.transport === 'streamable-http'
 
           return (
             <div key={m.id}>
@@ -163,10 +189,19 @@ export default function McpServersTab({ isAdmin: _isAdmin }: Props) {
                       )}
                     </div>
                     <div className="text-xs text-gray-500 mt-0.5 font-mono truncate">
-                      {m.transport === 'sse' || m.transport === 'streamable-http' ? m.url : `${m.command} ${m.args.join(' ')}`}
+                      {isHttpTransport ? m.url : `${m.command} ${m.args.join(' ')}`}
                     </div>
                   </div>
                   <div className="flex gap-2">
+                    {isHttpTransport && (
+                      <button
+                        onClick={() => handleTestConnection(m.id)}
+                        disabled={testingMcpId === m.id}
+                        className="px-2 py-1 text-xs text-gray-400 hover:text-white transition-colors disabled:opacity-50"
+                      >
+                        {testingMcpId === m.id ? 'Testing...' : 'Test'}
+                      </button>
+                    )}
                     <button
                       onClick={() => handleDiscoverTools(m.id)}
                       disabled={discoveringMcpId === m.id}
@@ -186,6 +221,15 @@ export default function McpServersTab({ isAdmin: _isAdmin }: Props) {
                   </div>
                 </div>
 
+                {transportUpdated && (
+                  <div className="mt-2 px-3 py-2 rounded text-xs bg-amber-900/30 text-amber-400 border border-amber-800/50">
+                    Transport auto-updated to <span className="font-mono font-medium">{transportUpdated}</span>
+                    {mcpToolsResult?.urlUpdated && (
+                      <> at <span className="font-mono font-medium">{mcpToolsResult.urlUpdated}</span></>
+                    )}
+                  </div>
+                )}
+
                 {discoveryError && (
                   <div className="mt-2 px-3 py-2 rounded text-xs bg-red-900/30 text-red-400 border border-red-800/50">
                     <div className="flex items-center justify-between">
@@ -193,6 +237,33 @@ export default function McpServersTab({ isAdmin: _isAdmin }: Props) {
                       <button onClick={() => setMcpToolsResult(null)} className="text-gray-500 hover:text-gray-300 ml-2">x</button>
                     </div>
                     <div className="mt-1 text-[11px] opacity-80 font-mono break-all">{discoveryError}</div>
+                  </div>
+                )}
+
+                {testResult && (
+                  <div className="mt-2 px-3 py-2 rounded text-xs border border-gray-700 bg-gray-950">
+                    <div className="flex items-center justify-between mb-2">
+                      <span className="font-medium text-gray-300">Connection Test Results</span>
+                      <button onClick={() => setMcpTestResult(null)} className="text-gray-500 hover:text-gray-300">x</button>
+                    </div>
+                    <div className="space-y-1">
+                      {testResult.probes.map((p, i) => (
+                        <div key={i} className="flex items-center gap-2 font-mono text-[11px]">
+                          <span className={`w-8 text-right ${p.status === 200 ? 'text-emerald-400' : p.status ? 'text-red-400' : 'text-gray-600'}`}>
+                            {p.status || 'ERR'}
+                          </span>
+                          <span className="text-gray-400">{p.path}</span>
+                          {p.content_type && <span className="text-gray-600 truncate">{p.content_type.split(';')[0]}</span>}
+                          {p.supports_sse && <span className="text-emerald-400">SSE</span>}
+                          {p.supports_streamable_http && <span className="text-emerald-400">Streamable-HTTP</span>}
+                        </div>
+                      ))}
+                    </div>
+                    {testResult.recommendation && (
+                      <div className="mt-2 pt-2 border-t border-gray-800 text-emerald-400">
+                        Recommended: <span className="font-mono font-medium">{testResult.recommendation.transport}</span> at <span className="font-mono font-medium">{testResult.recommendation.url}</span>
+                      </div>
+                    )}
                   </div>
                 )}
 

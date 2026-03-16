@@ -125,6 +125,28 @@ async def test_provider(provider_id: str, user: CurrentUser, db: DB):
         return {"status": "error", "detail": str(e)}
 
 
+@router.get("/{provider_id}/models")
+async def list_provider_models(provider_id: str, user: CurrentUser, db: DB):
+    """List available models for a provider."""
+    from agents.providers.registry import ProviderRegistry
+
+    config = await db.fetchrow(
+        "SELECT id, owner_id FROM ai_provider_configs WHERE id = $1", provider_id
+    )
+    if not config:
+        raise HTTPException(status_code=404)
+    if config["owner_id"] and str(config["owner_id"]) != str(user["id"]):
+        raise HTTPException(status_code=403)
+
+    registry = ProviderRegistry(db)
+    try:
+        provider = await registry.instantiate(provider_id)
+        models = await provider.list_models()
+        return {"provider_id": provider_id, "models": models}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to list models: {e}")
+
+
 # --- Notification Channels ---
 
 

@@ -179,3 +179,15 @@ class OpenAIProvider(AIProvider):
     def estimate_cost(self, tokens_input: int, tokens_output: int, model: str) -> float:
         pricing = PRICING.get(model, {"input": 2.50, "output": 10.0})
         return (tokens_input * pricing["input"] + tokens_output * pricing["output"]) / 1_000_000
+
+    async def list_models(self) -> list[dict]:
+        known = [
+            {"id": "gpt-4o", "name": "GPT-4o"},
+            {"id": "gpt-4o-mini", "name": "GPT-4o Mini"},
+            {"id": "o3", "name": "O3"},
+            {"id": "o3-mini", "name": "O3 Mini"},
+        ]
+        return [
+            {**m, "is_default": m["id"] == self.default_model}
+            for m in known
+        ]

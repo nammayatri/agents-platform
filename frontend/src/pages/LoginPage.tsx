@@ -28,7 +28,7 @@ export default function LoginPage() {
 
   return (
     <div className="min-h-screen flex items-center justify-center bg-gray-950">
-      <div className="w-full max-w-sm p-6 bg-gray-900 rounded-lg border border-gray-800">
+      <div className="w-full max-w-sm mx-4 md:mx-0 p-6 bg-gray-900 rounded-lg border border-gray-800">
         <h1 className="text-xl font-bold text-white mb-6">
           {isRegister ? 'Create Account' : 'Sign In'}
         </h1>

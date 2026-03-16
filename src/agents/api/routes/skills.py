@@ -227,7 +227,17 @@ async def discover_mcp_tools(server_id: str, user: CurrentUser, db: DB):
             url = server.get("url")
             if not url:
                 raise ValueError("URL is required for SSE/HTTP transport")
-            tools = await _discover_tools_http(url, transport)
+            tools, new_transport, new_url = await _discover_tools_http_with_fallback(url, transport)
+            # If transport/URL changed via fallback, update the server config
+            if new_transport != transport or new_url != url:
+                logger.info("MCP discovery: auto-detected transport change for %s: %s %s -> %s %s",
+                            server_id, transport, url, new_transport, new_url)
+                await db.execute(
+                    "UPDATE mcp_servers SET transport = $2, url = $3, updated_at = NOW() WHERE id = $1",
+                    server_id, new_transport, new_url,
+                )
+                transport = new_transport
+                url = new_url
         else:
             raise ValueError(f"Unknown transport: {transport}")
 
@@ -238,11 +248,16 @@ async def discover_mcp_tools(server_id: str, user: CurrentUser, db: DB):
             json.dumps(tools),
         )
 
-        return {"status": "ok", "tools": tools}
+        result = {"status": "ok", "tools": tools}
+        if transport != server.get("transport") or url != server.get("url"):
+            result["transport_updated"] = transport
+            result["url_updated"] = url
+        return result
 
     except Exception as e:
-        logger.warning("MCP tool discovery failed for %s: %s", server_id, e)
-        return {"status": "error", "detail": str(e), "tools": []}
+        logger.warning("MCP tool discovery failed for %s: %s: %s", server_id, type(e).__name__, e)
+        detail = str(e) or f"{type(e).__name__}"
+        return {"status": "error", "detail": detail, "tools": []}
 
 
 async def _discover_tools_stdio(
@@ -341,6 +356,54 @@ async def _read_jsonrpc_line(stdout: asyncio.StreamReader) -> dict:
             continue
 
 
+async def _discover_tools_http_with_fallback(
+    url: str, transport: str,
+) -> tuple[list[dict], str, str]:
+    """Discover tools, falling back to alternate transport if primary fails.
+
+    Returns (tools, effective_transport, effective_url).
+    """
+    from urllib.parse import urlparse, urlunparse
+
+    parsed = urlparse(url)
+    base_url = urlunparse((parsed.scheme, parsed.netloc, "", "", "", ""))
+
+    # Primary attempt
+    primary_error = None
+    try:
+        tools = await _discover_tools_http(url, transport)
+        return tools, transport, url
+    except Exception as e:
+        primary_error = e
+        logger.warning("MCP discovery primary (%s @ %s) failed: %s", transport, url, e)
+
+    # Fallback: try the other transport at common paths
+    fallback_attempts: list[tuple[str, str]] = []
+    if transport == "sse":
+        # SSE failed — try streamable-http at /mcp and base URL
+        fallback_attempts.append(("streamable-http", base_url + "/mcp"))
+        if parsed.path != "/mcp":
+            fallback_attempts.append(("streamable-http", base_url))
+    else:
+        # streamable-http failed — try SSE at /sse
+        fallback_attempts.append(("sse", base_url + "/sse"))
+        if parsed.path != "/sse":
+            fallback_attempts.append(("sse", base_url))
+
+    for fb_transport, fb_url in fallback_attempts:
+        try:
+            logger.info("MCP discovery fallback: trying %s @ %s", fb_transport, fb_url)
+            tools = await _discover_tools_http(fb_url, fb_transport)
+            logger.info("MCP discovery fallback succeeded: %s @ %s", fb_transport, fb_url)
+            return tools, fb_transport, fb_url
+        except Exception as fb_err:
+            logger.debug("MCP discovery fallback (%s @ %s) failed: %s", fb_transport, fb_url, fb_err)
+            continue
+
+    # All attempts failed — raise the primary error
+    raise primary_error
+
+
 async def _discover_tools_http(url: str, transport: str) -> list[dict]:
     """Discover tools from an SSE or streamable-http MCP server."""
     import httpx
@@ -348,34 +411,55 @@ async def _discover_tools_http(url: str, transport: str) -> list[dict]:
     if transport == "sse":
         return await _discover_tools_sse(url)
 
-    # streamable-http: POST JSON-RPC directly
-    async with httpx.AsyncClient(timeout=30) as client:
-        init_body = {
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "initialize",
+    return await _discover_tools_streamable_http(url)
+
+
+async def _discover_tools_streamable_http(url: str) -> list[dict]:
+    """Discover tools from a streamable-http MCP server.
+
+    Streamable-HTTP servers may return responses as SSE streams (text/event-stream)
+    which stay open. We must use streaming reads to avoid hanging.
+    """
+    import httpx
+
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream",
+    }
+
+    async with httpx.AsyncClient(
+        timeout=httpx.Timeout(30.0, connect=30.0), verify=False,
+    ) as client:
+        # 1. Initialize
+        init_resp, init_headers = await _streamable_post(client, url, {
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
             "params": {
-                "protocolVersion": "2024-11-05",
+                "protocolVersion": "2025-03-26",
                 "capabilities": {},
                 "clientInfo": {"name": "agents-platform", "version": "0.1.0"},
             },
-        }
-        resp = await client.post(url, json=init_body)
-        resp.raise_for_status()
-        init_resp = resp.json()
+        }, headers)
         if "error" in init_resp:
             raise ValueError(f"MCP initialize error: {init_resp['error']}")
 
-        # Send tools/list
-        tools_body = {
-            "jsonrpc": "2.0",
-            "id": 2,
-            "method": "tools/list",
-            "params": {},
-        }
-        resp = await client.post(url, json=tools_body)
-        resp.raise_for_status()
-        tools_resp = resp.json()
+        # Capture session ID for subsequent requests (MCP spec requirement)
+        session_id = init_headers.get("mcp-session-id")
+        if session_id:
+            headers = {**headers, "mcp-session-id": session_id}
+            logger.info("MCP streamable-http: session_id=%s", session_id)
+
+        # 2. Send initialized notification (fire-and-forget, no response expected)
+        try:
+            await _streamable_post(client, url, {
+                "jsonrpc": "2.0", "method": "notifications/initialized",
+            }, headers, expect_response=False)
+        except Exception:
+            pass  # Notifications may not return anything
+
+        # 3. tools/list
+        tools_resp, _ = await _streamable_post(client, url, {
+            "jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {},
+        }, headers)
         if "error" in tools_resp:
             raise ValueError(f"MCP tools/list error: {tools_resp['error']}")
 
@@ -388,6 +472,55 @@ async def _discover_tools_http(url: str, transport: str) -> list[dict]:
             }
             for t in tools
         ]
+
+
+async def _streamable_post(
+    client, url: str, body: dict, headers: dict, *,
+    expect_response: bool = True, timeout: float = 15,
+) -> tuple[dict, dict]:
+    """POST a JSON-RPC message and handle both JSON and SSE-stream responses.
+
+    Returns (json_response, response_headers_dict).
+    For SSE streams, reads line-by-line until a JSON-RPC response arrives,
+    then closes the stream immediately to avoid hanging.
+    """
+
+    req = client.build_request("POST", url, content=json.dumps(body), headers=headers)
+    resp = await client.send(req, stream=True)
+    resp.raise_for_status()
+
+    content_type = resp.headers.get("content-type", "")
+    resp_headers = dict(resp.headers)
+
+    try:
+        if "text/event-stream" in content_type:
+            if not expect_response:
+                return {}, resp_headers
+            deadline = asyncio.get_event_loop().time() + timeout
+            async for raw_line in resp.aiter_lines():
+                if asyncio.get_event_loop().time() > deadline:
+                    raise TimeoutError("Timed out reading SSE response")
+                line = raw_line.strip()
+                if line.startswith("data:"):
+                    data = line[5:].strip()
+                    if not data:
+                        continue
+                    try:
+                        msg = json.loads(data)
+                        if "id" in msg:
+                            return msg, resp_headers
+                    except json.JSONDecodeError:
+                        continue
+            if not expect_response:
+                return {}, resp_headers
+            raise ValueError("SSE stream ended without JSON-RPC response")
+        else:
+            raw = await resp.aread()
+            if not expect_response:
+                return {}, resp_headers
+            return json.loads(raw), resp_headers
+    finally:
+        await resp.aclose()
 
 
 async def _discover_tools_sse(url: str) -> list[dict]:
@@ -413,21 +546,29 @@ async def _discover_tools_sse(url: str) -> list[dict]:
         try:
             async for chunk in resp.aiter_bytes():
                 buf += chunk
+                # Normalize CRLF → LF (SSE spec allows both)
+                buf = buf.replace(b"\r\n", b"\n")
                 while b"\n\n" in buf:
                     block, buf = buf.split(b"\n\n", 1)
-                    etype = edata = None
+                    etype = None
+                    data_lines: list[str] = []
                     for line in block.decode(errors="replace").strip().split("\n"):
+                        if line.startswith(":"):
+                            continue  # SSE comment
                         if line.startswith("event:"):
                             etype = line[6:].strip()
                         elif line.startswith("data:"):
-                            edata = line[5:].strip()
-                    if etype and edata:
-                        await events.put((etype, edata))
+                            data_lines.append(line[5:].strip())
+                    edata = "\n".join(data_lines) if data_lines else None
+                    # SSE spec: default event type is "message"
+                    if edata is not None:
+                        await events.put((etype or "message", edata))
         except Exception as exc:
             await events.put(("error", str(exc)))
 
     async with httpx.AsyncClient(
-        timeout=httpx.Timeout(60.0, connect=10.0), follow_redirects=True,
+        timeout=httpx.Timeout(60.0, connect=30.0), follow_redirects=True,
+        verify=False,
     ) as client:
         # Open the SSE stream
         req = client.build_request("GET", url, headers={"Accept": "text/event-stream"})
@@ -509,6 +650,120 @@ async def _wait_for_jsonrpc_response(
                     return msg
             except json.JSONDecodeError:
                 continue
+
+
+@router.post("/mcp-servers/{server_id}/test-connection")
+async def test_mcp_connection(server_id: str, user: CurrentUser, db: DB):
+    """Test connectivity to an MCP server and return diagnostic info."""
+    import httpx
+
+    row = await db.fetchrow("SELECT * FROM mcp_servers WHERE id = $1", server_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="MCP server not found")
+    if str(row["owner_id"]) != str(user["id"]):
+        raise HTTPException(status_code=403, detail="Access denied")
+
+    server = dict(row)
+    transport = server.get("transport", "stdio")
+    url = server.get("url", "")
+
+    if transport == "stdio":
+        return {"status": "ok", "transport": "stdio", "message": "Stdio servers are tested during tool discovery"}
+
+    if not url:
+        return {"status": "error", "message": "No URL configured"}
+
+    from urllib.parse import urlparse, urlunparse
+    parsed = urlparse(url)
+    base_url = urlunparse((parsed.scheme, parsed.netloc, "", "", "", ""))
+
+    results = []
+
+    # Probe common endpoints
+    probe_paths = [
+        parsed.path,  # configured path
+        "/mcp",
+        "/sse",
+        "/health",
+        "/ping",
+    ]
+    # Deduplicate while preserving order
+    seen = set()
+    unique_paths = []
+    for p in probe_paths:
+        if p and p not in seen:
+            seen.add(p)
+            unique_paths.append(p)
+
+    async with httpx.AsyncClient(timeout=30, verify=False, follow_redirects=True) as client:
+        for path in unique_paths:
+            probe_url = base_url + path
+            try:
+                resp = await client.get(probe_url, headers={"Accept": "text/event-stream, application/json, */*"})
+                content_type = resp.headers.get("content-type", "")
+                results.append({
+                    "path": path,
+                    "url": probe_url,
+                    "status": resp.status_code,
+                    "content_type": content_type,
+                    "body_preview": resp.text[:200] if resp.status_code < 400 else resp.text[:500],
+                    "supports_sse": "text/event-stream" in content_type,
+                })
+            except Exception as e:
+                results.append({
+                    "path": path,
+                    "url": probe_url,
+                    "status": None,
+                    "error": str(e),
+                })
+
+        # Try streamable-http POST to /mcp
+        mcp_url = base_url + "/mcp"
+        try:
+            resp = await client.post(
+                mcp_url,
+                content=json.dumps({
+                    "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2024-11-05",
+                        "capabilities": {},
+                        "clientInfo": {"name": "agents-platform", "version": "0.1.0"},
+                    },
+                }),
+                headers={"Content-Type": "application/json", "Accept": "application/json, text/event-stream"},
+            )
+            results.append({
+                "path": "/mcp (POST initialize)",
+                "url": mcp_url,
+                "status": resp.status_code,
+                "content_type": resp.headers.get("content-type", ""),
+                "body_preview": resp.text[:500],
+                "supports_streamable_http": resp.status_code == 200,
+            })
+        except Exception as e:
+            results.append({
+                "path": "/mcp (POST initialize)",
+                "url": mcp_url,
+                "error": str(e),
+            })
+
+    # Determine recommendation
+    recommendation = None
+    for r in results:
+        if r.get("supports_streamable_http"):
+            recommendation = {"transport": "streamable-http", "url": mcp_url}
+            break
+        if r.get("supports_sse") and r.get("status") == 200:
+            recommendation = {"transport": "sse", "url": r["url"]}
+            break
+
+    return {
+        "status": "ok",
+        "current_transport": transport,
+        "current_url": url,
+        "probes": results,
+        "recommendation": recommendation,
+    }
 
 
 # ── Per-project enablement ──────────────────────────────────────────

@@ -123,6 +123,98 @@ _register_tool(BuiltinToolDef(
 ))
 
 
+_register_tool(BuiltinToolDef(
+    name="edit_file",
+    description=(
+        "Apply a targeted edit to a file by replacing an exact string match. "
+        "More efficient than write_file for small changes to large files — "
+        "you only specify the old text and the new replacement. "
+        "Path is relative to repo root."
+    ),
+    input_schema={
+        "type": "object",
+        "properties": {
+            "path": {"type": "string", "description": "File path relative to repo root"},
+            "old_text": {
+                "type": "string",
+                "description": "The exact text to find and replace (must match uniquely in the file)",
+            },
+            "new_text": {
+                "type": "string",
+                "description": "The replacement text",
+            },
+        },
+        "required": ["path", "old_text", "new_text"],
+    },
+    prompt_hint=(
+        "Apply a surgical edit to a file — replace an exact string match with new text. "
+        "More efficient than rewriting the whole file. Args: path, old_text, new_text"
+    ),
+    example='edit_file(path="src/main.py", old_text="def old_func():", new_text="def new_func():")',
+))
+
+_register_tool(BuiltinToolDef(
+    name="create_subtask",
+    description=(
+        "Create a new subtask under the current task. Use this when you want to "
+        "break your work into smaller parallel pieces. The new subtask will be "
+        "picked up and executed by a specialist agent. "
+        "Returns the ID of the created subtask."
+    ),
+    input_schema={
+        "type": "object",
+        "properties": {
+            "title": {"type": "string", "description": "Short descriptive title for the subtask"},
+            "description": {
+                "type": "string",
+                "description": (
+                    "Detailed instructions for the agent. Include file paths, "
+                    "code patterns, and expected outcome."
+                ),
+            },
+            "agent_role": {
+                "type": "string",
+                "description": "Agent role: coder, tester, reviewer, debugger",
+                "enum": ["coder", "tester", "reviewer", "debugger"],
+            },
+        },
+        "required": ["title", "description", "agent_role"],
+    },
+    prompt_hint=(
+        "Create a child subtask for parallel work. "
+        "Args: title, description (detailed instructions), agent_role (coder/tester/reviewer)"
+    ),
+    example='create_subtask(title="Add unit tests for auth module", '
+            'description="Write pytest tests for src/auth.py covering login, logout, token refresh", '
+            'agent_role="tester")',
+))
+
+
+_register_tool(BuiltinToolDef(
+    name="task_complete",
+    description=(
+        "Signal that you have finished your work. Call this when you believe "
+        "your task is done — all code changes are written, tests pass, etc. "
+        "This stops the iteration loop. Provide a brief summary of what you did."
+    ),
+    input_schema={
+        "type": "object",
+        "properties": {
+            "summary": {
+                "type": "string",
+                "description": "Brief summary of what was accomplished",
+            },
+        },
+        "required": ["summary"],
+    },
+    prompt_hint=(
+        "Signal task completion and stop the iteration loop. "
+        "Call this when ALL your work is done. Args: summary"
+    ),
+    example='task_complete(summary="Implemented the auth module with login/logout endpoints and added tests")',
+))
+
+
 def get_builtin_tool_defs(role: str) -> list[BuiltinToolDef]:
     """Return the BuiltinToolDef objects granted to *role*."""
     names = get_default_tools(role)
@@ -219,17 +311,27 @@ _register(AgentDefinition(
         "## Workflow\n"
         "1. Use `read_file` and `list_directory` to understand the existing codebase\n"
         "2. Use `search_files` to find relevant patterns and usages\n"
-        "3. Use `write_file` to create or modify files with your changes\n"
+        "3. Use `edit_file` for targeted changes to existing files (surgical find-and-replace)\n"
+        "   Use `write_file` only when creating new files or rewriting most of a file\n"
         "4. Use `run_command` to verify your changes (build, lint, test)\n\n"
+        "## Splitting Work\n"
+        "If your task is large or has independent parts that could be done in parallel, "
+        "you can use `create_subtask` to spawn child subtasks for other agents:\n"
+        "- Create subtasks for independent pieces (e.g., separate modules, separate test files)\n"
+        "- Each subtask should be self-contained with clear instructions\n"
+        "- Include specific file paths, patterns, and expected outcomes in the description\n"
+        "- You can create coder, tester, or reviewer subtasks\n"
+        "- After creating subtasks, focus on your own portion of the work\n\n"
         "## Rules\n"
-        "- ALWAYS use `write_file` to apply changes — never just describe code in text\n"
+        "- ALWAYS use tools to apply changes — never just describe code in text\n"
+        "- Prefer `edit_file` for modifying existing files — it's faster and less error-prone than rewriting\n"
+        "- Use `write_file` only for new files or when most of the file content changes\n"
         "- Read files before modifying them to understand the current state\n"
-        "- Write complete file contents (not partial snippets)\n"
         "- Follow the project's existing patterns and conventions\n"
         "- Include necessary imports and error handling\n"
         "- Only add comments for non-obvious logic"
     ),
-    default_tools=["read_file", "write_file", "list_directory", "search_files", "run_command"],
+    default_tools=["read_file", "write_file", "edit_file", "list_directory", "search_files", "run_command", "create_subtask", "task_complete"],
     tool_rule_categories=["coding", "quality", "general"],
 ))
 
@@ -243,14 +345,16 @@ _register(AgentDefinition(
         "1. Use `read_file` to understand the implementation being tested\n"
         "2. Use `search_files` to find existing test patterns\n"
         "3. Use `write_file` to create or update test files\n"
-        "4. Use `run_command` to execute the tests and verify they pass\n\n"
+        "4. Use `run_command` to execute the tests and verify they pass\n"
+        "5. If project build/test commands are provided below, run ALL of them\n\n"
         "## Rules\n"
         "- ALWAYS use `write_file` to create test files — never just output code as text\n"
         "- Cover happy paths, edge cases, and error conditions\n"
         "- Follow the project's existing test conventions and framework\n"
-        "- Run tests after writing them to confirm they pass"
+        "- Run tests after writing them to confirm they pass\n"
+        "- If build/test commands are provided in the prompt, you MUST run them all and report results"
     ),
-    default_tools=["read_file", "write_file", "list_directory", "search_files", "run_command"],
+    default_tools=["read_file", "write_file", "list_directory", "search_files", "run_command", "task_complete"],
     tool_rule_categories=["testing", "quality", "general"],
 ))
 
@@ -261,17 +365,19 @@ _register(AgentDefinition(
     system_prompt=(
         "You are a code reviewer. You MUST use the provided tools to read and examine code.\n\n"
         "## Workflow\n"
-        "1. Use `read_file` to examine the changed files\n"
-        "2. Use `search_files` to understand how changes affect the rest of the codebase\n"
-        "3. Use `run_command` to check build status, run linting, or run tests\n"
-        "4. Use `run_command` with `git diff` to see exactly what changed\n\n"
+        "1. Run `git diff` (or `git diff HEAD~1 HEAD`) to see exactly what changed\n"
+        "2. Use `read_file` if required to examine the changed files in full context\n"
+        "3. Use `search_files` to understand how changes affect the rest of the codebase\n"
+        "4. Use `run_command` to check build status, run linting, or run tests\n\n"
         "## Rules\n"
-        "- ALWAYS read the actual files before reviewing — never review blindly\n"
+        "- ALWAYS read the actual files and git diff before reviewing — never review blindly\n"
         "- Check for bugs, security issues, performance, and correctness\n"
         "- Be specific and constructive in your feedback\n"
+        "- For EVERY issue, specify the exact file path and line number where the issue is\n"
+        "- Include a concrete suggestion for how to fix each issue\n"
         "- If the code works correctly and follows good practices, approve it"
     ),
-    default_tools=["read_file", "list_directory", "search_files", "run_command"],
+    default_tools=["read_file", "list_directory", "search_files", "run_command", "task_complete"],
     tool_rule_categories=["review", "quality", "general"],
 ))
 
@@ -283,7 +389,7 @@ _register(AgentDefinition(
         "PR description writer. Create a clear PR description with summary, "
         "changes, testing done, and reviewer notes."
     ),
-    default_tools=["read_file", "list_directory", "search_files"],
+    default_tools=["read_file", "list_directory", "search_files", "task_complete"],
 ))
 
 _register(AgentDefinition(
@@ -294,7 +400,7 @@ _register(AgentDefinition(
         "Technical writer. Create a clear, structured report with key findings "
         "and recommendations."
     ),
-    default_tools=["read_file", "list_directory", "search_files"],
+    default_tools=["read_file", "list_directory", "search_files", "task_complete"],
 ))
 
 _register(AgentDefinition(
@@ -303,6 +409,52 @@ _register(AgentDefinition(
     description="Merges approved PRs, checks CI status, and runs post-merge builds",
     system_prompt="Merge agent. Review CI status and merge approved pull requests.",
     default_tools=["read_file", "list_directory", "run_command"],
+))
+
+DEBUGGER_SYSTEM_PROMPT = """\
+You are a senior debugging engineer. You MUST use the provided tools to investigate bugs, \
+errors, and performance issues.
+
+## Investigation Workflow
+1. **Understand the bug report** — read the task description carefully for symptoms, error \
+messages, affected components, and reproduction steps.
+2. **Check logs** — if log sources are provided, use `run_command` to read relevant log files \
+or run log commands. Search for error patterns, timestamps, and stack traces.
+3. **Query data sources** — if MCP data hints are provided (e.g., ClickHouse tables, metrics), \
+use the available MCP tools to query for relevant data. Follow the example queries as a starting point.
+4. **Explore the codebase** — use `read_file`, `search_files`, and `list_directory` to trace \
+the code path that triggers the bug. Follow the call chain from the error back to the root cause.
+5. **Reproduce** — use `run_command` to try reproducing the issue if possible (run tests, \
+curl endpoints, etc.).
+6. **Root cause analysis** — identify the exact root cause with evidence from logs, data, \
+and code.
+7. **Fix (if appropriate)** — if the fix is clear and safe, use `write_file` to apply it. \
+Otherwise, document the root cause and recommend next steps.
+8. **Verify** — if a fix was applied, run tests to confirm it resolves the issue.
+
+## When No Debug Context Is Configured
+If no log sources or MCP hints are provided, fall back to:
+- Search the codebase for the error message or pattern
+- Check for recent git changes that may have introduced the bug
+- Look for common issues: missing error handling, race conditions, null references, \
+configuration mismatches
+- Check test output for related failures
+
+## Rules
+- ALWAYS use tools — never guess without reading actual code, logs, or data
+- Collect evidence before concluding — cite specific log lines, query results, or code paths
+- Be precise about file paths and line numbers in your findings
+- If you apply a fix, keep it minimal and focused on the root cause
+- If unsure, recommend further investigation rather than guessing
+"""
+
+_register(AgentDefinition(
+    role="debugger",
+    display_name="Debugger",
+    description="Debugs issues using logs, metrics, database queries, and VM access",
+    system_prompt=DEBUGGER_SYSTEM_PROMPT,
+    default_tools=["read_file", "write_file", "edit_file", "list_directory", "search_files", "run_command", "create_subtask", "task_complete"],
+    tool_rule_categories=["debugging", "coding", "general"],
 ))
 
 PLANNER_CHAT_PROMPT = """\
@@ -327,6 +479,8 @@ setup, API client, each screen, config, error handling, tests, etc. — NOT 7 se
 
 AGENT ROLES:
 - **coder** — Implements code, fixes bugs, adds features. Use for all code changes.
+- **debugger** — Investigates and fixes bugs using logs, metrics, database queries, and VM access. \
+Use for bug reports, error investigations, production incidents, and performance issues.
 - **tester** — Writes and runs tests. Use after coder sub_tasks to validate changes.
 - **reviewer** — Reviews code quality, checks for bugs/security. Use for important changes.
 - **pr_creator** — Creates pull request descriptions.

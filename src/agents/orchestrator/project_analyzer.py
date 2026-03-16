@@ -444,9 +444,11 @@ class ProjectAnalyzer:
         current_settings = current["settings_json"] if current else {}
         if isinstance(current_settings, str):
             current_settings = json.loads(current_settings)
+        if not isinstance(current_settings, dict):
+            current_settings = {}
         current_settings.update(updates)
         await self.db.execute(
-            "UPDATE projects SET settings_json = $2::jsonb, updated_at = NOW() WHERE id = $1",
+            "UPDATE projects SET settings_json = $2, updated_at = NOW() WHERE id = $1",
             project_id,
-            json.dumps(current_settings, default=str),
+            current_settings,
         )

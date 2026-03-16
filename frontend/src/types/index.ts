@@ -6,11 +6,32 @@ export interface User {
   avatar_url?: string
 }
 
+export interface DebugLogSource {
+  service_name: string
+  log_path?: string
+  log_command?: string
+  description?: string
+}
+
+export interface DebugMcpHint {
+  mcp_server_name: string
+  available_data?: string[]
+  example_queries?: string[]
+  notes?: string
+}
+
+export interface DebugContext {
+  log_sources?: DebugLogSource[]
+  mcp_hints?: DebugMcpHint[]
+  custom_instructions?: string
+}
+
 export interface ProjectDependency {
   name: string
   repo_url?: string
   description?: string
   git_provider_id?: string
+  debug_context?: DebugContext
 }
 
 export type GitProviderType = 'github' | 'gitlab' | 'bitbucket' | 'custom'
@@ -41,6 +62,7 @@ export interface Project {
     work_rules?: WorkRules
     build_commands?: string[]
     merge_method?: 'merge' | 'squash' | 'rebase'
+    debug_context?: DebugContext
     project_understanding?: {
       summary?: string
       purpose?: string
@@ -73,6 +95,7 @@ export interface IterationLogEntry {
   files_changed?: string[]
   stuck_check?: { stuck: boolean; pattern?: string; advice?: string } | null
   tokens_used: number
+  llm_response?: string | null
 }
 
 export interface SubTask {
@@ -83,7 +106,7 @@ export interface SubTask {
   description?: string
   agent_role: string
   execution_order: number
-  status: 'pending' | 'assigned' | 'running' | 'completed' | 'failed'
+  status: 'pending' | 'assigned' | 'running' | 'completed' | 'failed' | 'cancelled'
   progress_pct: number
   progress_message?: string
   error_message?: string
@@ -137,6 +160,7 @@ export interface TodoItem {
   intake_data?: Record<string, unknown>
   plan_json?: PlanData
   ai_provider_id?: string
+  ai_model?: string
   state: TodoState
   sub_state?: string
   state_changed_at: string
@@ -152,6 +176,7 @@ export interface TodoItem {
   updated_at: string
   scheduled_at?: string
   completed_at?: string
+  chat_session_id?: string
   sub_tasks?: SubTask[]
   // Enriched provider info from backend
   provider_name?: string
@@ -295,6 +320,8 @@ export interface PlanData {
   estimated_tokens?: number
 }
 
+export type ChatMode = 'chat' | 'plan' | 'debug' | 'create_task'
+
 export interface ChatSession {
   id: string
   project_id: string
@@ -302,10 +329,19 @@ export interface ChatSession {
   title: string
   mode: 'chat' | 'plan'
   plan_mode: boolean
+  chat_mode?: ChatMode
   plan_json?: Record<string, unknown>
+  ai_model?: string
+  linked_todo_id?: string
   is_active: boolean
   created_at: string
   updated_at: string
+}
+
+export interface ModelInfo {
+  id: string
+  name: string
+  is_default: boolean
 }
 
 export interface AgentConfig {
@@ -406,12 +442,17 @@ export interface ProjectChatMessage {
 }
 
 export interface WSEvent {
-  type: 'state_change' | 'subtask_update' | 'chat_message' | 'progress' | 'activity' | 'deliverable_created' | 'ping'
+  type: 'state_change' | 'subtask_update' | 'chat_message' | 'progress' | 'activity' | 'deliverable_created' | 'task_cancelled' | 'llm_response' | 'ping'
   state?: TodoState
+  status?: string
   message?: string | { role: string; content: string; id?: string }
   sub_task_id?: string
   progress_pct?: number
   activity?: string
+  content?: string
+  preview?: string
+  iteration?: number
+  error_message?: string
 }
 
 // ── API Payload Types ──────────────────────────────────────────────
@@ -446,6 +487,7 @@ export interface TodoCreatePayload {
   task_type?: string
   labels?: string[]
   ai_provider_id?: string
+  ai_model?: string
   scheduled_at?: string
   rules_override_json?: WorkRules
   max_iterations?: number

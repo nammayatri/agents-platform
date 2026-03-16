@@ -66,6 +66,8 @@ class ReviewIssue(BaseModel):
     severity: Literal["critical", "major", "minor", "nit"] = Field(
         description="Issue severity",
     )
+    file: str = Field(default="", description="File path where the issue is located")
+    line: int | None = Field(default=None, description="Line number (approximate)")
     description: str = Field(description="What the issue is")
     suggestion: str = Field(default="", description="How to fix it")
 
@@ -116,6 +118,29 @@ class MergeAgentOutput(BaseAgentOutput):
     ci_passed: bool = Field(default=False)
 
 
+# ── Debugger ───────────────────────────────────────────────────────
+
+
+class DebuggerOutput(BaseAgentOutput):
+    root_cause: str = Field(description="Identified root cause of the issue")
+    evidence: list[str] = Field(
+        default_factory=list,
+        description="Log entries, query results, code paths supporting the diagnosis",
+    )
+    fix_applied: bool = Field(
+        default=False,
+        description="Whether a fix was applied in this run",
+    )
+    files_changed: list[str] = Field(
+        default_factory=list,
+        description="Files modified (if fix was applied)",
+    )
+    recommendation: str = Field(
+        default="",
+        description="Next steps or recommendation",
+    )
+
+
 # ── Registry ────────────────────────────────────────────────────────
 
 ROLE_OUTPUT_SCHEMAS: dict[str, type[BaseAgentOutput]] = {
@@ -125,4 +150,5 @@ ROLE_OUTPUT_SCHEMAS: dict[str, type[BaseAgentOutput]] = {
     "pr_creator": PRCreatorOutput,
     "report_writer": ReportWriterOutput,
     "merge_agent": MergeAgentOutput,
+    "debugger": DebuggerOutput,
 }

@@ -42,12 +42,20 @@ class WorkspaceManager:
     # ------------------------------------------------------------------
 
     async def _resolve_git_credentials(
-        self, git_provider_id: str | None, repo_url: str
-    ) -> tuple[str | None, str | None]:
-        """Resolve token and provider_type from a git_provider_configs reference.
+        self, git_provider_id: str | None, repo_url: str,
+    ) -> tuple[str | None, str | None, str | None]:
+        """Resolve git credentials (token, provider_type, api_base_url).
 
-        Returns (token, provider_type).
+        If git_provider_id is set, looks up that specific provider config.
+        Otherwise, auto-detects provider type from the repo URL and falls back
+        to the first matching active provider config in the database.
+
+        Returns (token, provider_type, api_base_url).
         """
+        token = None
+        provider_type = None
+        api_base_url = None
+
         if git_provider_id:
             row = await self.db.fetchrow(
                 "SELECT provider_type, api_base_url, token_enc "
@@ -56,10 +64,33 @@ class WorkspaceManager:
             )
             if row:
                 token = decrypt(row["token_enc"]) if row.get("token_enc") else None
-                return token, row["provider_type"]
+                provider_type = row["provider_type"]
+                api_base_url = row.get("api_base_url")
 
-        # Fallback: auto-detect from URL, no token
-        return None, detect_provider_type(repo_url)
+        if not token and repo_url:
+            # Fallback: find an active provider matching the repo URL's host
+            detected = detect_provider_type(repo_url)
+            if detected:
+                row = await self.db.fetchrow(
+                    "SELECT provider_type, api_base_url, token_enc "
+                    "FROM git_provider_configs "
+                    "WHERE provider_type = $1 AND is_active = TRUE "
+                    "LIMIT 1",
+                    detected,
+                )
+                if row:
+                    token = decrypt(row["token_enc"]) if row.get("token_enc") else None
+                    provider_type = row["provider_type"]
+                    api_base_url = row.get("api_base_url")
+                    logger.info(
+                        "Resolved git credentials via fallback: provider_type=%s",
+                        provider_type,
+                    )
+
+        if not provider_type:
+            provider_type = detect_provider_type(repo_url)
+
+        return token, provider_type, api_base_url
 
     async def setup_project_workspace(self, project_id: str) -> str:
         """Clone/pull the main repo and dependency repos into the project workspace.
@@ -83,7 +114,7 @@ class WorkspaceManager:
 
         # Resolve credentials from git_provider_configs
         project_git_provider_id = str(project["git_provider_id"]) if project.get("git_provider_id") else None
-        token, provider_type = await self._resolve_git_credentials(project_git_provider_id, repo_url)
+        token, provider_type, _ = await self._resolve_git_credentials(project_git_provider_id, repo_url)
         branch = project.get("default_branch") or "main"
 
         # Clone or pull the main repo
@@ -109,17 +140,14 @@ class WorkspaceManager:
             try:
                 # Each dependency can have its own git provider
                 dep_git_provider_id = dep.get("git_provider_id")
-                if dep_git_provider_id:
-                    dep_token, dep_provider_type = await self._resolve_git_credentials(
-                        dep_git_provider_id, dep_url
-                    )
-                else:
-                    # Fallback to project's git provider for same-host deps, else auto-detect
+                dep_token, dep_provider_type, _ = await self._resolve_git_credentials(
+                    dep_git_provider_id, dep_url,
+                )
+                # If no token resolved and project has one for the same host, reuse it
+                if not dep_token and token:
                     dep_detected = detect_provider_type(dep_url)
-                    if dep_detected == provider_type and token:
+                    if dep_detected == provider_type:
                         dep_token, dep_provider_type = token, provider_type
-                    else:
-                        dep_token, dep_provider_type = None, dep_detected
 
                 await self._clone_or_pull(
                     repo_url=dep_url,
@@ -190,7 +218,7 @@ class WorkspaceManager:
         clone_url = todo.get("repo_url") or ""
         git_provider_id = str(todo["git_provider_id"]) if todo.get("git_provider_id") else None
         logger.info("[workspace] Cloning task workspace: todo=%s clone_url=%s", todo_id, clone_url[:50] if clone_url else "none")
-        token, provider_type = await self._resolve_git_credentials(git_provider_id, clone_url)
+        token, provider_type, _ = await self._resolve_git_credentials(git_provider_id, clone_url)
 
         # Use local clone from project workspace for speed
         rc, out = await self._run_git(
@@ -273,6 +301,10 @@ class WorkspaceManager:
     ) -> bool:
         """Stage all changes, commit, and push to remote.
 
+        Resolves configured git credentials and ensures the remote URL is
+        authenticated before pushing, so pushes never depend on OS-level
+        credential helpers.
+
         Returns True if the branch was successfully pushed (even if there
         were no new changes to commit — the branch itself still gets pushed).
         """
@@ -283,6 +315,9 @@ class WorkspaceManager:
         if not os.path.isdir(os.path.join(repo_dir, ".git")):
             logger.error("commit_and_push: no .git directory in %s", repo_dir)
             return False
+
+        # Ensure the remote URL uses configured credentials
+        await self._ensure_authenticated_remote(repo_dir)
 
         # Ensure we're on the right branch
         rc, current_branch = await self._run_git("rev-parse", "--abbrev-ref", "HEAD", cwd=repo_dir)
@@ -331,6 +366,39 @@ class WorkspaceManager:
         logger.info("Pushed branch %s to origin", branch)
         return True
 
+    async def _ensure_authenticated_remote(self, repo_dir: str) -> None:
+        """Check the current origin URL and re-set it with configured credentials.
+
+        Reads the current remote URL, resolves credentials from the database,
+        and updates the remote URL to include the token so that git push
+        always uses configured credentials rather than OS-level helpers.
+        """
+        rc, current_url = await self._run_git(
+            "remote", "get-url", "origin", cwd=repo_dir,
+        )
+        if rc != 0 or not current_url.strip():
+            return
+
+        current_url = current_url.strip()
+
+        # Skip if the URL already has credentials embedded
+        if "@" in current_url and "x-access-token" in current_url:
+            return
+
+        token, provider_type, _ = await self._resolve_git_credentials(None, current_url)
+        if not token:
+            logger.warning(
+                "No configured git credentials found for %s — push may fail",
+                current_url,
+            )
+            return
+
+        authenticated_url = build_clone_url(current_url, token, provider_type)
+        await self._run_git(
+            "remote", "set-url", "origin", authenticated_url, cwd=repo_dir,
+        )
+        logger.info("Updated remote origin to use configured credentials")
+
     async def create_pr(
         self,
         project_id: str,
@@ -355,20 +423,9 @@ class WorkspaceManager:
         repo_url = project["repo_url"]
         git_provider_id = str(project["git_provider_id"]) if project.get("git_provider_id") else None
 
-        # Resolve credentials and API base URL from git_provider_configs
-        token = None
-        provider_type = None
-        api_base_url = None
-        if git_provider_id:
-            gp_row = await self.db.fetchrow(
-                "SELECT provider_type, api_base_url, token_enc "
-                "FROM git_provider_configs WHERE id = $1",
-                git_provider_id,
-            )
-            if gp_row:
-                token = decrypt(gp_row["token_enc"]) if gp_row.get("token_enc") else None
-                provider_type = gp_row["provider_type"]
-                api_base_url = gp_row.get("api_base_url")
+        token, provider_type, api_base_url = await self._resolve_git_credentials(
+            git_provider_id, repo_url,
+        )
 
         provider = create_git_provider(
             provider_type=provider_type,
@@ -405,22 +462,9 @@ class WorkspaceManager:
         instead of looking them up from the projects table.
         Returns {"url": str, "number": int}.
         """
-        token = None
-        provider_type = None
-        api_base_url = None
-        if git_provider_id:
-            gp_row = await self.db.fetchrow(
-                "SELECT provider_type, api_base_url, token_enc "
-                "FROM git_provider_configs WHERE id = $1",
-                git_provider_id,
-            )
-            if gp_row:
-                token = decrypt(gp_row["token_enc"]) if gp_row.get("token_enc") else None
-                provider_type = gp_row["provider_type"]
-                api_base_url = gp_row.get("api_base_url")
-
-        if not provider_type:
-            provider_type = detect_provider_type(repo_url)
+        token, provider_type, api_base_url = await self._resolve_git_credentials(
+            git_provider_id, repo_url,
+        )
 
         provider = create_git_provider(
             provider_type=provider_type,

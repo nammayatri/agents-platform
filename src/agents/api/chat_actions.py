@@ -182,7 +182,7 @@ async def _handle_create_task(arguments: dict, context: dict) -> dict:
                 project_id, creator_id, title, description, priority, task_type,
                 state, sub_state, plan_json, intake_data
             )
-            VALUES ($1, $2, $3, $4, $5, $6, 'in_progress', 'executing', $7::jsonb, $8::jsonb)
+            VALUES ($1, $2, $3, $4, $5, $6, 'in_progress', 'executing', $7, $8)
             RETURNING *
             """,
             project_id,
@@ -191,8 +191,8 @@ async def _handle_create_task(arguments: dict, context: dict) -> dict:
             arguments.get("description", ""),
             arguments.get("priority", "medium"),
             arguments.get("task_type", "general"),
-            json.dumps(plan_json),
-            json.dumps(intake_data),
+            plan_json,
+            intake_data,
         )
         todo_id = str(todo["id"])
 
@@ -237,6 +237,18 @@ async def _handle_create_task(arguments: dict, context: dict) -> dict:
                         dep_ids,
                     )
 
+        # Link to chat session if created from a session
+        session_id = context.get("session_id")
+        if session_id:
+            await db.execute(
+                "UPDATE todo_items SET chat_session_id = $1 WHERE id = $2",
+                session_id, todo_id,
+            )
+            await db.execute(
+                "UPDATE project_chat_sessions SET linked_todo_id = $1 WHERE id = $2",
+                todo_id, session_id,
+            )
+
         # Emit event for orchestrator — task starts at in_progress
         if event_bus:
             try:
@@ -258,6 +270,7 @@ async def _handle_create_task(arguments: dict, context: dict) -> dict:
             "task_type": arguments.get("task_type", "general"),
             "sub_tasks_created": len(sub_task_ids),
             "direct_execution": True,
+            "linked_session_id": session_id,
         }
 
     # Standard path: create task in intake state
@@ -273,6 +286,19 @@ async def _handle_create_task(arguments: dict, context: dict) -> dict:
         arguments.get("priority", "medium"),
         arguments.get("task_type", "general"),
     )
+    todo_id = str(todo["id"])
+
+    # Link to chat session if created from a session
+    session_id = context.get("session_id")
+    if session_id:
+        await db.execute(
+            "UPDATE todo_items SET chat_session_id = $1 WHERE id = $2",
+            session_id, todo_id,
+        )
+        await db.execute(
+            "UPDATE project_chat_sessions SET linked_todo_id = $1 WHERE id = $2",
+            todo_id, session_id,
+        )
 
     # Emit event for orchestrator pickup
     if event_bus:
@@ -281,7 +307,7 @@ async def _handle_create_task(arguments: dict, context: dict) -> dict:
 
             await event_bus.publish(TaskEvent(
                 event_type="task_created",
-                todo_id=str(todo["id"]),
+                todo_id=todo_id,
                 state="intake",
             ))
         except Exception:
@@ -289,10 +315,11 @@ async def _handle_create_task(arguments: dict, context: dict) -> dict:
 
     return {
         "action": "task_created",
-        "task_id": str(todo["id"]),
+        "task_id": todo_id,
         "title": arguments["title"],
         "priority": arguments.get("priority", "medium"),
         "task_type": arguments.get("task_type", "general"),
+        "linked_session_id": session_id,
     }
 
 
@@ -348,4 +375,246 @@ async def _handle_delete_task(arguments: dict, context: dict) -> dict:
         "action": "task_deleted",
         "task_id": task_id,
         "title": todo["title"],
+    }
+
+
+# ── Session-Task actions (linked session → task management) ───
+
+
+@chat_action(
+    name="add_subtask",
+    description=(
+        "Add a new subtask to the linked task. The subtask will be created in pending status. "
+        "Use when the user wants to add more work to an existing task."
+    ),
+    scope="session_task",
+    input_schema={
+        "type": "object",
+        "properties": {
+            "title": {"type": "string", "description": "Subtask title"},
+            "description": {"type": "string", "description": "Detailed description of the subtask"},
+            "agent_role": {
+                "type": "string",
+                "enum": ["coder", "tester", "reviewer", "debugger", "report_writer"],
+                "description": "Agent role to execute this subtask",
+            },
+            "execution_order": {
+                "type": "integer",
+                "description": "Execution order (0 = parallel with others at order 0)",
+            },
+        },
+        "required": ["title", "agent_role"],
+    },
+)
+async def _handle_add_subtask(arguments: dict, context: dict) -> dict:
+    """Add a subtask to the linked task."""
+    db = context["db"]
+    todo_id = context.get("todo_id")
+    if not todo_id:
+        return {"error": "No linked task found for this session"}
+
+    todo = await db.fetchrow(
+        "SELECT id, title, state FROM todo_items WHERE id = $1", todo_id,
+    )
+    if not todo:
+        return {"error": f"Task {todo_id} not found"}
+
+    if todo["state"] in ("completed", "failed", "cancelled"):
+        return {"error": f"Cannot add subtasks to a task in '{todo['state']}' state"}
+
+    row = await db.fetchrow(
+        """
+        INSERT INTO sub_tasks (todo_id, title, description, agent_role, execution_order, input_context)
+        VALUES ($1, $2, $3, $4, $5, '{}'::jsonb)
+        RETURNING id, title, agent_role, status
+        """,
+        todo_id,
+        arguments["title"],
+        arguments.get("description", ""),
+        arguments["agent_role"],
+        arguments.get("execution_order", 0),
+    )
+
+    return {
+        "action": "subtask_added",
+        "task_id": todo_id,
+        "sub_task_id": str(row["id"]),
+        "title": arguments["title"],
+        "agent_role": arguments["agent_role"],
+    }
+
+
+@chat_action(
+    name="update_subtask",
+    description=(
+        "Update an existing subtask that hasn't started yet (pending status only). "
+        "Use to change title, description, or agent role of a pending subtask."
+    ),
+    scope="session_task",
+    input_schema={
+        "type": "object",
+        "properties": {
+            "sub_task_id": {"type": "string", "description": "UUID of the subtask to update"},
+            "title": {"type": "string", "description": "New title"},
+            "description": {"type": "string", "description": "New description"},
+            "agent_role": {
+                "type": "string",
+                "enum": ["coder", "tester", "reviewer", "debugger", "report_writer"],
+                "description": "New agent role",
+            },
+        },
+        "required": ["sub_task_id"],
+    },
+)
+async def _handle_update_subtask(arguments: dict, context: dict) -> dict:
+    """Update a pending subtask."""
+    db = context["db"]
+    todo_id = context.get("todo_id")
+    if not todo_id:
+        return {"error": "No linked task found for this session"}
+
+    sub_task_id = arguments["sub_task_id"]
+    st = await db.fetchrow(
+        "SELECT id, title, status FROM sub_tasks WHERE id = $1 AND todo_id = $2",
+        sub_task_id, todo_id,
+    )
+    if not st:
+        return {"error": f"Subtask {sub_task_id} not found in this task"}
+
+    if st["status"] != "pending":
+        return {"error": f"Cannot update subtask in '{st['status']}' status (must be pending)"}
+
+    updates = []
+    params = []
+    idx = 1
+    for field in ("title", "description", "agent_role"):
+        if field in arguments:
+            updates.append(f"{field} = ${idx}")
+            params.append(arguments[field])
+            idx += 1
+
+    if not updates:
+        return {"error": "No fields to update"}
+
+    params.append(sub_task_id)
+    await db.execute(
+        f"UPDATE sub_tasks SET {', '.join(updates)} WHERE id = ${idx}",
+        *params,
+    )
+
+    return {
+        "action": "subtask_updated",
+        "task_id": todo_id,
+        "sub_task_id": sub_task_id,
+        "updated_fields": [f for f in ("title", "description", "agent_role") if f in arguments],
+    }
+
+
+@chat_action(
+    name="remove_subtask",
+    description=(
+        "Remove a subtask that hasn't started yet (pending status only). "
+        "Use when the user wants to remove planned work from the task."
+    ),
+    scope="session_task",
+    input_schema={
+        "type": "object",
+        "properties": {
+            "sub_task_id": {"type": "string", "description": "UUID of the subtask to remove"},
+        },
+        "required": ["sub_task_id"],
+    },
+)
+async def _handle_remove_subtask(arguments: dict, context: dict) -> dict:
+    """Remove a pending subtask."""
+    db = context["db"]
+    todo_id = context.get("todo_id")
+    if not todo_id:
+        return {"error": "No linked task found for this session"}
+
+    sub_task_id = arguments["sub_task_id"]
+    st = await db.fetchrow(
+        "SELECT id, title, status FROM sub_tasks WHERE id = $1 AND todo_id = $2",
+        sub_task_id, todo_id,
+    )
+    if not st:
+        return {"error": f"Subtask {sub_task_id} not found in this task"}
+
+    if st["status"] != "pending":
+        return {"error": f"Cannot remove subtask in '{st['status']}' status (must be pending)"}
+
+    await db.execute("DELETE FROM sub_tasks WHERE id = $1", sub_task_id)
+
+    return {
+        "action": "subtask_removed",
+        "task_id": todo_id,
+        "sub_task_id": sub_task_id,
+        "title": st["title"],
+    }
+
+
+@chat_action(
+    name="cancel_task",
+    description=(
+        "Cancel the linked task and stop all running work. "
+        "IMPORTANT: Always confirm with the user before cancelling."
+    ),
+    scope="session_task",
+    input_schema={
+        "type": "object",
+        "properties": {
+            "reason": {"type": "string", "description": "Reason for cancellation"},
+        },
+    },
+)
+async def _handle_cancel_task(arguments: dict, context: dict) -> dict:
+    """Cancel the linked task and all its non-terminal subtasks."""
+    db = context["db"]
+    todo_id = context.get("todo_id")
+    if not todo_id:
+        return {"error": "No linked task found for this session"}
+
+    todo = await db.fetchrow(
+        "SELECT id, title, state FROM todo_items WHERE id = $1", todo_id,
+    )
+    if not todo:
+        return {"error": f"Task {todo_id} not found"}
+
+    if todo["state"] in ("completed", "cancelled"):
+        return {"error": f"Task is already {todo['state']}"}
+
+    # Transition the task to cancelled
+    await db.execute(
+        "UPDATE todo_items SET state = 'cancelled', state_changed_at = NOW(), updated_at = NOW() WHERE id = $1",
+        todo_id,
+    )
+
+    # Cancel all non-terminal subtasks
+    cancelled_count = await db.fetchval(
+        """
+        WITH updated AS (
+            UPDATE sub_tasks SET status = 'cancelled', updated_at = NOW()
+            WHERE todo_id = $1 AND status NOT IN ('completed', 'failed', 'cancelled')
+            RETURNING id
+        )
+        SELECT count(*) FROM updated
+        """,
+        todo_id,
+    )
+
+    # Publish cancellation event via Redis
+    event_bus = context.get("event_bus")
+    redis = context.get("redis")
+    if redis:
+        await redis.publish(
+            f"task:{todo_id}:events",
+            json.dumps({"type": "task_cancelled"}),
+        )
+
+    return {
+        "action": "task_cancelled",
+        "task_id": todo_id,
+        "title": todo["title"],
+        "subtasks_cancelled": cancelled_count or 0,
+        "reason": arguments.get("reason", ""),
     }

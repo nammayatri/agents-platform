@@ -73,6 +73,14 @@ class AIProvider(ABC):
             return self.fast_model
         return self.default_model
 
+    @abstractmethod
+    async def list_models(self) -> list[dict]:
+        """Return available models for this provider.
+
+        Each dict: {"id": "model-id", "name": "Display Name", "is_default": bool}
+        """
+        ...
+
 
 # Type alias for tool executor callbacks:
 #   async def executor(tool_name: str, tool_args: dict) -> str

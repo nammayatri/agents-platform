@@ -13,6 +13,7 @@ import ProjectCapabilitiesTab from '../components/project/ProjectCapabilitiesTab
 import ProjectMembersTab from '../components/project/ProjectMembersTab'
 import ProjectUnderstandingTab from '../components/project/ProjectUnderstandingTab'
 import ProjectAgentsTab from '../components/project/ProjectAgentsTab'
+import ProjectDebugTab from '../components/project/ProjectDebugTab'
 
 interface ProjectUnderstanding {
   summary?: string
@@ -60,7 +61,7 @@ export default function ProjectSettingsPage() {
   const [buildCommands, setBuildCommands] = useState<string[]>([])
   const [mergeMethod, setMergeMethod] = useState<'merge' | 'squash' | 'rebase'>('squash')
 
-  const editTabs = ['General', 'Repository', 'Dependencies', 'Rules', 'Build & Merge', 'Capabilities', 'Members', 'Understanding', 'Agents']
+  const editTabs = ['General', 'Repository', 'Dependencies', 'Rules', 'Build & Merge', 'Debug', 'Capabilities', 'Members', 'Understanding', 'Agents']
   const activeTab = searchParams.get('tab') || editTabs[0]
   const setActiveTab = (t: string) => setSearchParams({ tab: t })
 
@@ -185,19 +186,19 @@ export default function ProjectSettingsPage() {
   }
 
   return (
-    <div className="p-6 max-w-2xl mx-auto">
+    <div className="p-4 md:p-6 max-w-2xl mx-auto">
       <div className="mb-6">
         <h1 className="text-xl font-semibold text-white">Project Settings</h1>
         <p className="text-sm text-gray-500 mt-1">{name}</p>
       </div>
 
       {/* Tabs */}
-      <div className="flex gap-1 mb-6 border-b border-gray-900 -mx-1">
+      <div className="flex gap-1 mb-6 border-b border-gray-900 -mx-1 overflow-x-auto">
         {editTabs.map((tab) => (
           <button
             key={tab}
             onClick={() => setActiveTab(tab)}
-            className={`px-3 py-2 text-sm font-medium transition-colors border-b-2 -mb-px ${
+            className={`px-3 py-2 text-sm font-medium transition-colors border-b-2 -mb-px shrink-0 whitespace-nowrap ${
               activeTab === tab
                 ? 'text-white border-indigo-500'
                 : 'text-gray-500 border-transparent hover:text-gray-300'
@@ -252,6 +253,13 @@ export default function ProjectSettingsPage() {
           />
         )}
 
+        {activeTab === 'Debug' && (
+          <ProjectDebugTab
+            projectId={projectId!}
+            setError={setError}
+          />
+        )}
+
         {activeTab === 'Capabilities' && (
           <ProjectCapabilitiesTab
             activeProviders={activeProviders}
@@ -290,8 +298,8 @@ export default function ProjectSettingsPage() {
         )}
 
         {/* Actions */}
-        {activeTab !== 'Understanding' && activeTab !== 'Agents' && activeTab !== 'Members' && activeTab !== 'Rules' && activeTab !== 'Build & Merge' && (
-          <div className="flex items-center gap-3 pt-2">
+        {activeTab !== 'Understanding' && activeTab !== 'Agents' && activeTab !== 'Members' && activeTab !== 'Rules' && activeTab !== 'Build & Merge' && activeTab !== 'Debug' && (
+          <div className="flex items-center gap-3 pt-2 flex-wrap">
             {userRole === 'owner' && (
               <button onClick={handleSave} disabled={saving} className="px-5 py-2 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 rounded-lg text-sm font-medium text-white transition-colors">
                 {saving ? 'Saving...' : 'Save Changes'}

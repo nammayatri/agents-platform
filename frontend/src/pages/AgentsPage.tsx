@@ -213,7 +213,7 @@ export default function AgentsPage() {
     <div className="flex h-full">
       <div className="flex-1 flex flex-col overflow-hidden">
         {/* Header with tabs */}
-        <div className="border-b border-gray-900 px-6 pt-5 pb-0">
+        <div className="border-b border-gray-900 px-4 md:px-6 pt-5 pb-0">
           <div className="flex items-center justify-between mb-4">
             <div>
               <h1 className="text-xl font-semibold text-white">Agents</h1>
@@ -874,7 +874,7 @@ function BuilderTab({
       </div>
 
       {/* Input area */}
-      <div className="border-t border-gray-900 px-6 py-3">
+      <div className="border-t border-gray-900 px-4 md:px-6 py-3">
         <div className="max-w-2xl mx-auto">
           <div className="flex items-end gap-2">
             <div className="flex-1 relative">

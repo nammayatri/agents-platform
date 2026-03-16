@@ -10,6 +10,7 @@ class CreateTodoInput(BaseModel):
     labels: list[str] = []
     task_type: str = "code"  # 'code' | 'research' | 'document' | 'general'
     ai_provider_id: str | None = None
+    ai_model: str | None = None  # Explicit model override (within the selected provider)
     scheduled_at: str | None = None  # ISO 8601 datetime for deferred execution
     rules_override_json: dict | None = None  # Per-task work rule overrides
     max_iterations: int | None = None  # RALPH loop max iterations (default 50)

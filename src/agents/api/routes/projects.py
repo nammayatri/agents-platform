@@ -292,6 +292,29 @@ class WorkRulesInput(BaseModel):
     general: list[str] | None = None
 
 
+# ── Debug Context ──────────────────────────────────────────
+
+
+class DebugLogSource(BaseModel):
+    service_name: str
+    log_path: str | None = None
+    log_command: str | None = None
+    description: str | None = None
+
+
+class DebugMcpHint(BaseModel):
+    mcp_server_name: str
+    available_data: list[str] | None = None
+    example_queries: list[str] | None = None
+    notes: str | None = None
+
+
+class DebugContextInput(BaseModel):
+    log_sources: list[DebugLogSource] | None = None
+    mcp_hints: list[DebugMcpHint] | None = None
+    custom_instructions: str | None = None
+
+
 @router.get("/{project_id}/rules")
 async def get_work_rules(project_id: str, user: CurrentUser, db: DB):
     """Get project-level work rules."""
@@ -318,11 +341,43 @@ async def update_work_rules(project_id: str, body: WorkRulesInput, user: Current
     settings["work_rules"] = rules
 
     await db.execute(
-        "UPDATE projects SET settings_json = $2::jsonb, updated_at = NOW() WHERE id = $1",
+        "UPDATE projects SET settings_json = $2, updated_at = NOW() WHERE id = $1",
         project_id,
-        json.dumps(settings),
+        settings,
     )
     return rules
+
+
+@router.get("/{project_id}/debug-context")
+async def get_debug_context(project_id: str, user: CurrentUser, db: DB):
+    """Get project-level debug context (log sources, MCP hints, instructions)."""
+    await check_project_access(db, project_id, user)
+    row = await db.fetchrow("SELECT settings_json FROM projects WHERE id = $1", project_id)
+    settings = row["settings_json"] or {}
+    if isinstance(settings, str):
+        settings = json.loads(settings)
+    return settings.get("debug_context", {})
+
+
+@router.put("/{project_id}/debug-context")
+async def update_debug_context(
+    project_id: str, body: DebugContextInput, user: CurrentUser, db: DB,
+):
+    """Update project-level debug context. Owner-only."""
+    await check_project_owner(db, project_id, user)
+    row = await db.fetchrow("SELECT settings_json FROM projects WHERE id = $1", project_id)
+    settings = row["settings_json"] or {}
+    if isinstance(settings, str):
+        settings = json.loads(settings)
+
+    settings["debug_context"] = body.model_dump(exclude_none=True)
+
+    await db.execute(
+        "UPDATE projects SET settings_json = $2, updated_at = NOW() WHERE id = $1",
+        project_id,
+        settings,
+    )
+    return settings["debug_context"]
 
 
 async def _analyze_project(project_id: str, db) -> None:

@@ -177,3 +177,14 @@ class AnthropicProvider(AIProvider):
     def estimate_cost(self, tokens_input: int, tokens_output: int, model: str) -> float:
         pricing = PRICING.get(model, {"input": 3.0, "output": 15.0})
         return (tokens_input * pricing["input"] + tokens_output * pricing["output"]) / 1_000_000
+
+    async def list_models(self) -> list[dict]:
+        known = [
+            {"id": "claude-opus-4-20250514", "name": "Claude Opus 4"},
+            {"id": "claude-sonnet-4-20250514", "name": "Claude Sonnet 4"},
+            {"id": "claude-haiku-3-20250311", "name": "Claude Haiku 3"},
+        ]
+        return [
+            {**m, "is_default": m["id"] == self.default_model}
+            for m in known
+        ]

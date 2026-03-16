@@ -1,0 +1,251 @@
+/* Agent Platform Chat TUI Theme */
+
+Screen {
+    background: #030712;
+}
+
+/* ── Header bar ── */
+
+#header-bar {
+    dock: top;
+    height: 1;
+    background: #111827;
+    color: #9ca3af;
+    padding: 0 1;
+}
+
+#header-bar .mode-label {
+    color: #eab308;
+    text-style: bold;
+}
+
+/* ── Main layout ── */
+
+#main-area {
+    layout: horizontal;
+}
+
+/* ── Chat log (scrollable message area) ── */
+
+#chat-log {
+    width: 1fr;
+    padding: 1 1;
+    background: #030712;
+}
+
+.message-user {
+    margin: 0 0 1 8;
+    background: #3730a3;
+    color: #e0e7ff;
+    padding: 0 1;
+    border: round #4f46e5;
+}
+
+.message-assistant {
+    margin: 0 8 1 0;
+    background: #111827;
+    color: #d1d5db;
+    padding: 0 1;
+    border: round #1f2937;
+}
+
+.message-system {
+    margin: 0 4 1 4;
+    color: #6b7280;
+    text-style: italic;
+}
+
+.notice-green {
+    margin: 0 4 1 4;
+    color: #22c55e;
+    text-style: bold;
+}
+
+.notice-yellow {
+    margin: 0 4 1 4;
+    color: #eab308;
+}
+
+.notice-red {
+    margin: 0 4 1 4;
+    color: #ef4444;
+}
+
+/* ── Plan card ── */
+
+.plan-card {
+    margin: 0 4 1 0;
+    background: #1c1917;
+    padding: 1 2;
+    border: round #92400e;
+}
+
+.plan-card .plan-title {
+    color: #fbbf24;
+    text-style: bold;
+}
+
+.plan-card .plan-subtask {
+    color: #d6d3d1;
+    margin: 0 0 0 2;
+}
+
+.plan-card .plan-role {
+    color: #78716c;
+}
+
+#plan-actions {
+    margin: 1 0 0 2;
+    height: auto;
+    layout: horizontal;
+}
+
+#plan-actions Button {
+    margin: 0 1 0 0;
+    min-width: 14;
+}
+
+.btn-approve {
+    background: #166534;
+    color: #bbf7d0;
+}
+
+.btn-approve:hover {
+    background: #15803d;
+}
+
+.btn-reject {
+    background: #7f1d1d;
+    color: #fecaca;
+}
+
+.btn-reject:hover {
+    background: #991b1b;
+}
+
+.plan-approved-badge {
+    margin: 1 0 0 2;
+    color: #22c55e;
+    text-style: bold;
+}
+
+/* ── Thinking indicator ── */
+
+.thinking {
+    margin: 0 4 1 0;
+    color: #6b7280;
+    text-style: italic;
+}
+
+/* ── Input area ── */
+
+#input-area {
+    dock: bottom;
+    height: auto;
+    max-height: 8;
+    background: #111827;
+    border-top: solid #1f2937;
+    padding: 0 1;
+    layout: horizontal;
+}
+
+#mode-indicator {
+    width: 4;
+    height: 1;
+    color: #eab308;
+    text-style: bold;
+    padding: 0 0;
+    content-align: center middle;
+}
+
+#mode-indicator.chat-mode {
+    color: #6366f1;
+}
+
+#message-input {
+    width: 1fr;
+    height: auto;
+    max-height: 6;
+    background: #1f2937;
+    color: #e5e7eb;
+    border: round #374151;
+}
+
+#message-input:focus {
+    border: round #6366f1;
+}
+
+#message-input.disabled {
+    color: #6b7280;
+    border: round #374151;
+}
+
+/* ── Task panel (sidebar) ── */
+
+#task-panel {
+    width: 32;
+    background: #111827;
+    border-left: solid #1f2937;
+    padding: 1;
+    display: none;
+}
+
+#task-panel.visible {
+    display: block;
+}
+
+#task-panel .task-header {
+    color: #9ca3af;
+    text-style: bold;
+    margin: 0 0 1 0;
+}
+
+.task-row {
+    height: 1;
+    padding: 0 1;
+}
+
+.task-row:hover {
+    background: #1f2937;
+}
+
+.task-state-completed { color: #22c55e; }
+.task-state-in_progress { color: #06b6d4; }
+.task-state-running { color: #06b6d4; }
+.task-state-plan_ready { color: #eab308; text-style: bold; }
+.task-state-planning { color: #eab308; }
+.task-state-failed { color: #ef4444; }
+.task-state-cancelled { color: #6b7280; }
+.task-state-review { color: #a855f7; }
+.task-state-intake { color: #3b82f6; }
+.task-state-scheduled { color: #6b7280; }
+
+#task-actions {
+    margin: 1 0 0 0;
+    height: auto;
+}
+
+#task-actions Button {
+    margin: 0 1 0 0;
+    min-width: 10;
+}
+
+/* ── Reject feedback input ── */
+
+#reject-input-area {
+    height: auto;
+    margin: 1 0 0 0;
+    layout: horizontal;
+    display: none;
+}
+
+#reject-input-area.visible {
+    display: block;
+}
+
+#reject-feedback {
+    width: 1fr;
+    background: #1f2937;
+    color: #e5e7eb;
+    border: round #374151;
+}

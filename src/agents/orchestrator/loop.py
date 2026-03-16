@@ -332,9 +332,12 @@ class EventDrivenOrchestrator:
                             todo_id[:8], final["state"], final.get("sub_state"))
         except Exception as e:
             logger.exception("Task %s failed: %s", todo_id[:8], e)
+            error_msg = f"{type(e).__name__}: {e}"
+            if len(error_msg) > 1500:
+                error_msg = error_msg[:1500] + "..."
             try:
                 await transition_todo(
-                    self.db, todo_id, "failed", error_message=str(e),
+                    self.db, todo_id, "failed", error_message=error_msg,
                     redis=self.redis,
                 )
                 todo_data = await self.db.fetchrow(
@@ -347,7 +350,7 @@ class EventDrivenOrchestrator:
                         {
                             "todo_id": todo_id,
                             "title": todo_data["title"],
-                            "detail": str(e),
+                            "detail": error_msg,
                         },
                     )
             except Exception:
