@@ -1284,9 +1284,13 @@ class AgentCoordinator:
             todo = await self._load_todo()
             await self._phase_review(todo, provider)
         else:
-            # Check retry count
-            retry_count = todo.get("retry_count", 0)
-            if retry_count < self._MAX_TEST_RETRIES:
+            # Count previous test-fix attempts (dedicated counter, not shared retry_count)
+            test_fix_count = await self.db.fetchval(
+                "SELECT COUNT(*) FROM sub_tasks "
+                "WHERE todo_id = $1 AND title LIKE 'Fix test failures from testing phase%'",
+                self.todo_id,
+            ) or 0
+            if test_fix_count < self._MAX_TEST_RETRIES:
                 await self._create_test_fix_subtasks(
                     todo, provider, test_results, workspace_path,
                 )
@@ -1298,7 +1302,7 @@ class AgentCoordinator:
             else:
                 error_output = test_results.get("error_output", "Unknown failures")
                 await self._post_system_message(
-                    f"**Testing failed after {retry_count + 1} attempts.**\n\n"
+                    f"**Testing failed after {test_fix_count + 1} attempts.**\n\n"
                     f"Failures:\n```\n{error_output[:1000]}\n```\n\n"
                     "Proceeding to review with known test failures."
                 )
@@ -1472,33 +1476,62 @@ class AgentCoordinator:
 
         tools = self._get_builtin_tools(workspace_path, "tester")
 
-        try:
-            from agents.providers.base import run_tool_loop
+        from agents.providers.base import run_tool_loop
 
-            content, response = await run_tool_loop(
-                provider, messages,
-                tools=tools,
-                tool_executor=lambda name, args: self.mcp_executor.execute_tool(name, args, tools),
-                max_rounds=10,
-                temperature=0.1,
-            )
-            await self._track_tokens(response)
+        max_parse_retries = 3
+        last_content = ""
+        for parse_attempt in range(max_parse_retries):
+            try:
+                content, response = await run_tool_loop(
+                    provider, messages,
+                    tools=tools,
+                    tool_executor=lambda name, args: self.mcp_executor.execute_tool(name, args, tools),
+                    max_rounds=10,
+                    temperature=0.1,
+                )
+                await self._track_tokens(response)
+                last_content = content
 
-            result = parse_llm_json(content)
-            if result is None:
-                return {"passed": True, "summary": "Testing completed (could not parse LLM result)"}
+                result = parse_llm_json(content)
+                if result is not None and isinstance(result.get("passed"), bool):
+                    return {
+                        "passed": result["passed"],
+                        "summary": result.get("summary", ""),
+                        "error_output": "\n".join(result.get("failures", [])) if result.get("failures") else None,
+                    }
 
-            return {
-                "passed": result.get("passed", True),
-                "summary": result.get("summary", ""),
-                "error_output": "\n".join(result.get("failures", [])) if result.get("failures") else None,
-            }
-        except Exception as e:
-            logger.error("[%s] LLM test discovery failed: %s", self.todo_id, e, exc_info=True)
-            return {
-                "passed": True,
-                "summary": f"Test discovery failed ({type(e).__name__}), skipping",
-            }
+                # Parse failed — retry with correction prompt
+                logger.warning(
+                    "[%s] Test discovery parse attempt %d/%d failed, retrying with correction",
+                    self.todo_id, parse_attempt + 1, max_parse_retries,
+                )
+                if parse_attempt < max_parse_retries - 1:
+                    messages = [
+                        LLMMessage(role="system", content=system_prompt),
+                        LLMMessage(role="user", content=(
+                            "Your previous response could not be parsed as valid JSON. "
+                            "You MUST respond with ONLY a JSON object in this exact format, "
+                            "no other text:\n"
+                            '{"passed": true, "summary": "what happened", '
+                            '"commands_run": ["cmd1"], "failures": ["failure1"]}\n\n'
+                            "Set passed=true if all tests passed, false if any failed."
+                        )),
+                    ]
+            except Exception as e:
+                logger.error("[%s] LLM test discovery attempt %d failed: %s",
+                             self.todo_id, parse_attempt + 1, e, exc_info=True)
+                last_content = str(e)
+                if parse_attempt < max_parse_retries - 1:
+                    continue
+                break
+
+        # All retries exhausted — treat as failure (not success)
+        logger.error("[%s] Test discovery failed after %d parse attempts", self.todo_id, max_parse_retries)
+        return {
+            "passed": False,
+            "summary": "Test discovery could not produce parseable results after retries",
+            "error_output": f"LLM output could not be parsed:\n{last_content[:1000]}",
+        }
 
     async def _create_test_fix_subtasks(
         self, todo: dict, provider: AIProvider, test_results: dict, workspace_path: str | None,
@@ -1518,12 +1551,6 @@ class AgentCoordinator:
             description=fix_description,
             role="coder",
             depends_on=[],
-        )
-
-        # Increment retry count
-        await self.db.execute(
-            "UPDATE todo_items SET retry_count = retry_count + 1, updated_at = NOW() WHERE id = $1",
-            self.todo_id,
         )
 
         await self._post_system_message(
