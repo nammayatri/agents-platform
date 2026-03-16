@@ -1,4 +1,9 @@
-import asyncio
+"""Todo (task) CRUD and state transition endpoints.
+
+Workspace IDE endpoints (file browsing, editing, git operations) are in
+workspace.py to keep this module focused on task lifecycle management.
+"""
+
 import json
 import os
 from datetime import datetime
@@ -16,12 +21,21 @@ from agents.schemas.todo import (
     RequestChangesInput,
     UpdateTodoInput,
 )
+from agents.utils.git_utils import run_git_command
 
 
 class RetryInput(BaseModel):
     with_context: bool = False
 
+
+class TriggerSubTaskInput(BaseModel):
+    force: bool = False
+
+
 router = APIRouter()
+
+
+# ── CRUD ─────────────────────────────────────────────────────────────
 
 
 @router.get("/projects/{project_id}/todos")
@@ -47,7 +61,6 @@ async def list_todos(
     query += " ORDER BY created_at DESC"
     rows = await db.fetch(query, *params)
 
-    # Enrich with provider info
     results = []
     for r in rows:
         item = dict(r)
@@ -70,7 +83,6 @@ async def create_todo(
 ):
     await check_project_access(db, project_id, user)
 
-    # Determine initial state: scheduled or immediate
     scheduled_at = None
     initial_state = "intake"
     if body.scheduled_at:
@@ -105,7 +117,6 @@ async def create_todo(
         body.max_iterations,
     )
 
-    # Emit event for immediate tasks (scheduled tasks wait for their time)
     if initial_state == "intake":
         await event_bus.publish(TaskEvent(
             event_type="task_created",
@@ -124,14 +135,12 @@ async def get_todo(todo_id: str, user: CurrentUser, db: DB):
     await check_project_access(db, str(todo["project_id"]), user)
 
     result = dict(todo)
-    # Include sub-tasks
     sub_tasks = await db.fetch(
         "SELECT * FROM sub_tasks WHERE todo_id = $1 ORDER BY execution_order, created_at",
         todo_id,
     )
     result["sub_tasks"] = [dict(s) for s in sub_tasks]
 
-    # Include provider info
     if result.get("ai_provider_id"):
         prov = await db.fetchrow(
             "SELECT display_name, default_model, provider_type FROM ai_provider_configs WHERE id = $1",
@@ -174,6 +183,9 @@ async def update_todo(todo_id: str, body: UpdateTodoInput, user: CurrentUser, db
     return dict(updated)
 
 
+# ── State Transitions ────────────────────────────────────────────────
+
+
 @router.post("/todos/{todo_id}/cancel")
 async def cancel_todo(todo_id: str, user: CurrentUser, db: DB, redis: Redis, event_bus: EventBusDep):
     todo = await db.fetchrow("SELECT project_id FROM todo_items WHERE id = $1", todo_id)
@@ -185,7 +197,6 @@ async def cancel_todo(todo_id: str, user: CurrentUser, db: DB, redis: Redis, eve
     if not result:
         raise HTTPException(status_code=400, detail="Cannot cancel in current state")
 
-    # Cancel all pending/assigned/running subtasks
     await db.execute(
         """
         UPDATE sub_tasks
@@ -195,7 +206,6 @@ async def cancel_todo(todo_id: str, user: CurrentUser, db: DB, redis: Redis, eve
         todo_id,
     )
 
-    # Publish cancellation events so the coordinator stops
     await redis.publish(
         f"task:{todo_id}:events",
         json.dumps({"type": "state_change", "state": "cancelled"}),
@@ -222,14 +232,11 @@ async def retry_todo(
     if todo["state"] not in ("failed", "cancelled", "completed"):
         raise HTTPException(status_code=400, detail="Can only retry failed, cancelled, or completed tasks")
 
-    # Check if this is a completed/failed task that just needs a PR
-    # (has completed coder work but no pull_request deliverable)
     if todo["state"] in ("completed", "failed"):
         needs_pr_only = await _check_needs_pr_only(db, todo_id)
         if needs_pr_only:
             return await _retry_pr_creation(db, redis, event_bus, todo_id, todo)
 
-    # Full retry: gather context from previous run and restart from intake
     prev_context = await _build_previous_run_context(db, todo_id, todo)
     intake = todo.get("intake_data") or {}
     if isinstance(intake, str):
@@ -245,7 +252,6 @@ async def retry_todo(
     if not result:
         raise HTTPException(status_code=400, detail="Transition failed")
 
-    # Reset retry count and clear error/completion state
     await db.execute(
         "UPDATE todo_items SET retry_count = 0, error_message = NULL, "
         "completed_at = NULL WHERE id = $1",
@@ -256,117 +262,10 @@ async def retry_todo(
         json.dumps({"type": "state_change", "state": "intake"}),
     )
 
-    # Emit event so orchestrator picks it up immediately
     await event_bus.publish(TaskEvent(
         event_type="task_activated",
         todo_id=todo_id,
         state="intake",
-    ))
-    return result
-
-
-async def _check_needs_pr_only(db, todo_id: str) -> bool:
-    """Check if the task has completed coder work but no PR deliverable."""
-    # Has completed coder subtasks?
-    coder_count = await db.fetchval(
-        "SELECT COUNT(*) FROM sub_tasks WHERE todo_id = $1 "
-        "AND agent_role = 'coder' AND status = 'completed'",
-        todo_id,
-    )
-    if not coder_count:
-        return False
-
-    # Already has a PR?
-    pr_exists = await db.fetchrow(
-        "SELECT id FROM deliverables WHERE todo_id = $1 AND type = 'pull_request'",
-        todo_id,
-    )
-    if pr_exists:
-        return False
-
-    # Has a failed or no pr_creator subtask?
-    pr_task = await db.fetchrow(
-        "SELECT id, status FROM sub_tasks WHERE todo_id = $1 AND agent_role = 'pr_creator' "
-        "ORDER BY created_at DESC LIMIT 1",
-        todo_id,
-    )
-    # Either no pr_creator exists, or it failed — needs PR retry
-    return True
-
-
-async def _retry_pr_creation(db, redis, event_bus, todo_id: str, todo: dict) -> dict:
-    """Retry just the PR creation step instead of full task retry."""
-    # Reset any failed pr_creator subtask, or create a new one
-    existing_pr_task = await db.fetchrow(
-        "SELECT id, status FROM sub_tasks WHERE todo_id = $1 AND agent_role = 'pr_creator' "
-        "ORDER BY created_at DESC LIMIT 1",
-        todo_id,
-    )
-
-    if existing_pr_task and existing_pr_task["status"] in ("failed", "completed"):
-        # Reset to pending for retry
-        await db.execute(
-            "UPDATE sub_tasks SET status = 'pending', error_message = NULL, "
-            "updated_at = NOW() WHERE id = $1",
-            existing_pr_task["id"],
-        )
-    elif not existing_pr_task:
-        # Create a new pr_creator subtask
-        coder_subtasks = await db.fetch(
-            "SELECT id, target_repo FROM sub_tasks WHERE todo_id = $1 "
-            "AND agent_role = 'coder' AND status = 'completed' ORDER BY created_at DESC",
-            todo_id,
-        )
-        all_coder_ids = [str(st["id"]) for st in coder_subtasks]
-        target_repo_json = coder_subtasks[0].get("target_repo") if coder_subtasks else None
-        if isinstance(target_repo_json, str):
-            target_repo_json = json.loads(target_repo_json)
-
-        max_order = await db.fetchval(
-            "SELECT COALESCE(MAX(execution_order), 0) FROM sub_tasks WHERE todo_id = $1",
-            todo_id,
-        )
-        await db.fetchrow(
-            """
-            INSERT INTO sub_tasks (
-                todo_id, title, description, agent_role,
-                execution_order, depends_on, target_repo
-            )
-            VALUES ($1, $2, $3, 'pr_creator', $4, $5, $6)
-            RETURNING id
-            """,
-            todo_id,
-            "Create Pull Request",
-            "Commit all workspace changes, push to a feature branch, and create a pull request.",
-            max_order + 1,
-            all_coder_ids,
-            target_repo_json,
-        )
-
-    # Transition to in_progress so orchestrator picks it up
-    result = await transition_todo(db, todo_id, "in_progress", event_bus=event_bus)
-    if not result:
-        # Fallback: try intake → in_progress
-        await transition_todo(db, todo_id, "intake", event_bus=event_bus)
-        result = await transition_todo(db, todo_id, "in_progress", event_bus=event_bus)
-    if not result:
-        raise HTTPException(status_code=400, detail="Could not transition task for PR retry")
-
-    await db.execute(
-        "UPDATE todo_items SET error_message = NULL, completed_at = NULL, "
-        "sub_state = 'pr_retry' WHERE id = $1",
-        todo_id,
-    )
-
-    await redis.publish(
-        f"task:{todo_id}:events",
-        json.dumps({"type": "state_change", "state": "in_progress"}),
-    )
-
-    await event_bus.publish(TaskEvent(
-        event_type="task_activated",
-        todo_id=todo_id,
-        state="in_progress",
     ))
     return result
 
@@ -376,7 +275,7 @@ async def retry_subtask(
     todo_id: str, subtask_id: str, user: CurrentUser, db: DB,
     redis: Redis, event_bus: EventBusDep,
 ):
-    """Retry a specific failed sub-task (e.g., pr_creator, merge_agent)."""
+    """Retry a specific failed sub-task."""
     todo = await db.fetchrow("SELECT * FROM todo_items WHERE id = $1", todo_id)
     if not todo:
         raise HTTPException(status_code=404)
@@ -395,14 +294,12 @@ async def retry_subtask(
             detail=f"Can only retry failed or completed sub-tasks (current: {sub_task['status']})",
         )
 
-    # Reset the sub-task to pending
     await db.execute(
         "UPDATE sub_tasks SET status = 'pending', error_message = NULL, "
         "updated_at = NOW() WHERE id = $1",
         subtask_id,
     )
 
-    # If the parent todo is completed or failed, transition to in_progress
     if todo["state"] in ("completed", "failed"):
         result = await transition_todo(db, todo_id, "in_progress", event_bus=event_bus)
         if not result:
@@ -426,113 +323,6 @@ async def retry_subtask(
     ))
 
     return {"status": "retrying", "subtask_id": subtask_id, "agent_role": sub_task["agent_role"]}
-
-
-async def _build_previous_run_context(db, todo_id: str, todo) -> dict:
-    """Gather summary from the previous execution to feed into next run.
-
-    Includes subtask results and the git diff from the task workspace
-    so the planner knows what code changes already exist.
-    """
-    sub_tasks = await db.fetch(
-        "SELECT title, agent_role, status, output_result, error_message "
-        "FROM sub_tasks WHERE todo_id = $1 ORDER BY execution_order",
-        todo_id,
-    )
-
-    ctx: dict = {
-        "result_summary": todo.get("result_summary") or "",
-        "previous_state": todo["state"],
-        "sub_tasks": [
-            {
-                "title": st["title"],
-                "role": st["agent_role"],
-                "status": st["status"],
-                "output": (
-                    json.loads(st["output_result"])
-                    if isinstance(st["output_result"], str)
-                    else st["output_result"]
-                ) if st["output_result"] else None,
-                "error": st["error_message"],
-            }
-            for st in sub_tasks
-        ],
-    }
-
-    # Capture git diff from the task workspace
-    git_diff = await _get_task_workspace_diff(str(todo["project_id"]), todo_id)
-    if git_diff:
-        ctx["git_diff"] = git_diff
-
-    return ctx
-
-
-async def _get_task_workspace_diff(project_id: str, todo_id: str) -> dict | None:
-    """Get git diff from the task workspace, comparing against the base branch."""
-    repo_dir = os.path.join(
-        settings.workspace_root, project_id, "tasks", todo_id, "repo",
-    )
-    if not os.path.isdir(repo_dir):
-        return None
-
-    async def _run_git(*args: str) -> tuple[int, str]:
-        proc = await asyncio.create_subprocess_exec(
-            "git", *args, cwd=repo_dir,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, _ = await proc.communicate()
-        return proc.returncode, stdout.decode(errors="replace")
-
-    try:
-        # Find the merge-base with the default branch to get the full diff
-        # of changes made by the agent (not just the last commit)
-        rc, base_branch = await _run_git(
-            "rev-parse", "--abbrev-ref", "HEAD@{upstream}",
-        )
-        if rc != 0:
-            # Fallback: try origin/main or origin/master
-            for fallback in ("origin/main", "origin/master"):
-                rc2, _ = await _run_git("rev-parse", "--verify", fallback)
-                if rc2 == 0:
-                    base_branch = fallback
-                    break
-            else:
-                # No upstream found — diff against HEAD~1 as last resort
-                base_branch = "HEAD~1"
-        else:
-            base_branch = base_branch.strip()
-
-        # Diff stat (summary of changed files)
-        rc, stat_output = await _run_git("diff", "--stat", base_branch)
-        if rc != 0 or not stat_output.strip():
-            return None
-
-        # Changed files with status
-        _, names_output = await _run_git("diff", "--name-status", base_branch)
-        files = []
-        for line in names_output.strip().split("\n"):
-            if line.strip():
-                parts = line.split("\t", 1)
-                if len(parts) == 2:
-                    files.append({"status": parts[0], "path": parts[1]})
-
-        # Full diff (truncated to avoid blowing up context)
-        _, diff_output = await _run_git("diff", base_branch)
-        max_diff = 15000  # ~15k chars to stay within token budget
-        truncated = len(diff_output) > max_diff
-        diff_text = diff_output[:max_diff]
-        if truncated:
-            diff_text += "\n... (diff truncated)"
-
-        return {
-            "stat": stat_output.strip(),
-            "files": files,
-            "diff": diff_text,
-            "truncated": truncated,
-        }
-    except Exception:
-        return None
 
 
 @router.post("/todos/{todo_id}/accept-deliverables")
@@ -565,12 +355,8 @@ async def request_changes(
     if not result:
         raise HTTPException(status_code=400, detail="Cannot request changes in current state")
 
-    # Post feedback as chat message for the coordinator to pick up
     await db.execute(
-        """
-        INSERT INTO chat_messages (todo_id, role, content)
-        VALUES ($1, 'user', $2)
-        """,
+        "INSERT INTO chat_messages (todo_id, role, content) VALUES ($1, 'user', $2)",
         todo_id,
         f"[Change Request]: {body.feedback}",
     )
@@ -586,6 +372,9 @@ async def request_changes(
         state="in_progress",
     ))
     return result
+
+
+# ── Plan Approval ────────────────────────────────────────────────────
 
 
 @router.post("/todos/{todo_id}/approve-plan")
@@ -605,7 +394,6 @@ async def approve_plan(todo_id: str, user: CurrentUser, db: DB, redis: Redis, ev
     if isinstance(plan, str):
         plan = json.loads(plan)
 
-    # Create sub-tasks from the approved plan
     sub_task_ids = []
     for st in plan.get("sub_tasks", []):
         row = await db.fetchrow(
@@ -626,7 +414,6 @@ async def approve_plan(todo_id: str, user: CurrentUser, db: DB, redis: Redis, ev
         )
         sub_task_ids.append(str(row["id"]))
 
-    # Set up dependencies
     for i, st in enumerate(plan.get("sub_tasks", [])):
         depends_on = st.get("depends_on", [])
         if depends_on:
@@ -672,14 +459,12 @@ async def reject_plan(
     if todo["state"] != "plan_ready":
         raise HTTPException(status_code=400, detail="Task is not awaiting plan approval")
 
-    # Clear plan and any existing sub-tasks
     await db.execute(
         "UPDATE todo_items SET plan_json = NULL, updated_at = NOW() WHERE id = $1",
         todo_id,
     )
     await db.execute("DELETE FROM sub_tasks WHERE todo_id = $1", todo_id)
 
-    # Post user feedback as chat message
     await db.execute(
         "INSERT INTO chat_messages (todo_id, role, content) VALUES ($1, 'user', $2)",
         todo_id,
@@ -687,7 +472,6 @@ async def reject_plan(
     )
     await redis.rpush(f"task:{todo_id}:chat_input", body.feedback)
 
-    # Transition back to planning
     result = await transition_todo(db, todo_id, "planning", event_bus=event_bus)
     if not result:
         raise HTTPException(status_code=400, detail="Transition failed")
@@ -705,9 +489,12 @@ async def reject_plan(
     return result
 
 
+# ── Merge Approval ───────────────────────────────────────────────────
+
+
 @router.post("/todos/{todo_id}/approve-merge")
 async def approve_merge(todo_id: str, user: CurrentUser, db: DB, redis: Redis, event_bus: EventBusDep):
-    """Approve a pending merge. Wakes the coordinator to proceed with merge."""
+    """Approve a pending merge."""
     todo = await db.fetchrow("SELECT * FROM todo_items WHERE id = $1", todo_id)
     if not todo:
         raise HTTPException(status_code=404)
@@ -715,7 +502,6 @@ async def approve_merge(todo_id: str, user: CurrentUser, db: DB, redis: Redis, e
     if todo.get("sub_state") != "awaiting_merge_approval":
         raise HTTPException(status_code=400, detail="Task is not awaiting merge approval")
 
-    # Set sub_state to merge_approved so coordinator can proceed
     await db.execute(
         "UPDATE todo_items SET sub_state = 'merge_approved', updated_at = NOW() WHERE id = $1",
         todo_id,
@@ -741,7 +527,7 @@ async def approve_merge(todo_id: str, user: CurrentUser, db: DB, redis: Redis, e
 async def reject_merge(
     todo_id: str, body: RequestChangesInput, user: CurrentUser, db: DB, redis: Redis, event_bus: EventBusDep,
 ):
-    """Reject a pending merge. Fails the merge subtask and posts feedback."""
+    """Reject a pending merge."""
     todo = await db.fetchrow("SELECT * FROM todo_items WHERE id = $1", todo_id)
     if not todo:
         raise HTTPException(status_code=404)
@@ -749,7 +535,6 @@ async def reject_merge(
     if todo.get("sub_state") != "awaiting_merge_approval":
         raise HTTPException(status_code=400, detail="Task is not awaiting merge approval")
 
-    # Fail the pending merge subtask
     merge_st = await db.fetchrow(
         "SELECT id FROM sub_tasks WHERE todo_id = $1 AND agent_role = 'merge_agent' AND status = 'pending' LIMIT 1",
         todo_id,
@@ -760,12 +545,10 @@ async def reject_merge(
             error_message=f"Merge rejected by user: {body.feedback}",
         )
 
-    # Clear sub_state
     await db.execute(
         "UPDATE todo_items SET sub_state = 'executing', updated_at = NOW() WHERE id = $1",
         todo_id,
     )
-    # Post feedback as chat message
     await db.execute(
         "INSERT INTO chat_messages (todo_id, role, content) VALUES ($1, 'user', $2)",
         todo_id,
@@ -784,8 +567,7 @@ async def reject_merge(
     return {"status": "rejected"}
 
 
-class TriggerSubTaskInput(BaseModel):
-    force: bool = False  # If true, clears depends_on to force execution
+# ── Subtask Trigger ──────────────────────────────────────────────────
 
 
 @router.post("/todos/{todo_id}/sub-tasks/{sub_task_id}/trigger")
@@ -798,11 +580,7 @@ async def trigger_subtask(
     redis: Redis,
     event_bus: EventBusDep,
 ):
-    """Manually trigger a blocked or failed subtask.
-
-    Resets the subtask to 'pending' so the coordinator picks it up.
-    If force=true, also clears depends_on to bypass dependency checks.
-    """
+    """Manually trigger a blocked or failed subtask."""
     todo = await db.fetchrow("SELECT project_id, state FROM todo_items WHERE id = $1", todo_id)
     if not todo:
         raise HTTPException(status_code=404, detail="Task not found")
@@ -818,7 +596,6 @@ async def trigger_subtask(
     if st["status"] in ("running", "assigned"):
         raise HTTPException(status_code=400, detail="Subtask is already running")
 
-    # Reset subtask to pending
     if body.force:
         await db.execute(
             "UPDATE sub_tasks SET status = 'pending', depends_on = '{}', "
@@ -832,21 +609,217 @@ async def trigger_subtask(
             sub_task_id,
         )
 
-    # Ensure the parent todo is in a state the coordinator will pick up
     if todo["state"] not in ("in_progress",):
         await transition_todo(db, todo_id, "in_progress", event_bus=event_bus)
 
-    # Publish event so coordinator re-evaluates
     await event_bus.publish(TaskEvent(
         event_type="state_changed",
         todo_id=todo_id,
         state="in_progress",
     ))
 
-    # Notify via WebSocket
     await redis.publish(
         f"task:{todo_id}:events",
         json.dumps({"type": "activity", "activity": f"Subtask manually triggered: {sub_task_id[:8]}"}),
     )
 
     return {"status": "triggered", "sub_task_id": sub_task_id, "force": body.force}
+
+
+# ── Internal Helpers ─────────────────────────────────────────────────
+
+
+async def _check_needs_pr_only(db, todo_id: str) -> bool:
+    """Check if the task has completed coder work but no PR deliverable."""
+    coder_count = await db.fetchval(
+        "SELECT COUNT(*) FROM sub_tasks WHERE todo_id = $1 "
+        "AND agent_role = 'coder' AND status = 'completed'",
+        todo_id,
+    )
+    if not coder_count:
+        return False
+
+    pr_exists = await db.fetchrow(
+        "SELECT id FROM deliverables WHERE todo_id = $1 AND type = 'pull_request'",
+        todo_id,
+    )
+    if pr_exists:
+        return False
+
+    unfinished = await db.fetchval(
+        "SELECT COUNT(*) FROM sub_tasks WHERE todo_id = $1 "
+        "AND agent_role NOT IN ('pr_creator', 'merge_agent') "
+        "AND status IN ('pending', 'failed', 'running', 'assigned')",
+        todo_id,
+    )
+    if unfinished:
+        return False
+
+    last_reviewer = await db.fetchrow(
+        "SELECT review_verdict FROM sub_tasks WHERE todo_id = $1 "
+        "AND agent_role = 'reviewer' AND status = 'completed' "
+        "ORDER BY created_at DESC LIMIT 1",
+        todo_id,
+    )
+    if last_reviewer and last_reviewer["review_verdict"] == "needs_changes":
+        return False
+
+    return True
+
+
+async def _retry_pr_creation(db, redis, event_bus, todo_id: str, todo: dict) -> dict:
+    """Retry just the PR creation step."""
+    existing_pr_task = await db.fetchrow(
+        "SELECT id, status FROM sub_tasks WHERE todo_id = $1 AND agent_role = 'pr_creator' "
+        "ORDER BY created_at DESC LIMIT 1",
+        todo_id,
+    )
+
+    if existing_pr_task and existing_pr_task["status"] in ("failed", "completed"):
+        await db.execute(
+            "UPDATE sub_tasks SET status = 'pending', error_message = NULL, "
+            "updated_at = NOW() WHERE id = $1",
+            existing_pr_task["id"],
+        )
+    elif not existing_pr_task:
+        coder_subtasks = await db.fetch(
+            "SELECT id, target_repo FROM sub_tasks WHERE todo_id = $1 "
+            "AND agent_role = 'coder' AND status = 'completed' ORDER BY created_at DESC",
+            todo_id,
+        )
+        all_coder_ids = [str(st["id"]) for st in coder_subtasks]
+        target_repo_json = coder_subtasks[0].get("target_repo") if coder_subtasks else None
+        if isinstance(target_repo_json, str):
+            target_repo_json = json.loads(target_repo_json)
+
+        max_order = await db.fetchval(
+            "SELECT COALESCE(MAX(execution_order), 0) FROM sub_tasks WHERE todo_id = $1",
+            todo_id,
+        )
+        await db.fetchrow(
+            """
+            INSERT INTO sub_tasks (
+                todo_id, title, description, agent_role,
+                execution_order, depends_on, target_repo
+            )
+            VALUES ($1, $2, $3, 'pr_creator', $4, $5, $6)
+            RETURNING id
+            """,
+            todo_id,
+            "Create Pull Request",
+            "Commit all workspace changes, push to a feature branch, and create a pull request.",
+            max_order + 1,
+            all_coder_ids,
+            target_repo_json,
+        )
+
+    result = await transition_todo(db, todo_id, "in_progress", event_bus=event_bus)
+    if not result:
+        await transition_todo(db, todo_id, "intake", event_bus=event_bus)
+        result = await transition_todo(db, todo_id, "in_progress", event_bus=event_bus)
+    if not result:
+        raise HTTPException(status_code=400, detail="Could not transition task for PR retry")
+
+    await db.execute(
+        "UPDATE todo_items SET error_message = NULL, completed_at = NULL, "
+        "sub_state = 'pr_retry' WHERE id = $1",
+        todo_id,
+    )
+
+    await redis.publish(
+        f"task:{todo_id}:events",
+        json.dumps({"type": "state_change", "state": "in_progress"}),
+    )
+
+    await event_bus.publish(TaskEvent(
+        event_type="task_activated",
+        todo_id=todo_id,
+        state="in_progress",
+    ))
+    return result
+
+
+async def _build_previous_run_context(db, todo_id: str, todo) -> dict:
+    """Gather summary from the previous execution for retry context."""
+    sub_tasks = await db.fetch(
+        "SELECT title, agent_role, status, output_result, error_message "
+        "FROM sub_tasks WHERE todo_id = $1 ORDER BY execution_order",
+        todo_id,
+    )
+
+    ctx: dict = {
+        "result_summary": todo.get("result_summary") or "",
+        "previous_state": todo["state"],
+        "sub_tasks": [
+            {
+                "title": st["title"],
+                "role": st["agent_role"],
+                "status": st["status"],
+                "output": (
+                    json.loads(st["output_result"])
+                    if isinstance(st["output_result"], str)
+                    else st["output_result"]
+                ) if st["output_result"] else None,
+                "error": st["error_message"],
+            }
+            for st in sub_tasks
+        ],
+    }
+
+    git_diff = await _get_task_workspace_diff(str(todo["project_id"]), todo_id)
+    if git_diff:
+        ctx["git_diff"] = git_diff
+
+    return ctx
+
+
+async def _get_task_workspace_diff(project_id: str, todo_id: str) -> dict | None:
+    """Get git diff from the task workspace for retry context."""
+    repo_dir = os.path.join(
+        settings.workspace_root, project_id, "tasks", todo_id, "repo",
+    )
+    if not os.path.isdir(repo_dir):
+        return None
+
+    try:
+        rc, base_branch = await run_git_command(
+            "rev-parse", "--abbrev-ref", "HEAD@{upstream}", cwd=repo_dir,
+        )
+        if rc != 0:
+            for fallback in ("origin/main", "origin/master"):
+                rc2, _ = await run_git_command("rev-parse", "--verify", fallback, cwd=repo_dir)
+                if rc2 == 0:
+                    base_branch = fallback
+                    break
+            else:
+                base_branch = "HEAD~1"
+        else:
+            base_branch = base_branch.strip()
+
+        rc, stat_output = await run_git_command("diff", "--stat", base_branch, cwd=repo_dir)
+        if rc != 0 or not stat_output.strip():
+            return None
+
+        _, names_output = await run_git_command("diff", "--name-status", base_branch, cwd=repo_dir)
+        files = []
+        for line in names_output.strip().split("\n"):
+            if line.strip():
+                parts = line.split("\t", 1)
+                if len(parts) == 2:
+                    files.append({"status": parts[0], "path": parts[1]})
+
+        _, diff_output = await run_git_command("diff", base_branch, cwd=repo_dir)
+        max_diff = 15000
+        truncated = len(diff_output) > max_diff
+        diff_text = diff_output[:max_diff]
+        if truncated:
+            diff_text += "\n... (diff truncated)"
+
+        return {
+            "stat": stat_output.strip(),
+            "files": files,
+            "diff": diff_text,
+            "truncated": truncated,
+        }
+    except Exception:
+        return None

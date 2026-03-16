@@ -136,6 +136,7 @@ def create_app() -> FastAPI:
         skills,
         todos,
         websocket,
+        workspace,
     )
 
     # Health/readiness probes at root (no /api prefix) for K8s
@@ -145,6 +146,7 @@ def create_app() -> FastAPI:
     app.include_router(projects.router, prefix="/api/projects", tags=["projects"])
     app.include_router(project_chat.router, prefix="/api", tags=["project-chat"])
     app.include_router(todos.router, prefix="/api", tags=["todos"])
+    app.include_router(workspace.router, prefix="/api", tags=["workspace"])
     app.include_router(chat.router, prefix="/api", tags=["chat"])
     app.include_router(deliverables.router, prefix="/api", tags=["deliverables"])
     app.include_router(providers.router, prefix="/api/providers", tags=["providers"])

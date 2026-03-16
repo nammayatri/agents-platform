@@ -435,10 +435,40 @@ async def _handle_add_subtask(arguments: dict, context: dict) -> dict:
         arguments.get("execution_order", 0),
     )
 
+    sub_task_id = str(row["id"])
+
+    # Notify orchestrator so it picks up the new subtask
+    event_bus = context.get("event_bus")
+    if event_bus:
+        try:
+            from agents.orchestrator.events import TaskEvent
+
+            await event_bus.publish(TaskEvent(
+                event_type="state_changed",
+                todo_id=todo_id,
+                state=todo["state"],
+                metadata={"subtask_added": sub_task_id},
+            ))
+        except Exception:
+            logger.warning("Failed to emit event for new subtask %s", sub_task_id[:8])
+
+    # Publish WebSocket event so frontend refreshes subtask list
+    redis = context.get("redis")
+    if redis:
+        await redis.publish(
+            f"task:{todo_id}:events",
+            json.dumps({
+                "type": "subtask_update",
+                "sub_task_id": sub_task_id,
+                "status": "pending",
+                "message": f"New subtask added: {arguments['title']}",
+            }),
+        )
+
     return {
         "action": "subtask_added",
         "task_id": todo_id,
-        "sub_task_id": str(row["id"]),
+        "sub_task_id": sub_task_id,
         "title": arguments["title"],
         "agent_role": arguments["agent_role"],
     }

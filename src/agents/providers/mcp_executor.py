@@ -213,6 +213,34 @@ class McpToolExecutor:
                     logger.debug("MCP fallback also failed: %s", fb_err)
             return json.dumps({"error": str(e)})
 
+    def _resolve_allowed_dirs(self, workspace_path: str, tool_name: str) -> list[str]:
+        """Compute allowed directories per tool type.
+
+        Read-only tools (read_file, list_directory, search_files) can access
+        the main repo, dependency repos under workspace/deps/, and the
+        main_repo/ symlink (for dep workspaces referencing the main project).
+        Write tools remain restricted to the repo/ directory only.
+        """
+        repo_dir = os.path.join(workspace_path, "repo") if workspace_path else ""
+        allowed = [os.path.realpath(repo_dir)] if repo_dir else []
+
+        read_only_tools = {"read_file", "list_directory", "search_files"}
+        if tool_name in read_only_tools:
+            deps_dir = os.path.join(workspace_path, "deps")
+            if os.path.exists(deps_dir):
+                allowed.append(os.path.realpath(deps_dir))
+            # For dep workspaces: allow reading the main project repo
+            main_repo_dir = os.path.join(workspace_path, "main_repo")
+            if os.path.exists(main_repo_dir):
+                allowed.append(os.path.realpath(main_repo_dir))
+
+        return allowed
+
+    @staticmethod
+    def _check_path_allowed(real_path: str, allowed_dirs: list[str]) -> bool:
+        """Check if a resolved path falls within any allowed directory."""
+        return any(real_path.startswith(d + os.sep) or real_path == d for d in allowed_dirs)
+
     async def _execute_builtin(self, tool_meta: dict, tool_input: dict) -> str:
         """Execute a built-in workspace tool directly (no MCP server)."""
         workspace_path = tool_meta.get("_workspace_path", "")
@@ -225,10 +253,10 @@ class McpToolExecutor:
             if tool_name == "read_file":
                 path = tool_input.get("path", "")
                 full_path = os.path.join(repo_dir, path)
-                # Security: ensure path stays within repo
+                # Security: ensure path stays within repo or deps (read-only)
                 real_path = os.path.realpath(full_path)
-                real_repo = os.path.realpath(repo_dir)
-                if not real_path.startswith(real_repo):
+                allowed_dirs = self._resolve_allowed_dirs(workspace_path, tool_name)
+                if not self._check_path_allowed(real_path, allowed_dirs):
                     logger.warning("builtin[read_file]: path traversal blocked: %s", path)
                     return json.dumps({"error": "Path traversal not allowed"})
                 if not os.path.isfile(real_path):
@@ -319,8 +347,8 @@ class McpToolExecutor:
                 path = tool_input.get("path", "")
                 full_path = os.path.join(repo_dir, path) if path else repo_dir
                 real_path = os.path.realpath(full_path)
-                real_repo = os.path.realpath(repo_dir)
-                if not real_path.startswith(real_repo):
+                allowed_dirs = self._resolve_allowed_dirs(workspace_path, tool_name)
+                if not self._check_path_allowed(real_path, allowed_dirs):
                     logger.warning("builtin[list_directory]: path traversal blocked: %s", path)
                     return json.dumps({"error": "Path traversal not allowed"})
                 if not os.path.isdir(real_path):
@@ -345,8 +373,8 @@ class McpToolExecutor:
                 file_glob = tool_input.get("file_glob", "*")
                 full_search = os.path.join(repo_dir, search_path) if search_path else repo_dir
                 real_search = os.path.realpath(full_search)
-                real_repo = os.path.realpath(repo_dir)
-                if not real_search.startswith(real_repo):
+                allowed_dirs = self._resolve_allowed_dirs(workspace_path, tool_name)
+                if not self._check_path_allowed(real_search, allowed_dirs):
                     logger.warning("builtin[search_files]: path traversal blocked: %s", search_path)
                     return json.dumps({"error": "Path traversal not allowed"})
                 if not os.path.isdir(real_search):

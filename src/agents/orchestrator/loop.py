@@ -176,8 +176,8 @@ class EventDrivenOrchestrator:
             await self.event_bus.ack(msg_id)
             return
 
-        # Don't dispatch if awaiting user response or merge approval
-        if todo.get("sub_state") in ("awaiting_response", "awaiting_merge_approval"):
+        # Don't dispatch if awaiting user response, merge approval, or workspace edit review
+        if todo.get("sub_state") in ("awaiting_response", "awaiting_merge_approval", "workspace_edited"):
             logger.info("Task %s awaiting user input (sub_state=%s), skipping", todo_id[:8], todo.get("sub_state"))
             await self.locks.release(todo_id)
             await self.event_bus.ack(msg_id)

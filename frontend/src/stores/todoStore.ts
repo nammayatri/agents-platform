@@ -31,6 +31,7 @@ interface TodoState {
   rejectPlan: (todoId: string, feedback: string) => Promise<void>
   approveMerge: (todoId: string) => Promise<void>
   rejectMerge: (todoId: string, feedback: string) => Promise<void>
+  resumeTodo: (todoId: string) => Promise<void>
 
   fetchChat: (todoId: string) => Promise<void>
   sendChat: (todoId: string, content: string) => Promise<void>
@@ -167,6 +168,14 @@ export const useTodoStore = create<TodoState>((set, get) => ({
 
   rejectMerge: async (todoId, feedback) => {
     await todosApi.rejectMerge(todoId, feedback)
+    const { todos } = get()
+    if (todos[todoId]) {
+      set({ todos: { ...todos, [todoId]: { ...todos[todoId], sub_state: 'executing' } } })
+    }
+  },
+
+  resumeTodo: async (todoId) => {
+    await todosApi.resume(todoId)
     const { todos } = get()
     if (todos[todoId]) {
       set({ todos: { ...todos, [todoId]: { ...todos[todoId], sub_state: 'executing' } } })

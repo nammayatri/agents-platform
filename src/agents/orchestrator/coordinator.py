@@ -109,6 +109,26 @@ and what the expected outcome is.
 - Include relevant context from your codebase exploration so the agent doesn't need to \
 re-discover everything.
 
+## Cross-Repo Exploration
+
+Dependency repos are available at ../deps/{name}/ (read-only via workspace tools).
+- Use list_directory(path="../deps/") to see which dependency repos are available.
+- Use read_file(path="../deps/{name}/src/...") to read dependency source code.
+- Use search_files(pattern="...", path="../deps/{name}/") to search within a dependency.
+- When a task involves cross-repo concerns (shared types, API consumed from a dep, \
+integration patterns), ALWAYS explore both the main repo AND the relevant deps first.
+- For sub-tasks that need to modify a dependency repo, set target_repo with the dep's \
+repo_url, name, default_branch, and git_provider_id.
+
+## Query Enrichment
+
+Before creating your plan, proactively enrich the user's request:
+- Identify ambiguities or missing context in the task description.
+- Explore the codebase to find the actual file paths, current implementation, and patterns.
+- Discover the current behavior so you can describe what needs to change.
+- Make each sub-task description self-contained with all discovered context \
+(file paths, function names, current patterns) so agents can start working immediately.
+
 ## Output Format
 
 After exploring the codebase, output ONLY a JSON object (no markdown fences, no extra text):
@@ -364,6 +384,40 @@ class AgentCoordinator:
                 "You MUST explore the codebase using the tools before outputting your plan. "
                 "Read relevant files, search for patterns, and understand the existing code."
             )
+
+            # Inject dependency info so planner knows about available deps
+            dep_dirs = context.get("dependency_dirs", {})
+            deps_list = context.get("dependencies", [])
+            if dep_dirs:
+                planner_prompt += "\n\nDependency repositories available for reference (read-only):"
+                planner_prompt += "\nAccess via ../deps/{name}/path relative to repo root."
+                for dep in deps_list:
+                    name = dep.get("name", "")
+                    dir_name = dep_dirs.get(name, "")
+                    if dir_name:
+                        line = f"\n  - ../deps/{dir_name}/"
+                        if dep.get("repo_url"):
+                            line += f" ({dep['repo_url']})"
+                        if dep.get("git_provider_id"):
+                            line += f" [git_provider_id: {dep['git_provider_id']}]"
+                        planner_prompt += line
+
+            # Inject cross-repo integration links from project understanding
+            understanding = context.get("project_understanding", {})
+            cross_links = understanding.get("cross_repo_links", []) if isinstance(understanding, dict) else []
+            if cross_links:
+                planner_prompt += "\n\nKnown cross-repo integration points:"
+                for link in cross_links:
+                    dep = link.get("dep_name", "?")
+                    pattern = link.get("integration_pattern", "")
+                    main_files = ", ".join(link.get("main_repo_files", [])[:5])
+                    interfaces = ", ".join(link.get("shared_interfaces", [])[:5])
+                    planner_prompt += f"\n  - {dep}: {pattern}"
+                    if main_files:
+                        planner_prompt += f" (main repo: {main_files})"
+                    if interfaces:
+                        planner_prompt += f" (interfaces: {interfaces})"
+
             planner_prompt += build_tools_prompt_block("planner")
 
         # Build user message — add explicit retry/diff context if present
@@ -1486,14 +1540,48 @@ class AgentCoordinator:
         previous_results = await self._get_completed_results()
         intake = safe_json(todo.get("intake_data"))
 
+        # Determine if this is a dependency repo sub-task
+        target_repo = sub_task.get("target_repo")
+        if isinstance(target_repo, str):
+            target_repo = json.loads(target_repo) if target_repo else None
+        is_dep_workspace = bool(target_repo and target_repo.get("repo_url"))
+
         # Workspace context
         workspace_context = ""
         if workspace_path:
             file_tree = self.workspace_mgr.get_file_tree(workspace_path, max_depth=4)
-            workspace_context = (
-                f"\n\nYou are working inside the project repository root directory.\n"
-                f"Project file structure:\n{file_tree}\n"
-            )
+
+            if is_dep_workspace:
+                dep_name = target_repo.get("name", "dependency")
+                workspace_context = (
+                    f"\n\nYou are working inside the DEPENDENCY repository: {dep_name}\n"
+                    f"Your changes will create a PR on this dependency's repo.\n"
+                    f"Repository file structure:\n{file_tree}\n"
+                )
+                main_repo_dir = os.path.join(workspace_path, "main_repo")
+                if os.path.isdir(main_repo_dir):
+                    workspace_context += (
+                        "\nThe main project repo is available for reference (read-only) at "
+                        "../main_repo/ relative to repo root.\n"
+                    )
+            else:
+                workspace_context = (
+                    f"\n\nYou are working inside the project repository root directory.\n"
+                    f"Project file structure:\n{file_tree}\n"
+                )
+
+            # List available dependency repos
+            task_deps_dir = os.path.join(workspace_path, "deps")
+            if os.path.isdir(task_deps_dir):
+                dep_entries = [d for d in sorted(os.listdir(task_deps_dir))
+                               if os.path.isdir(os.path.join(task_deps_dir, d))]
+                if dep_entries:
+                    workspace_context += (
+                        "\nDependency repos available (read-only) via ../deps/{name}/path:\n"
+                    )
+                    for d in dep_entries:
+                        workspace_context += f"  - ../deps/{d}/\n"
+
             # Git diff of current changes
             try:
                 repo_dir = os.path.join(workspace_path, "repo")
@@ -1719,13 +1807,16 @@ class AgentCoordinator:
         if not st or st["status"] != "completed":
             return
 
-        # Only process review loop sub-tasks
-        has_loop = st.get("review_loop") or st.get("review_chain_id")
-        if not has_loop:
+        # Only process review-loop sub-tasks or chained reviewers.
+        # Parallel fix coders (review_loop=False, role=coder) must NOT enter
+        # this handler — they would each spawn a duplicate reviewer.
+        role = st["agent_role"]
+        is_review_loop_task = st.get("review_loop")
+        is_chained_reviewer = (role == "reviewer" and st.get("review_chain_id"))
+        if not is_review_loop_task and not is_chained_reviewer:
             return
 
         chain_id = st.get("review_chain_id") or st["id"]
-        role = st["agent_role"]
 
         # Safety: count sub-tasks in this chain
         chain_count = await self.db.fetchval(
@@ -1782,7 +1873,7 @@ class AgentCoordinator:
                 else:
                     reviewer_feedback = str(output)
                     structured_issues = []
-                await self._create_fix_subtask(
+                await self._create_fix_subtasks(
                     st, chain_id, reviewer_feedback, structured_issues,
                 )
 
@@ -1883,15 +1974,104 @@ class AgentCoordinator:
             f"**Review loop:** Created reviewer sub-task for '{coder_st['title']}'"
         )
 
-    async def _create_fix_subtask(
+    async def _create_fix_subtasks(
         self, reviewer_st: dict, chain_id, feedback: str,
         structured_issues: list | None = None,
     ) -> None:
-        """Create a coder fix sub-task with detailed reviewer feedback.
+        """Create fix sub-tasks from reviewer feedback.
 
-        Extracts file paths, line numbers, and specific suggestions from
-        the reviewer's structured output so the coder knows exactly what
-        to fix and where.
+        If issues span multiple files, creates parallel per-file fix
+        sub-tasks plus a pre-created reviewer that depends on all of them.
+        Otherwise falls back to a single fix sub-task (legacy path).
+        """
+        # Group issues by file
+        file_groups: dict[str, list[dict]] = {}
+        if structured_issues:
+            for issue in structured_issues:
+                if isinstance(issue, dict):
+                    key = issue.get("file") or "_general"
+                    file_groups.setdefault(key, []).append(issue)
+
+        # Single-file or no structured issues → legacy single fix sub-task
+        if len(file_groups) <= 1:
+            await self._create_single_fix_subtask(
+                reviewer_st, chain_id, feedback, structured_issues,
+            )
+            return
+
+        # Multi-file → parallel fix sub-tasks + pre-created reviewer
+        target_repo_json = reviewer_st.get("target_repo")
+        if isinstance(target_repo_json, str):
+            target_repo_json = json.loads(target_repo_json)
+
+        base_order = (reviewer_st.get("execution_order") or 0) + 1
+        base_title = reviewer_st["title"].removeprefix("Review: ")
+        fix_task_ids: list[str] = []
+
+        for file_key, file_issues in file_groups.items():
+            description = self._build_fix_description_for_file(
+                file_key, file_issues, reviewer_st,
+            )
+            display_file = file_key if file_key != "_general" else "general"
+            row = await self.db.fetchrow(
+                """
+                INSERT INTO sub_tasks (
+                    todo_id, title, description, agent_role,
+                    execution_order, depends_on,
+                    review_loop, review_chain_id, target_repo
+                )
+                VALUES ($1, $2, $3, 'coder', $4, $5, FALSE, $6, $7)
+                RETURNING id
+                """,
+                self.todo_id,
+                f"Fix ({display_file}): {base_title}",
+                description,
+                base_order,
+                [str(reviewer_st["id"])],
+                chain_id,
+                target_repo_json,
+            )
+            fix_task_ids.append(str(row["id"]))
+            logger.info(
+                "Created parallel fix sub-task %s for file %s in chain %s",
+                row["id"], file_key, chain_id,
+            )
+
+        # Pre-create a reviewer that depends on all parallel fix tasks
+        reviewer_row = await self.db.fetchrow(
+            """
+            INSERT INTO sub_tasks (
+                todo_id, title, description, agent_role,
+                execution_order, depends_on,
+                review_loop, review_chain_id, target_repo
+            )
+            VALUES ($1, $2, $3, 'reviewer', $4, $5, FALSE, $6, $7)
+            RETURNING id
+            """,
+            self.todo_id,
+            f"Review: {base_title}",
+            "Review the workspace after parallel fixes. Check that all issues are resolved.",
+            base_order + 1,
+            fix_task_ids,
+            chain_id,
+            target_repo_json,
+        )
+        logger.info(
+            "Created pre-reviewer sub-task %s (depends on %d fixes) for chain %s",
+            reviewer_row["id"], len(fix_task_ids), chain_id,
+        )
+        await self._post_system_message(
+            f"**Review loop:** Reviewer requested changes across {len(file_groups)} files. "
+            f"Created {len(fix_task_ids)} parallel fix sub-tasks + reviewer."
+        )
+
+    async def _create_single_fix_subtask(
+        self, reviewer_st: dict, chain_id, feedback: str,
+        structured_issues: list | None = None,
+    ) -> None:
+        """Create a single coder fix sub-task (legacy path).
+
+        Used when all issues are in one file or have no file info.
         """
         target_repo_json = reviewer_st.get("target_repo")
         if isinstance(target_repo_json, str):
@@ -1958,6 +2138,39 @@ class AgentCoordinator:
         await self._post_system_message(
             "**Review loop:** Reviewer requested changes. Created fix sub-task."
         )
+
+    @staticmethod
+    def _build_fix_description_for_file(
+        file_key: str, issues: list[dict], reviewer_st: dict,
+    ) -> str:
+        """Build a focused fix description for issues in a single file."""
+        if file_key == "_general":
+            parts = ["Fix the following general issues:\n"]
+        else:
+            parts = [f"Fix the following issues in `{file_key}`:\n"]
+
+        for i, issue in enumerate(issues, 1):
+            severity = issue.get("severity", "major").upper()
+            line = issue.get("line")
+            issue_desc = issue.get("description", "")
+            suggestion = issue.get("suggestion", "")
+
+            line_ref = f" (line {line})" if line else ""
+            parts.append(f"### Issue {i} [{severity}]{line_ref}")
+            if issue_desc:
+                parts.append(f"**Problem:** {issue_desc}")
+            if suggestion:
+                parts.append(f"**Fix:** {suggestion}")
+            parts.append("")
+
+        # Include reviewer summary for context
+        reviewer_output = reviewer_st.get("output_result") or {}
+        if isinstance(reviewer_output, dict):
+            summary = reviewer_output.get("summary", "")
+            if summary:
+                parts.append(f"\n## Reviewer Summary\n{summary}")
+
+        return "\n".join(parts)
 
     async def _create_merge_subtask(self, approved_st: dict, chain_id) -> None:
         """Create a merge_agent sub-task after reviewer approval.
@@ -3121,7 +3334,13 @@ class AgentCoordinator:
     # ---- DEPENDENCY WORKSPACE ----
 
     async def _setup_dependency_workspace(self, sub_task: dict) -> str:
-        """Set up a separate workspace for a sub-task targeting a dependency repo."""
+        """Set up a separate workspace for a sub-task targeting a dependency repo.
+
+        The workspace includes:
+        - repo/ — the cloned dependency repo (writable)
+        - deps/ — symlink to project-level deps for cross-repo reads
+        - main_repo/ — symlink to the main project repo for reference (read-only)
+        """
         target_repo = sub_task.get("target_repo")
         if isinstance(target_repo, str):
             target_repo = json.loads(target_repo)
@@ -3167,6 +3386,24 @@ class AgentCoordinator:
             "checkout", "-b", task_branch, cwd=dep_repo_dir,
         )
 
+        # Symlink project-level deps dir for cross-repo reads
+        project_deps_dir = os.path.join(project_dir, "deps")
+        dep_deps_link = os.path.join(dep_task_dir, "deps")
+        if os.path.isdir(project_deps_dir) and not os.path.exists(dep_deps_link):
+            try:
+                os.symlink(project_deps_dir, dep_deps_link)
+            except OSError:
+                logger.debug("Could not symlink deps into dep workspace")
+
+        # Symlink main project repo for reference
+        main_repo_dir = os.path.join(project_dir, "repo")
+        main_repo_link = os.path.join(dep_task_dir, "main_repo")
+        if os.path.isdir(main_repo_dir) and not os.path.exists(main_repo_link):
+            try:
+                os.symlink(main_repo_dir, main_repo_link)
+            except OSError:
+                logger.debug("Could not symlink main repo into dep workspace")
+
         return dep_task_dir
 
     # ---- HELPERS ----
@@ -3191,6 +3428,16 @@ class AgentCoordinator:
             if isinstance(deps, str):
                 deps = json.loads(deps)
             context["dependencies"] = deps
+
+            # Build dependency_dirs mapping (name -> normalized dir name) for agents
+            dep_dirs = {}
+            for dep in deps:
+                name = dep.get("name", "")
+                if name:
+                    dir_name = name.replace("/", "_").replace(" ", "_")
+                    dep_dirs[name] = dir_name
+            if dep_dirs:
+                context["dependency_dirs"] = dep_dirs
 
         # Include stored project understanding from analysis
         if project and project.get("settings_json"):
@@ -3468,14 +3715,53 @@ class AgentCoordinator:
         role = sub_task["agent_role"]
         intake = safe_json(todo.get("intake_data"))
 
+        # Determine if this is a dependency repo sub-task
+        target_repo = sub_task.get("target_repo")
+        if isinstance(target_repo, str):
+            target_repo = json.loads(target_repo) if target_repo else None
+        is_dep_workspace = bool(target_repo and target_repo.get("repo_url"))
+
         # Build workspace context if available
         workspace_context = ""
         if workspace_path:
             file_tree = self.workspace_mgr.get_file_tree(workspace_path, max_depth=4)
-            workspace_context = (
-                f"\n\nYou are working inside the project repository root directory.\n"
-                f"Project file structure:\n{file_tree}\n"
-            )
+
+            if is_dep_workspace:
+                dep_name = target_repo.get("name", "dependency")
+                workspace_context = (
+                    f"\n\nYou are working inside the DEPENDENCY repository: {dep_name}\n"
+                    f"This is a dependency of the main project. Your changes will create a PR "
+                    f"on this dependency's repo.\n"
+                    f"Repository file structure:\n{file_tree}\n"
+                )
+                # Main repo available for reference
+                main_repo_dir = os.path.join(workspace_path, "main_repo")
+                if os.path.isdir(main_repo_dir):
+                    workspace_context += (
+                        "\nThe main project repo is available for reference (read-only) at "
+                        "../main_repo/ relative to repo root.\n"
+                        "Use read_file('../main_repo/path') to see how the main project "
+                        "uses this dependency.\n"
+                    )
+            else:
+                workspace_context = (
+                    f"\n\nYou are working inside the project repository root directory.\n"
+                    f"Project file structure:\n{file_tree}\n"
+                )
+
+            # List available dependency repos for reference
+            task_deps_dir = os.path.join(workspace_path, "deps")
+            if os.path.isdir(task_deps_dir):
+                dep_entries = sorted(os.listdir(task_deps_dir))
+                if dep_entries:
+                    workspace_context += (
+                        "\nDependency repositories available for reference (read-only):\n"
+                        "Access via ../deps/{name}/path relative to repo root.\n"
+                    )
+                    for d in dep_entries:
+                        full = os.path.join(task_deps_dir, d)
+                        if os.path.isdir(full):
+                            workspace_context += f"  - ../deps/{d}/\n"
 
         # Work rules injection
         rules_block = ""

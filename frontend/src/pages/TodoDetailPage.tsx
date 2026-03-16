@@ -1,8 +1,10 @@
 import { useEffect, useState, useRef } from 'react'
 import { useParams } from 'react-router-dom'
+import { Code2 } from 'lucide-react'
 import { useTodoStore } from '../stores/todoStore'
 import { useTaskWebSocket } from '../hooks/useTaskWebSocket'
 import DiffViewer from '../components/DiffViewer'
+import WorkspaceView from '../components/workspace/WorkspaceView'
 import type { SubTask, ChatMessage, Deliverable, AgentRun, PlanSubTask, IterationLogEntry, ProgressLogEntry } from '../types'
 
 const STATE_COLORS: Record<string, string> = {
@@ -60,6 +62,7 @@ export default function TodoDetailPage() {
   const approveMerge = useTodoStore((s) => s.approveMerge)
   const rejectMerge = useTodoStore((s) => s.rejectMerge)
   const appendActivity = useTodoStore((s) => s.appendActivity)
+  const resumeTodo = useTodoStore((s) => s.resumeTodo)
   const llmResponses = useTodoStore((s) => s.llmResponses)
   const agentRunsByTodo = useTodoStore((s) => s.agentRunsByTodo)
   const fetchAgentRuns = useTodoStore((s) => s.fetchAgentRuns)
@@ -75,7 +78,9 @@ export default function TodoDetailPage() {
   const [expandedSubTasks, setExpandedSubTasks] = useState<Set<string>>(new Set())
   const [expandedActivity, setExpandedActivity] = useState<Set<string>>(new Set())
   const [expandedLlmResponse, setExpandedLlmResponse] = useState<Set<string>>(new Set())
+  const [expandedDetails, setExpandedDetails] = useState<Set<string>>(new Set())
   const [showMobileChat, setShowMobileChat] = useState(false)
+  const [showWorkspace, setShowWorkspace] = useState(false)
   const activityEndRefs = useRef<Record<string, HTMLDivElement | null>>({})
   const chatEndRef = useRef<HTMLDivElement>(null)
 
@@ -179,17 +184,37 @@ export default function TodoDetailPage() {
           {todo.description && (
             <p className="mt-2 text-gray-500 text-sm leading-relaxed">{todo.description}</p>
           )}
-          {todo.provider_name && (
-            <div className="mt-2 inline-flex items-center gap-1.5 px-2.5 py-1 bg-gray-900 border border-gray-800 rounded text-[11px] text-gray-500">
-              <span className="w-1.5 h-1.5 rounded-full bg-emerald-500" />
-              <span>{todo.provider_name}</span>
-              {todo.provider_model && (
-                <span className="text-gray-600 font-mono">· {todo.provider_model}</span>
-              )}
-            </div>
-          )}
+          <div className="mt-2 flex items-center gap-2 flex-wrap">
+            {todo.provider_name && (
+              <div className="inline-flex items-center gap-1.5 px-2.5 py-1 bg-gray-900 border border-gray-800 rounded text-[11px] text-gray-500">
+                <span className="w-1.5 h-1.5 rounded-full bg-emerald-500" />
+                <span>{todo.provider_name}</span>
+                {todo.provider_model && (
+                  <span className="text-gray-600 font-mono">· {todo.provider_model}</span>
+                )}
+              </div>
+            )}
+            <button
+              onClick={() => setShowWorkspace(!showWorkspace)}
+              className={`ml-auto px-3 py-1.5 rounded-lg text-xs transition-colors flex items-center gap-1.5 ${
+                showWorkspace
+                  ? 'bg-indigo-600 hover:bg-indigo-500 text-white'
+                  : 'bg-gray-800 hover:bg-gray-700 text-gray-400 hover:text-white'
+              }`}
+            >
+              <Code2 className="w-3.5 h-3.5" />
+              {showWorkspace ? 'Task Details' : 'Workspace'}
+            </button>
+          </div>
         </div>
 
+        {/* Workspace Mode */}
+        {showWorkspace ? (
+          <div className="flex-1 -mx-4 md:-mx-6 -mb-4 md:-mb-6" style={{ height: 'calc(100vh - 180px)' }}>
+            <WorkspaceView todoId={todoId!} />
+          </div>
+        ) : (
+        <>
         {/* Error Banner */}
         {todo.error_message && (
           <div className="mb-5 px-4 py-3 bg-red-500/5 border border-red-500/10 rounded-lg">
@@ -403,6 +428,27 @@ export default function TodoDetailPage() {
           </div>
         )}
 
+        {/* Workspace Edited — Resume Banner */}
+        {todo.sub_state === 'workspace_edited' && (
+          <div className="mb-5 bg-gray-900 border border-amber-500/20 rounded-lg overflow-hidden">
+            <div className="px-4 py-3 flex items-center gap-3">
+              <span className="w-2 h-2 rounded-full bg-amber-400" />
+              <div className="flex-1 min-w-0">
+                <h2 className="text-sm font-medium text-white">Task paused — workspace edited</h2>
+                <p className="text-xs text-gray-500 mt-0.5">
+                  You committed changes in the workspace. Running sub-tasks were cancelled. Resume to let the agent re-plan and continue.
+                </p>
+              </div>
+              <button
+                onClick={() => todoId && resumeTodo(todoId)}
+                className="px-4 py-1.5 bg-amber-600 hover:bg-amber-500 rounded-lg text-sm font-medium text-white transition-colors shrink-0"
+              >
+                Resume
+              </button>
+            </div>
+          </div>
+        )}
+
         {/* Actions */}
         <div className="flex gap-2 mb-6 flex-wrap">
           {todo.state === 'review' && (
@@ -593,17 +639,39 @@ export default function TodoDetailPage() {
                             {passedCount > 0 && <span className="text-emerald-400/60 ml-1">{passedCount} pass</span>}
                           </span>
                         )}
-                        {(st.status === 'pending' || st.status === 'failed') && todoId && (
-                          <div className="ml-auto shrink-0">
-                            <button
-                              onClick={(e) => { e.stopPropagation(); triggerSubTask(todoId, st.id, true) }}
-                              className="px-2 py-0.5 bg-gray-800 hover:bg-gray-700 rounded text-[10px] text-gray-400 transition-colors"
-                              title="Force run — skip dependency checks"
-                            >
-                              Force Run
-                            </button>
-                          </div>
-                        )}
+                        {(() => {
+                          const canForceRun = (st.status === 'pending' || st.status === 'failed') && todoId
+                          const canShowDetails = (st.status === 'completed' || st.status === 'failed') && (st.output_result || st.description || st.error_message)
+                          if (!canForceRun && !canShowDetails) return null
+                          return (
+                            <div className="ml-auto shrink-0 flex items-center gap-1.5">
+                              {canForceRun && (
+                                <button
+                                  onClick={(e) => { e.stopPropagation(); triggerSubTask(todoId!, st.id, true) }}
+                                  className="px-2 py-0.5 bg-gray-800 hover:bg-gray-700 rounded text-[10px] text-gray-400 transition-colors"
+                                  title="Force run — skip dependency checks"
+                                >
+                                  Force Run
+                                </button>
+                              )}
+                              {canShowDetails && (
+                                <button
+                                  onClick={(e) => {
+                                    e.stopPropagation()
+                                    setExpandedDetails((prev) => {
+                                      const next = new Set(prev)
+                                      if (next.has(st.id)) next.delete(st.id); else next.add(st.id)
+                                      return next
+                                    })
+                                  }}
+                                  className="px-2 py-0.5 bg-gray-800 hover:bg-gray-700 rounded text-[10px] text-gray-400 transition-colors"
+                                >
+                                  {expandedDetails.has(st.id) ? 'Hide' : 'Details'}
+                                </button>
+                              )}
+                            </div>
+                          )
+                        })()}
                       </div>
                       {st.status === 'running' && (
                         <div className="mt-2">
@@ -711,32 +779,206 @@ export default function TodoDetailPage() {
                           <p className="text-[11px] text-gray-400 mb-2">{st.output_result.summary}</p>
                         )}
 
-                        {st.output_result.issues && st.output_result.issues.length > 0 && (
-                          <div className="space-y-1.5">
-                            {(st.output_result.issues as Array<{ severity: string; description: string; suggestion?: string }>).map((issue, idx) => (
-                              <div key={idx} className="flex items-start gap-2">
-                                <span className={`text-[10px] font-medium px-1.5 py-0.5 rounded shrink-0 ${
-                                  issue.severity === 'critical' ? 'bg-red-500/10 text-red-400' :
-                                  issue.severity === 'major' ? 'bg-amber-500/10 text-amber-400' :
-                                  issue.severity === 'minor' ? 'bg-gray-800 text-gray-400' :
-                                  'bg-gray-800 text-gray-600'
-                                }`}>
-                                  {issue.severity}
-                                </span>
-                                <div className="flex-1 min-w-0">
-                                  <p className="text-[11px] text-gray-300">{issue.description}</p>
-                                  {issue.suggestion && (
-                                    <p className="text-[11px] text-gray-600 mt-0.5">{'\u2192'} {issue.suggestion}</p>
+                        {st.output_result.issues && st.output_result.issues.length > 0 && (() => {
+                          type Issue = { severity: string; file?: string; line?: number | null; description: string; suggestion?: string }
+                          const issues = st.output_result!.issues as Issue[]
+
+                          const grouped = new Map<string, Issue[]>()
+                          for (const issue of issues) {
+                            const key = issue.file || '_general'
+                            if (!grouped.has(key)) grouped.set(key, [])
+                            grouped.get(key)!.push(issue)
+                          }
+
+                          const severityClass = (sev: string) =>
+                            sev === 'critical' ? 'bg-red-500/10 text-red-400' :
+                            sev === 'major' ? 'bg-amber-500/10 text-amber-400' :
+                            sev === 'minor' ? 'bg-gray-800 text-gray-400' :
+                            'bg-gray-800 text-gray-600'
+
+                          const renderIssue = (issue: Issue, idx: number) => (
+                            <div key={idx} className="flex items-start gap-2">
+                              <span className={`text-[10px] font-medium px-1.5 py-0.5 rounded shrink-0 ${severityClass(issue.severity)}`}>
+                                {issue.severity}
+                              </span>
+                              <div className="flex-1 min-w-0">
+                                <div className="text-[11px] text-gray-300">
+                                  {issue.line != null && (
+                                    <span className="text-[10px] text-gray-600 font-mono mr-1.5">L{issue.line}</span>
                                   )}
+                                  {issue.description}
                                 </div>
+                                {issue.suggestion && (
+                                  <p className="text-[11px] text-gray-600 mt-0.5">{'\u2192'} {issue.suggestion}</p>
+                                )}
                               </div>
-                            ))}
-                          </div>
-                        )}
+                            </div>
+                          )
+
+                          // Single group or no file info: flat list (backward compatible)
+                          if (grouped.size <= 1 && (grouped.has('_general') || grouped.size === 0)) {
+                            return <div className="space-y-1.5">{issues.map(renderIssue)}</div>
+                          }
+
+                          // Multiple groups: grouped by file
+                          return (
+                            <div className="space-y-2.5">
+                              {Array.from(grouped.entries()).map(([fileKey, fileIssues]) => (
+                                <div key={fileKey}>
+                                  {fileKey !== '_general' ? (
+                                    <div className="text-[11px] text-gray-500 font-mono flex items-center gap-1.5 mb-1">
+                                      <span className="w-1 h-1 rounded-full bg-gray-700 shrink-0" />
+                                      {fileKey}
+                                    </div>
+                                  ) : (
+                                    <div className="text-[11px] text-gray-600 uppercase tracking-wider mb-1">General</div>
+                                  )}
+                                  <div className="space-y-1.5 pl-2.5">
+                                    {fileIssues.map(renderIssue)}
+                                  </div>
+                                </div>
+                              ))}
+                            </div>
+                          )
+                        })()}
 
                         {st.output_result.needs_human_review && (
                           <div className="mt-2 text-[10px] text-amber-400/70 flex items-center gap-1">
                             <span>{'\u26A0'}</span> Needs human review
+                          </div>
+                        )}
+                      </div>
+                    )}
+
+                    {/* Collapsible details panel */}
+                    {expandedDetails.has(st.id) && (
+                      <div className="border-t border-gray-800 px-3 py-2.5 bg-gray-950/30 space-y-2">
+                        {/* Task description / instructions */}
+                        {st.description && (
+                          <details>
+                            <summary className="text-[10px] text-gray-600 uppercase tracking-wider cursor-pointer hover:text-gray-500">
+                              Task Instructions
+                            </summary>
+                            <pre className="mt-1.5 text-[11px] text-gray-500 font-mono whitespace-pre-wrap max-h-32 overflow-y-auto leading-relaxed bg-gray-950 rounded px-2.5 py-2 border border-gray-800/50">
+                              {st.description}
+                            </pre>
+                          </details>
+                        )}
+
+                        {/* Role-specific output */}
+                        {st.output_result && (() => {
+                          const out = st.output_result!
+                          const role = st.agent_role
+                          const items: Array<{ label: string; value: string | string[] | boolean | undefined | null }> = []
+
+                          if (role === 'coder') {
+                            if (out.approach) items.push({ label: 'Approach', value: out.approach as string })
+                            if (out.files_changed && (out.files_changed as string[]).length > 0) items.push({ label: 'Files Changed', value: out.files_changed as string[] })
+                            if (out.setup_steps && (out.setup_steps as string[]).length > 0) items.push({ label: 'Setup Steps', value: out.setup_steps as string[] })
+                          } else if (role === 'tester') {
+                            if (out.test_summary) items.push({ label: 'Test Summary', value: out.test_summary as string })
+                            if (out.test_files && (out.test_files as string[]).length > 0) items.push({ label: 'Test Files', value: out.test_files as string[] })
+                            items.push({ label: 'Bug Reproduced Before Fix', value: (out.bug_reproduced_before_fix as boolean) ? 'Yes' : 'No' })
+                            items.push({ label: 'Bug Resolved After Fix', value: (out.bug_resolved_after_fix as boolean) ? 'Yes' : 'No' })
+                          } else if (role === 'debugger') {
+                            if (out.root_cause) items.push({ label: 'Root Cause', value: out.root_cause as string })
+                            if (out.evidence && (out.evidence as string[]).length > 0) items.push({ label: 'Evidence', value: out.evidence as string[] })
+                            if (out.recommendation) items.push({ label: 'Recommendation', value: out.recommendation as string })
+                            if (out.files_changed && (out.files_changed as string[]).length > 0) items.push({ label: 'Files Changed', value: out.files_changed as string[] })
+                          } else if (role === 'pr_creator') {
+                            if (out.pr_title) items.push({ label: 'PR Title', value: out.pr_title as string })
+                            if (out.pr_body) items.push({ label: 'PR Body', value: out.pr_body as string })
+                            if (out.breaking_changes && (out.breaking_changes as string[]).length > 0) items.push({ label: 'Breaking Changes', value: out.breaking_changes as string[] })
+                          } else if (role === 'report_writer') {
+                            if (out.executive_summary) items.push({ label: 'Summary', value: out.executive_summary as string })
+                          } else if (role === 'merge_agent') {
+                            if (out.merge_decision) items.push({ label: 'Decision', value: out.merge_decision as string })
+                            if (out.reason) items.push({ label: 'Reason', value: out.reason as string })
+                            items.push({ label: 'CI Passed', value: (out.ci_passed as boolean) ? 'Yes' : 'No' })
+                          } else if (role === 'reviewer') {
+                            // Reviewer already has its own detailed section above, just show summary here
+                            if (out.summary) items.push({ label: 'Summary', value: out.summary as string })
+                          } else {
+                            // Unknown role — show any string/array fields
+                            for (const [k, v] of Object.entries(out)) {
+                              if (k === 'raw_content' || k === 'content') continue
+                              if (typeof v === 'string' && v) items.push({ label: k, value: v })
+                              if (Array.isArray(v) && v.length > 0) items.push({ label: k, value: v as string[] })
+                            }
+                          }
+
+                          if (items.length === 0) return null
+
+                          return (
+                            <div className="space-y-1.5">
+                              <div className="text-[10px] text-gray-600 uppercase tracking-wider">Output</div>
+                              {items.map((item, idx) => (
+                                <div key={idx}>
+                                  <span className="text-[10px] text-gray-600">{item.label}:</span>
+                                  {Array.isArray(item.value) ? (
+                                    <div className="mt-0.5 pl-2 space-y-0.5">
+                                      {(item.value as string[]).map((v, vi) => (
+                                        <div key={vi} className="text-[11px] text-gray-400 font-mono flex items-start gap-1.5">
+                                          <span className="w-1 h-1 rounded-full bg-gray-700 mt-1.5 shrink-0" />
+                                          {String(v)}
+                                        </div>
+                                      ))}
+                                    </div>
+                                  ) : (
+                                    <pre className="mt-0.5 text-[11px] text-gray-400 whitespace-pre-wrap leading-relaxed max-h-24 overflow-y-auto">
+                                      {String(item.value)}
+                                    </pre>
+                                  )}
+                                </div>
+                              ))}
+                            </div>
+                          )
+                        })()}
+
+                        {/* Raw LLM content (truncated, collapsible) */}
+                        {st.output_result?.raw_content && (
+                          <details>
+                            <summary className="text-[10px] text-gray-600 uppercase tracking-wider cursor-pointer hover:text-gray-500">
+                              Raw LLM Output ({(st.output_result.raw_content as string).length.toLocaleString()} chars)
+                            </summary>
+                            <pre className="mt-1.5 text-[11px] text-gray-500 font-mono whitespace-pre-wrap max-h-48 overflow-y-auto leading-relaxed bg-gray-950 rounded px-2.5 py-2 border border-gray-800/50">
+                              {(st.output_result.raw_content as string).slice(0, 5000)}
+                              {(st.output_result.raw_content as string).length > 5000 && '\n\n... truncated ...'}
+                            </pre>
+                          </details>
+                        )}
+
+                        {/* Iteration summary table */}
+                        {iterLog.length > 0 && (
+                          <details>
+                            <summary className="text-[10px] text-gray-600 uppercase tracking-wider cursor-pointer hover:text-gray-500">
+                              Iterations ({iterLog.length})
+                            </summary>
+                            <div className="mt-1.5 space-y-1">
+                              {iterLog.map((entry: IterationLogEntry, i: number) => (
+                                <div key={i} className="flex items-start gap-2 text-[11px]">
+                                  <span className="text-gray-700 font-mono w-5 shrink-0 text-right">#{entry.iteration}</span>
+                                  <span className={`px-1 py-0.5 rounded text-[10px] font-medium shrink-0 ${
+                                    entry.outcome === 'passed' ? 'bg-emerald-500/10 text-emerald-400/70' : 'bg-red-500/10 text-red-400/70'
+                                  }`}>{entry.outcome}</span>
+                                  <span className="text-gray-500 truncate flex-1">{entry.action}</span>
+                                  <span className="text-gray-700 font-mono shrink-0">{entry.tokens_used.toLocaleString()} tok</span>
+                                </div>
+                              ))}
+                              <div className="text-[10px] text-gray-700 font-mono pt-1 border-t border-gray-800/50">
+                                Total: {iterLog.reduce((s, e) => s + e.tokens_used, 0).toLocaleString()} tokens across {iterLog.length} iterations
+                              </div>
+                            </div>
+                          </details>
+                        )}
+
+                        {/* Error message if present */}
+                        {st.error_message && (
+                          <div>
+                            <div className="text-[10px] text-red-400/70 uppercase tracking-wider mb-1">Error</div>
+                            <pre className="text-[11px] text-red-300/50 font-mono whitespace-pre-wrap max-h-24 overflow-y-auto leading-relaxed bg-red-500/5 rounded px-2.5 py-2 border border-red-500/10">
+                              {st.error_message}
+                            </pre>
                           </div>
                         )}
                       </div>
@@ -968,6 +1210,8 @@ export default function TodoDetailPage() {
             <span className="px-1.5 py-0.5 bg-gray-800 rounded text-[10px] text-gray-500">{messages.length}</span>
           )}
         </button>
+        </>
+        )}
       </div>
 
       {/* Chat sidebar */}

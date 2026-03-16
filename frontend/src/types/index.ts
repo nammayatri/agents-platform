@@ -121,6 +121,8 @@ export interface SubTask {
     matches_plan?: boolean
     issues?: Array<{
       severity: 'critical' | 'major' | 'minor' | 'nit'
+      file?: string
+      line?: number | null
       description: string
       suggestion?: string
     }>
@@ -452,7 +454,7 @@ export interface ProjectChatMessage {
 }
 
 export interface WSEvent {
-  type: 'state_change' | 'subtask_update' | 'chat_message' | 'progress' | 'activity' | 'deliverable_created' | 'task_cancelled' | 'llm_response' | 'ping'
+  type: 'state_change' | 'subtask_update' | 'chat_message' | 'progress' | 'activity' | 'deliverable_created' | 'task_cancelled' | 'llm_response' | 'workspace_commit' | 'workspace_push' | 'ping'
   state?: TodoState
   status?: string
   message?: string | { role: string; content: string; id?: string }
@@ -558,6 +560,37 @@ export interface NotificationChannelPayload {
   display_name: string
   config_json: Record<string, string>
   notify_on?: string[]
+}
+
+// ── Workspace IDE Types ──────────────────────────────────────────────
+
+export interface FileTreeNode {
+  name: string
+  path: string
+  type: 'file' | 'dir'
+  size?: number
+  children?: FileTreeNode[]
+}
+
+export interface FileContent {
+  path: string
+  content: string
+  size: number
+  language: string
+  binary: boolean
+  truncated?: boolean
+}
+
+export interface GitFileStatus {
+  path: string
+  status: string
+  staged: boolean
+}
+
+export interface GitStatus {
+  branch: string
+  files: GitFileStatus[]
+  clean: boolean
 }
 
 export interface AgentCreatePayload {

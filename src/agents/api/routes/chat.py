@@ -122,7 +122,7 @@ async def send_chat_message(
     # wait for the orchestrator poll cycle.  The orchestrator handles state
     # transitions; chat should always be fast and direct.
     asyncio.create_task(
-        _direct_chat_response(todo_id, body.content, db, redis, session_id=str(session_id) if session_id else None)
+        _direct_chat_response(todo_id, body.content, db, redis, event_bus, session_id=str(session_id) if session_id else None)
     )
 
     # Return in chat_messages-compatible format
@@ -136,7 +136,7 @@ async def send_chat_message(
 
 
 async def _direct_chat_response(
-    todo_id: str, message: str, db, redis, *, session_id: str | None = None,
+    todo_id: str, message: str, db, redis, event_bus=None, *, session_id: str | None = None,
 ):
     """Generate an immediate AI response to any user chat message."""
     from agents.api.chat_actions import execute_action, get_actions_as_tools, is_action_tool
@@ -242,6 +242,7 @@ async def _direct_chat_response(
                 "user_id": str(todo["creator_id"]),
                 "todo_id": todo_id,
                 "redis": redis,
+                "event_bus": event_bus,
             }
 
         if skills_ctx:

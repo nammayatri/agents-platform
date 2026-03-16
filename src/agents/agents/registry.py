@@ -43,16 +43,19 @@ def _register_tool(defn: BuiltinToolDef) -> None:
 
 _register_tool(BuiltinToolDef(
     name="read_file",
-    description="Read a file's contents. Path is relative to repo root.",
+    description=(
+        "Read a file's contents. Path is relative to repo root. "
+        "You can also read dependency repo files via ../deps/{name}/path (read-only)."
+    ),
     input_schema={
         "type": "object",
         "properties": {
-            "path": {"type": "string", "description": "File path relative to repo root"},
+            "path": {"type": "string", "description": "File path relative to repo root (use ../deps/{name}/path for dependency repos)"},
         },
         "required": ["path"],
     },
-    prompt_hint="Read a file's contents. Args: path (relative to repo root)",
-    example='read_file(path="src/main.py")',
+    prompt_hint="Read a file's contents. Args: path (relative to repo root, or ../deps/{name}/path for deps)",
+    example='read_file(path="src/main.py")  # or read_file(path="../deps/auth-lib/src/index.ts")',
 ))
 
 _register_tool(BuiltinToolDef(
@@ -72,35 +75,39 @@ _register_tool(BuiltinToolDef(
 
 _register_tool(BuiltinToolDef(
     name="list_directory",
-    description="List files and directories. Path is relative to repo root (empty for root).",
+    description=(
+        "List files and directories. Path is relative to repo root (empty for root). "
+        "Use ../deps/ to list available dependency repos, or ../deps/{name}/ to explore one."
+    ),
     input_schema={
         "type": "object",
         "properties": {
-            "path": {"type": "string", "description": "Directory path relative to repo root"},
+            "path": {"type": "string", "description": "Directory path relative to repo root (use ../deps/ to list dependency repos)"},
         },
         "required": ["path"],
     },
-    prompt_hint="List files and directories. Args: path (empty string for repo root)",
-    example='list_directory(path="src/")',
+    prompt_hint="List files and directories. Args: path (empty for repo root, ../deps/ for dependency repos)",
+    example='list_directory(path="src/")  # or list_directory(path="../deps/")',
 ))
 
 _register_tool(BuiltinToolDef(
     name="search_files",
     description=(
         "Search for a text pattern across files using grep. "
-        "Returns matching lines with file paths and line numbers."
+        "Returns matching lines with file paths and line numbers. "
+        "Use path='../deps/{name}/' to search within a dependency repo."
     ),
     input_schema={
         "type": "object",
         "properties": {
             "pattern": {"type": "string", "description": "Search pattern (regex supported)"},
-            "path": {"type": "string", "description": "Directory to search in, relative to repo root (empty for root)"},
+            "path": {"type": "string", "description": "Directory to search in, relative to repo root (empty for root, ../deps/{name}/ for deps)"},
             "file_glob": {"type": "string", "description": "File glob filter, e.g. '*.py', '*.ts' (optional)"},
         },
         "required": ["pattern"],
     },
-    prompt_hint="Grep for a pattern across files. Args: pattern, path (optional), file_glob (optional)",
-    example='search_files(pattern="def handle_", file_glob="*.py")',
+    prompt_hint="Grep for a pattern across files. Args: pattern, path (optional, ../deps/{name}/ for deps), file_glob (optional)",
+    example='search_files(pattern="def handle_", file_glob="*.py")  # or search_files(pattern="export", path="../deps/shared-types/")',
 ))
 
 _register_tool(BuiltinToolDef(
@@ -493,6 +500,24 @@ SUB-TASK GUIDELINES:
 - Set execution_order for sequential work (0 = parallel)
 - Use depends_on (0-based indexes) for dependencies between sub_tasks within the task
 - Sub_tasks with no dependencies can run in parallel
+
+CROSS-REPO EXPLORATION:
+- Dependency repos are available at ../deps/{name}/ (read-only). Use list_directory("../deps/") \
+to see them.
+- When a task involves cross-repo concerns (shared types, APIs consumed from deps, integration \
+patterns), explore both the main repo AND relevant deps before planning.
+- Use read_file("../deps/{name}/src/...") and search_files(pattern="...", path="../deps/{name}/") \
+to understand dependency code.
+- When creating tasks that modify a dependency repo, set target_repo on the sub_task with the \
+dep's repo_url, name, default_branch, and git_provider_id.
+
+QUERY ENRICHMENT:
+- Before answering or creating tasks, identify gaps in the user's request — are there ambiguous \
+file paths, unclear current behavior, or missing context?
+- Explore the codebase to find actual file paths, current implementations, and patterns.
+- When creating sub_tasks, include specific file paths, current code patterns, and expected \
+outcomes discovered during exploration. Make descriptions self-contained so the agent doesn't \
+need to re-discover everything.
 
 REVIEW LOOP (review_loop field):
 - Set review_loop=true for critical or complex code changes that need the full \

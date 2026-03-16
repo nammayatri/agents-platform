@@ -9,6 +9,7 @@ import type {
   GitProviderPayload, SkillPayload, McpServerPayload,
   NotificationChannelPayload, AgentCreatePayload, AgentUpdatePayload,
   ProjectMember, DebugContext,
+  FileTreeNode, FileContent, GitStatus,
 } from '../types'
 
 const API_BASE = '/api'
@@ -163,6 +164,37 @@ export const todos = {
       method: 'POST',
       body: JSON.stringify({ feedback }),
     }),
+  resume: (id: string) =>
+    request<{ status: string }>(`/todos/${id}/resume`, { method: 'POST' }),
+  workspace: {
+    tree: (todoId: string) =>
+      request<FileTreeNode[]>(`/todos/${todoId}/workspace/tree`),
+    file: (todoId: string, path: string) =>
+      request<FileContent>(`/todos/${todoId}/workspace/file?path=${encodeURIComponent(path)}`),
+    saveFile: (todoId: string, path: string, content: string) =>
+      request<{ path: string; size: number; saved: boolean }>(`/todos/${todoId}/workspace/file`, {
+        method: 'PUT',
+        body: JSON.stringify({ path, content }),
+      }),
+    gitStatus: (todoId: string) =>
+      request<GitStatus>(`/todos/${todoId}/workspace/git/status`),
+    gitDiff: (todoId: string, staged?: boolean) =>
+      request<{ diff: string; stats: string }>(`/todos/${todoId}/workspace/git/diff${staged ? '?staged=true' : ''}`),
+    gitAdd: (todoId: string, paths: string[]) =>
+      request<GitStatus>(`/todos/${todoId}/workspace/git/add`, {
+        method: 'POST',
+        body: JSON.stringify({ paths }),
+      }),
+    gitCommit: (todoId: string, message: string) =>
+      request<{ hash: string; message: string; success: boolean }>(`/todos/${todoId}/workspace/git/commit`, {
+        method: 'POST',
+        body: JSON.stringify({ message }),
+      }),
+    gitPush: (todoId: string) =>
+      request<{ success: boolean; output: string; branch: string }>(`/todos/${todoId}/workspace/git/push`, {
+        method: 'POST',
+      }),
+  },
 }
 
 // Chat (todo-level)

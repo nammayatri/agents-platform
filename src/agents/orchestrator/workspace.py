@@ -20,12 +20,16 @@ import shutil
 
 import asyncpg
 
-from agents.infra.crypto import decrypt
 from agents.orchestrator.git_providers.factory import (
     build_clone_url,
     create_git_provider,
-    detect_provider_type,
     parse_repo_url,
+)
+from agents.utils.file_utils import build_file_tree_text
+from agents.utils.git_utils import (
+    ensure_authenticated_remote,
+    resolve_git_credentials,
+    run_git_command,
 )
 
 logger = logging.getLogger(__name__)
@@ -40,57 +44,6 @@ class WorkspaceManager:
     # ------------------------------------------------------------------
     # Project workspace
     # ------------------------------------------------------------------
-
-    async def _resolve_git_credentials(
-        self, git_provider_id: str | None, repo_url: str,
-    ) -> tuple[str | None, str | None, str | None]:
-        """Resolve git credentials (token, provider_type, api_base_url).
-
-        If git_provider_id is set, looks up that specific provider config.
-        Otherwise, auto-detects provider type from the repo URL and falls back
-        to the first matching active provider config in the database.
-
-        Returns (token, provider_type, api_base_url).
-        """
-        token = None
-        provider_type = None
-        api_base_url = None
-
-        if git_provider_id:
-            row = await self.db.fetchrow(
-                "SELECT provider_type, api_base_url, token_enc "
-                "FROM git_provider_configs WHERE id = $1 AND is_active = TRUE",
-                git_provider_id,
-            )
-            if row:
-                token = decrypt(row["token_enc"]) if row.get("token_enc") else None
-                provider_type = row["provider_type"]
-                api_base_url = row.get("api_base_url")
-
-        if not token and repo_url:
-            # Fallback: find an active provider matching the repo URL's host
-            detected = detect_provider_type(repo_url)
-            if detected:
-                row = await self.db.fetchrow(
-                    "SELECT provider_type, api_base_url, token_enc "
-                    "FROM git_provider_configs "
-                    "WHERE provider_type = $1 AND is_active = TRUE "
-                    "LIMIT 1",
-                    detected,
-                )
-                if row:
-                    token = decrypt(row["token_enc"]) if row.get("token_enc") else None
-                    provider_type = row["provider_type"]
-                    api_base_url = row.get("api_base_url")
-                    logger.info(
-                        "Resolved git credentials via fallback: provider_type=%s",
-                        provider_type,
-                    )
-
-        if not provider_type:
-            provider_type = detect_provider_type(repo_url)
-
-        return token, provider_type, api_base_url
 
     async def setup_project_workspace(self, project_id: str) -> str:
         """Clone/pull the main repo and dependency repos into the project workspace.
@@ -112,12 +65,12 @@ class WorkspaceManager:
         deps_dir = os.path.join(project_dir, "deps")
         os.makedirs(deps_dir, exist_ok=True)
 
-        # Resolve credentials from git_provider_configs
         project_git_provider_id = str(project["git_provider_id"]) if project.get("git_provider_id") else None
-        token, provider_type, _ = await self._resolve_git_credentials(project_git_provider_id, repo_url)
+        token, provider_type, _ = await resolve_git_credentials(
+            self.db, project_git_provider_id, repo_url,
+        )
         branch = project.get("default_branch") or "main"
 
-        # Clone or pull the main repo
         await self._clone_or_pull(
             repo_url=repo_url,
             target_dir=repo_dir,
@@ -126,7 +79,6 @@ class WorkspaceManager:
             provider_type=provider_type,
         )
 
-        # Clone dependency repos
         context_docs = project.get("context_docs") or []
         if isinstance(context_docs, str):
             context_docs = json.loads(context_docs)
@@ -138,9 +90,11 @@ class WorkspaceManager:
             dep_name = dep.get("name", "").replace("/", "_").replace(" ", "_") or "dep"
             dep_dir = os.path.join(deps_dir, dep_name)
             try:
+                from agents.orchestrator.git_providers.factory import detect_provider_type
+
                 dep_git_provider_id = dep.get("git_provider_id")
-                dep_token, dep_provider_type, _ = await self._resolve_git_credentials(
-                    dep_git_provider_id, dep_url,
+                dep_token, dep_provider_type, _ = await resolve_git_credentials(
+                    self.db, dep_git_provider_id, dep_url,
                 )
                 if not dep_token and token:
                     dep_detected = detect_provider_type(dep_url)
@@ -157,12 +111,10 @@ class WorkspaceManager:
             except Exception:
                 logger.warning("Failed to clone dependency %s from %s", dep_name, dep_url)
 
-        # Clone all dependencies in parallel
         dep_tasks = [_clone_dep(dep) for dep in context_docs]
         if dep_tasks:
             await asyncio.gather(*dep_tasks, return_exceptions=True)
 
-        # Store workspace path in DB
         await self.db.execute(
             "UPDATE projects SET workspace_path = $2, updated_at = NOW() WHERE id = $1",
             project_id,
@@ -195,7 +147,6 @@ class WorkspaceManager:
         project_id = str(todo["project_id"])
         project_workspace = todo.get("project_workspace")
 
-        # Ensure project workspace exists
         if not project_workspace or not os.path.isdir(project_workspace):
             logger.info("[workspace] No project workspace, setting up for project=%s", project_id)
             project_workspace = await self.setup_project_workspace(project_id)
@@ -204,46 +155,41 @@ class WorkspaceManager:
         if not os.path.isdir(project_repo_dir):
             raise ValueError(f"Project repo not cloned at {project_repo_dir}")
 
-        # Create task workspace
         short_id = str(todo_id)[:8]
         task_dir = os.path.join(project_workspace, "tasks", str(todo_id))
         task_repo_dir = os.path.join(task_dir, "repo")
 
         if os.path.isdir(task_repo_dir):
-            # Already exists -- pull latest
             logger.info("[workspace] Task workspace exists, fetching latest for todo=%s", todo_id)
-            await self._run_git("fetch", "origin", cwd=task_repo_dir)
+            await run_git_command("fetch", "origin", cwd=task_repo_dir)
             return task_dir
 
         os.makedirs(task_dir, exist_ok=True)
 
-        # Resolve git credentials from git_provider_configs
         clone_url = todo.get("repo_url") or ""
         git_provider_id = str(todo["git_provider_id"]) if todo.get("git_provider_id") else None
         logger.info("[workspace] Cloning task workspace: todo=%s clone_url=%s", todo_id, clone_url[:50] if clone_url else "none")
-        token, provider_type, _ = await self._resolve_git_credentials(git_provider_id, clone_url)
+        token, provider_type, _ = await resolve_git_credentials(
+            self.db, git_provider_id, clone_url,
+        )
 
-        # Use local clone from project workspace for speed
-        rc, out = await self._run_git(
+        rc, out = await run_git_command(
             "clone", project_repo_dir, task_repo_dir,
             cwd=self.workspace_root,
         )
         if rc != 0:
             raise RuntimeError(f"Failed to clone task workspace: {out}")
 
-        # Set the remote to the real origin (not the local path)
         authenticated_url = build_clone_url(clone_url, token, provider_type)
-        await self._run_git(
+        await run_git_command(
             "remote", "set-url", "origin", authenticated_url,
             cwd=task_repo_dir,
         )
 
-        # Create task branch
         branch_name = f"task/{short_id}"
         logger.info("[workspace] Created task branch=%s for todo=%s", branch_name, todo_id)
-        await self._run_git("checkout", "-b", branch_name, cwd=task_repo_dir)
+        await run_git_command("checkout", "-b", branch_name, cwd=task_repo_dir)
 
-        # Symlink deps into task workspace
         project_deps = os.path.join(project_workspace, "deps")
         task_deps = os.path.join(task_dir, "deps")
         if os.path.isdir(project_deps) and not os.path.exists(task_deps):
@@ -304,12 +250,7 @@ class WorkspaceManager:
     ) -> bool:
         """Stage all changes, commit, and push to remote.
 
-        Resolves configured git credentials and ensures the remote URL is
-        authenticated before pushing, so pushes never depend on OS-level
-        credential helpers.
-
-        Returns True if the branch was successfully pushed (even if there
-        were no new changes to commit — the branch itself still gets pushed).
+        Returns True if the branch was successfully pushed.
         """
         repo_dir = os.path.join(workspace_path, "repo")
         if not os.path.isdir(repo_dir):
@@ -319,88 +260,42 @@ class WorkspaceManager:
             logger.error("commit_and_push: no .git directory in %s", repo_dir)
             return False
 
-        # Ensure the remote URL uses configured credentials
-        await self._ensure_authenticated_remote(repo_dir)
+        await ensure_authenticated_remote(repo_dir, self.db)
 
-        # Ensure we're on the right branch
-        rc, current_branch = await self._run_git("rev-parse", "--abbrev-ref", "HEAD", cwd=repo_dir)
+        rc, current_branch = await run_git_command("rev-parse", "--abbrev-ref", "HEAD", cwd=repo_dir)
         if rc == 0:
             current_branch = current_branch.strip()
             if current_branch != branch:
                 logger.info("Switching from %s to %s", current_branch, branch)
-                # Try checkout; create if it doesn't exist
-                rc, out = await self._run_git("checkout", branch, cwd=repo_dir)
+                rc, out = await run_git_command("checkout", branch, cwd=repo_dir)
                 if rc != 0:
-                    rc, out = await self._run_git("checkout", "-b", branch, cwd=repo_dir)
+                    rc, out = await run_git_command("checkout", "-b", branch, cwd=repo_dir)
                     if rc != 0:
                         logger.error("git checkout -b %s failed: %s", branch, out)
                         return False
 
-        # Stage all changes
-        rc, out = await self._run_git("add", "-A", cwd=repo_dir)
+        rc, out = await run_git_command("add", "-A", cwd=repo_dir)
         if rc != 0:
             logger.error("git add failed: %s", out)
             return False
 
-        # Check if there's anything to commit
-        rc, out = await self._run_git("diff", "--cached", "--quiet", cwd=repo_dir)
+        rc, out = await run_git_command("diff", "--cached", "--quiet", cwd=repo_dir)
         if rc == 0:
             logger.info("No new changes to commit — checking if branch has unpushed commits")
         else:
-            # Commit
-            rc, out = await self._run_git(
-                "commit", "-m", message,
-                cwd=repo_dir,
-            )
+            rc, out = await run_git_command("commit", "-m", message, cwd=repo_dir)
             if rc != 0:
                 logger.error("git commit failed: %s", out)
                 return False
             logger.info("Committed changes on branch %s", branch)
 
-        # Push (always push — branch may have unpushed commits from earlier)
-        rc, out = await self._run_git(
-            "push", "-u", "origin", branch,
-            cwd=repo_dir,
-        )
+        rc, out = await run_git_command("push", "-u", "origin", branch, cwd=repo_dir)
         if rc != 0:
             logger.error("git push failed: %s", out)
             return False
 
         logger.info("Pushed branch %s to origin", branch)
         return True
-
-    async def _ensure_authenticated_remote(self, repo_dir: str) -> None:
-        """Check the current origin URL and re-set it with configured credentials.
-
-        Reads the current remote URL, resolves credentials from the database,
-        and updates the remote URL to include the token so that git push
-        always uses configured credentials rather than OS-level helpers.
-        """
-        rc, current_url = await self._run_git(
-            "remote", "get-url", "origin", cwd=repo_dir,
-        )
-        if rc != 0 or not current_url.strip():
-            return
-
-        current_url = current_url.strip()
-
-        # Skip if the URL already has credentials embedded
-        if "@" in current_url and "x-access-token" in current_url:
-            return
-
-        token, provider_type, _ = await self._resolve_git_credentials(None, current_url)
-        if not token:
-            logger.warning(
-                "No configured git credentials found for %s — push may fail",
-                current_url,
-            )
-            return
-
-        authenticated_url = build_clone_url(current_url, token, provider_type)
-        await self._run_git(
-            "remote", "set-url", "origin", authenticated_url, cwd=repo_dir,
-        )
-        logger.info("Updated remote origin to use configured credentials")
 
     async def create_pr(
         self,
@@ -426,8 +321,8 @@ class WorkspaceManager:
         repo_url = project["repo_url"]
         git_provider_id = str(project["git_provider_id"]) if project.get("git_provider_id") else None
 
-        token, provider_type, api_base_url = await self._resolve_git_credentials(
-            git_provider_id, repo_url,
+        token, provider_type, api_base_url = await resolve_git_credentials(
+            self.db, git_provider_id, repo_url,
         )
 
         provider = create_git_provider(
@@ -461,12 +356,10 @@ class WorkspaceManager:
     ) -> dict:
         """Create a PR for any repo (not just the project's main repo).
 
-        Like create_pr but takes explicit repo_url and git_provider_id
-        instead of looking them up from the projects table.
         Returns {"url": str, "number": int}.
         """
-        token, provider_type, api_base_url = await self._resolve_git_credentials(
-            git_provider_id, repo_url,
+        token, provider_type, api_base_url = await resolve_git_credentials(
+            self.db, git_provider_id, repo_url,
         )
 
         provider = create_git_provider(
@@ -497,31 +390,7 @@ class WorkspaceManager:
         repo_dir = os.path.join(workspace_path, "repo")
         if not os.path.isdir(repo_dir):
             repo_dir = workspace_path
-
-        lines: list[str] = []
-        skip_dirs = {
-            ".git", "node_modules", "__pycache__", ".venv", "venv",
-            "dist", "build", ".next", ".nuxt", "target", ".tox",
-        }
-
-        def _walk(path: str, prefix: str, depth: int) -> None:
-            if depth > max_depth:
-                lines.append(f"{prefix}...")
-                return
-            try:
-                entries = sorted(os.listdir(path))
-            except PermissionError:
-                return
-            dirs = [e for e in entries if os.path.isdir(os.path.join(path, e)) and e not in skip_dirs]
-            files = [e for e in entries if os.path.isfile(os.path.join(path, e))]
-            for f in files:
-                lines.append(f"{prefix}{f}")
-            for d in dirs:
-                lines.append(f"{prefix}{d}/")
-                _walk(os.path.join(path, d), prefix + "  ", depth + 1)
-
-        _walk(repo_dir, "", 0)
-        return "\n".join(lines)
+        return build_file_tree_text(repo_dir, max_depth)
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -539,38 +408,24 @@ class WorkspaceManager:
         clone_url = build_clone_url(repo_url, token, provider_type)
 
         if os.path.isdir(os.path.join(target_dir, ".git")):
-            # Pull latest
-            rc, out = await self._run_git("fetch", "origin", cwd=target_dir)
+            rc, out = await run_git_command("fetch", "origin", cwd=target_dir)
             if rc != 0:
                 logger.warning("git fetch failed for %s: %s", target_dir, out)
                 return False
-            rc, out = await self._run_git(
+            rc, out = await run_git_command(
                 "reset", "--hard", f"origin/{branch}" if branch != "HEAD" else "FETCH_HEAD",
                 cwd=target_dir,
             )
             return rc == 0
 
-        # Fresh clone
         os.makedirs(os.path.dirname(target_dir), exist_ok=True)
         args = ["clone", "--depth", "1"]
         if branch and branch != "HEAD":
             args.extend(["--branch", branch])
         args.extend([clone_url, target_dir])
 
-        rc, out = await self._run_git(*args, cwd=self.workspace_root)
+        rc, out = await run_git_command(*args, cwd=self.workspace_root)
         if rc != 0:
             logger.error("git clone failed: %s", out)
             return False
         return True
-
-    async def _run_git(self, *args: str, cwd: str) -> tuple[int, str]:
-        """Run a git command asynchronously."""
-        proc = await asyncio.create_subprocess_exec(
-            "git", *args,
-            cwd=cwd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-            env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
-        )
-        stdout, _ = await proc.communicate()
-        return proc.returncode or 0, stdout.decode(errors="replace")

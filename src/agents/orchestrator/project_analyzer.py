@@ -72,24 +72,30 @@ SKIP_EXTENSIONS = {
 
 ANALYZER_SYSTEM_PROMPT = """\
 You are a project analyst. Given a project's directory structure, documentation, \
-configuration files, and sampled source code, produce a structured understanding.
+configuration files, sampled source code, and cross-repo integration data, produce a \
+structured understanding.
 
 Your analysis should cover:
 1. **Purpose**: What the project does, its core value proposition
 2. **Architecture**: High-level architecture, key modules/components, data flow
 3. **Tech stack**: Languages, frameworks, databases, infrastructure
 4. **Key patterns**: Coding conventions, design patterns, error handling approach
-5. **Dependency relationships**: How each listed dependency is used
-6. **API surface**: Key endpoints, interfaces, or entry points
-7. **Testing**: Testing approach, test frameworks, CI/CD patterns
-8. **Important context**: Anything an AI agent should know before working on tasks
+5. **Dependency relationships**: How each listed dependency is used, including specific \
+files and interfaces at integration points
+6. **Cross-repo links**: How the main repo integrates with each dependency — shared types, \
+API calls, imports, configuration references
+7. **API surface**: Key endpoints, interfaces, or entry points
+8. **Testing**: Testing approach, test frameworks, CI/CD patterns
+9. **Important context**: Anything an AI agent should know before working on tasks
 
 Output a JSON object with these keys:
 - "purpose": string (2-3 sentences)
 - "architecture": string (paragraph describing structure)
 - "tech_stack": list of strings
 - "key_patterns": list of strings (important conventions)
-- "dependency_map": list of {"name": string, "role": string}
+- "dependency_map": list of {"name": string, "role": string, "integration_files": list of strings}
+- "cross_repo_links": list of {"dep_name": string, "main_repo_files": list of strings, \
+"shared_interfaces": list of strings, "integration_pattern": string}
 - "api_surface": string (key endpoints or interfaces)
 - "testing_approach": string
 - "important_context": list of strings (things an agent must know)
@@ -157,6 +163,10 @@ class ProjectAnalyzer:
             sampled = self._smart_sample(repo_dir)
             dep_summaries = self._sample_dependencies(deps_dir, context_docs)
 
+            # Find cross-repo integration points (main repo -> deps)
+            dep_names = [d.get("name", "") for d in context_docs if d.get("name")]
+            integration_points = self._find_integration_points(repo_dir, dep_names)
+
             provider = await provider_task
 
             if not sampled["files"]:
@@ -174,9 +184,12 @@ class ProjectAnalyzer:
             )
 
             if dep_summaries:
+                dep_detail = f"Read docs for {len(dep_summaries)} dependencies"
+                if integration_points:
+                    total_refs = sum(len(v) for v in integration_points.values())
+                    dep_detail += f", found {total_refs} cross-repo references"
                 await self._publish_progress(
-                    project_id, "dependencies",
-                    f"Read docs for {len(dep_summaries)} dependencies",
+                    project_id, "dependencies", dep_detail,
                 )
 
             if not provider:
@@ -195,6 +208,7 @@ class ProjectAnalyzer:
                 dependencies=context_docs,
                 dep_summaries=dep_summaries,
                 provider=provider,
+                integration_points=integration_points or None,
             )
 
             if analysis:
@@ -352,10 +366,12 @@ class ProjectAnalyzer:
     def _sample_dependencies(
         self, deps_dir: str, context_docs: list[dict]
     ) -> list[dict]:
-        """Read README and config from cloned dependency repos."""
+        """Read README, config, file tree, and key source files from dependency repos."""
         summaries: list[dict] = []
         if not os.path.isdir(deps_dir):
             return summaries
+
+        dep_budget = 20_000  # max chars of source content per dependency
 
         for dep in context_docs:
             dep_name = dep.get("name", "").replace("/", "_").replace(" ", "_")
@@ -363,7 +379,7 @@ class ProjectAnalyzer:
             if not os.path.isdir(dep_dir):
                 continue
 
-            summary = {"name": dep.get("name", dep_name)}
+            summary: dict = {"name": dep.get("name", dep_name)}
 
             # Read README
             for readme_name in ("README.md", "readme.md", "README", "README.rst"):
@@ -391,10 +407,132 @@ class ProjectAnalyzer:
                         pass
                     break
 
-            if "readme" in summary or "manifest" in summary:
+            # Build shallow file tree (max depth 3)
+            tree_lines: list[str] = []
+            for root, dirs, files in os.walk(dep_dir):
+                dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+                rel = os.path.relpath(root, dep_dir)
+                depth = 0 if rel == "." else rel.count(os.sep) + 1
+                if depth > 3:
+                    continue
+                indent = "  " * depth
+                if rel != ".":
+                    tree_lines.append(f"{indent}{os.path.basename(root)}/")
+                for f in sorted(files):
+                    ext = os.path.splitext(f)[1].lower()
+                    if ext not in SKIP_EXTENSIONS:
+                        tree_lines.append(f"{indent}  {f}")
+            if tree_lines:
+                summary["tree"] = "\n".join(tree_lines[:200])
+
+            # Read key source files: entry points + shallow src/lib files
+            key_files: list[dict] = []
+            chars_used = 0
+            candidates: list[str] = []
+
+            for root, dirs, files in os.walk(dep_dir):
+                dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+                rel_root = os.path.relpath(root, dep_dir)
+                depth = 0 if rel_root == "." else rel_root.count(os.sep) + 1
+                if depth > 3:
+                    continue
+                for f in sorted(files):
+                    basename = f.lower()
+                    ext = os.path.splitext(f)[1].lower()
+                    if ext in SKIP_EXTENSIONS:
+                        continue
+                    rel_path = os.path.join(rel_root, f) if rel_root != "." else f
+                    # Prioritize entry points and source in key dirs
+                    if basename in ENTRY_POINTS:
+                        candidates.insert(0, rel_path)
+                    elif ext in (".py", ".ts", ".js", ".tsx", ".jsx", ".rs", ".go", ".java"):
+                        parts = rel_path.lower().split(os.sep)
+                        if any(p in ("src", "lib", "app", "api", "core") for p in parts):
+                            candidates.append(rel_path)
+
+            for rel_path in candidates[:15]:
+                if chars_used >= dep_budget:
+                    break
+                abs_path = os.path.join(dep_dir, rel_path)
+                try:
+                    content = open(abs_path, "r", errors="replace").read()
+                    if len(content) > 8000:
+                        content = content[:8000] + "\n[... truncated]"
+                    if chars_used + len(content) > dep_budget:
+                        continue
+                    key_files.append({"path": rel_path, "content": content})
+                    chars_used += len(content)
+                except (OSError, UnicodeDecodeError):
+                    pass
+
+            if key_files:
+                summary["key_files"] = key_files
+
+            if any(k in summary for k in ("readme", "manifest", "key_files", "tree")):
                 summaries.append(summary)
 
         return summaries
+
+    def _find_integration_points(
+        self, repo_dir: str, dep_names: list[str],
+    ) -> dict[str, list[str]]:
+        """Scan main repo for imports/references to each dependency name.
+
+        Returns a mapping of dep_name -> list of "file:line: preview" strings.
+        """
+        import re
+
+        results: dict[str, list[str]] = {}
+        if not dep_names or not os.path.isdir(repo_dir):
+            return results
+
+        # Build search variants for each dep name
+        dep_patterns: dict[str, re.Pattern] = {}
+        for name in dep_names:
+            variants = {name}
+            # Hyphenated <-> underscored
+            if "-" in name:
+                variants.add(name.replace("-", "_"))
+            if "_" in name:
+                variants.add(name.replace("_", "-"))
+            # Scoped package (@org/name -> name part)
+            if "/" in name:
+                variants.add(name.split("/")[-1])
+            # Build a case-insensitive regex matching any variant
+            escaped = [re.escape(v) for v in variants]
+            dep_patterns[name] = re.compile("|".join(escaped), re.IGNORECASE)
+
+        # Walk repo (max depth 5) and grep each file
+        source_exts = {".py", ".ts", ".js", ".tsx", ".jsx", ".rs", ".go", ".java",
+                       ".rb", ".cs", ".json", ".yaml", ".yml", ".toml", ".cfg"}
+
+        for root, dirs, files in os.walk(repo_dir):
+            dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+            rel_root = os.path.relpath(root, repo_dir)
+            depth = 0 if rel_root == "." else rel_root.count(os.sep) + 1
+            if depth > 5:
+                continue
+
+            for fname in files:
+                ext = os.path.splitext(fname)[1].lower()
+                if ext not in source_exts:
+                    continue
+                rel_path = os.path.join(rel_root, fname) if rel_root != "." else fname
+                abs_path = os.path.join(root, fname)
+
+                try:
+                    with open(abs_path, "r", errors="replace") as fh:
+                        for line_no, line in enumerate(fh, 1):
+                            for dep_name, pattern in dep_patterns.items():
+                                if pattern.search(line):
+                                    hits = results.setdefault(dep_name, [])
+                                    if len(hits) < 15:
+                                        preview = line.strip()[:120]
+                                        hits.append(f"{rel_path}:{line_no}: {preview}")
+                except (OSError, UnicodeDecodeError):
+                    pass
+
+        return results
 
     async def _run_analysis(
         self,
@@ -405,6 +543,7 @@ class ProjectAnalyzer:
         dependencies: list[dict],
         dep_summaries: list[dict],
         provider,
+        integration_points: dict[str, list[str]] | None = None,
     ) -> dict | None:
         """Send sampled codebase to LLM for structured analysis."""
         # Build file contents section
@@ -424,7 +563,7 @@ class ProjectAnalyzer:
                     deps_text += f": {dep['description']}"
                 deps_text += "\n"
 
-        # Add cloned dependency docs
+        # Add cloned dependency docs, key files, and tree
         if dep_summaries:
             deps_text += "\n\nDependency documentation:\n"
             for ds in dep_summaries:
@@ -433,6 +572,21 @@ class ProjectAnalyzer:
                     deps_text += ds["readme"] + "\n"
                 if "manifest" in ds:
                     deps_text += f"\nManifest:\n{ds['manifest']}\n"
+                if "tree" in ds:
+                    deps_text += f"\nFile tree:\n{ds['tree']}\n"
+                if "key_files" in ds:
+                    deps_text += f"\nKey source files ({len(ds['key_files'])}):\n"
+                    for kf in ds["key_files"]:
+                        deps_text += f"\n  -- {kf['path']} --\n{kf['content']}\n"
+
+        # Add integration points (cross-repo references)
+        if integration_points:
+            deps_text += "\n\nCross-repo integration points (main repo references to dependencies):\n"
+            for dep_name, hits in integration_points.items():
+                if hits:
+                    deps_text += f"\n{dep_name} ({len(hits)} references):\n"
+                    for hit in hits:
+                        deps_text += f"  {hit}\n"
 
         messages = [
             LLMMessage(role="system", content=ANALYZER_SYSTEM_PROMPT),
