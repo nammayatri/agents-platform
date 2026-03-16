@@ -179,10 +179,18 @@ class SelfHostedProvider(AIProvider):
         if choice.message.tool_calls:
             import json
             for tc in choice.message.tool_calls:
+                try:
+                    args = json.loads(tc.function.arguments)
+                except (json.JSONDecodeError, TypeError):
+                    logger.warning(
+                        "Failed to parse tool call arguments for %s: %s",
+                        tc.function.name, tc.function.arguments[:200] if tc.function.arguments else "None",
+                    )
+                    args = {"_raw_arguments": tc.function.arguments or ""}
                 tool_calls.append({
                     "id": tc.id,
                     "name": tc.function.name,
-                    "arguments": json.loads(tc.function.arguments),
+                    "arguments": args,
                 })
 
         # Fallback: parse XML tool calls from content if model doesn't use native tool API

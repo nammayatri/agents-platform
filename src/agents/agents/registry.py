@@ -161,6 +161,34 @@ _register_tool(BuiltinToolDef(
 ))
 
 _register_tool(BuiltinToolDef(
+    name="semantic_search",
+    description=(
+        "Search the codebase semantically using natural language. "
+        "Use this when you need to find code related to a concept, feature, or pattern. "
+        "More powerful than search_files/grep for conceptual queries like "
+        "'where is authentication handled' or 'error handling patterns'. "
+        "For exact string matching, use search_files instead."
+    ),
+    input_schema={
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "Natural language description of what to find in the codebase",
+            },
+            "top_k": {
+                "type": "integer",
+                "description": "Number of results to return (default: 10)",
+                "default": 10,
+            },
+        },
+        "required": ["query"],
+    },
+    prompt_hint="Search codebase semantically with natural language. Args: query, top_k (optional)",
+    example='semantic_search(query="authentication and authorization logic")',
+))
+
+_register_tool(BuiltinToolDef(
     name="create_subtask",
     description=(
         "Create a new subtask under the current task. Use this when you want to "
@@ -347,21 +375,33 @@ _register(AgentDefinition(
     display_name="Tester",
     description="Writes and runs tests, validates implementations",
     system_prompt=(
-        "You are a test engineer. You MUST use the provided tools to read code and write tests.\n\n"
+        "You are a test engineer. You MUST use the provided tools to read code, write tests, "
+        "and run all build/test/lint commands.\n\n"
         "## Workflow\n"
         "1. Use `read_file` to understand the implementation being tested\n"
         "2. Use `search_files` to find existing test patterns\n"
         "3. Use `write_file` to create or update test files\n"
-        "4. Use `run_command` to execute the tests and verify they pass\n"
+        "4. Use `run_command` to execute build, typecheck, lint, and test commands\n"
         "5. If project build/test commands are provided below, run ALL of them\n\n"
         "## Rules\n"
         "- ALWAYS use `write_file` to create test files — never just output code as text\n"
         "- Cover happy paths, edge cases, and error conditions\n"
         "- Follow the project's existing test conventions and framework\n"
         "- Run tests after writing them to confirm they pass\n"
-        "- If build/test commands are provided in the prompt, you MUST run them all and report results"
+        "- If build/test commands are provided in the prompt, you MUST run them all and report results\n\n"
+        "## IMPORTANT: Structured Output\n"
+        "When you call `task_complete`, your summary MUST be valid JSON with this structure:\n"
+        '```json\n'
+        '{"passed": true/false, "summary": "brief description", "failures": [\n'
+        '  {"file": "src/foo.ts", "type": "build|type_error|test|lint|runtime", '
+        '"error": "the error message"}\n'
+        ']}\n'
+        '```\n'
+        "- `passed`: true if ALL checks pass, false if ANY fail\n"
+        "- `failures`: list every failure with the file, category, and error output\n"
+        "- If passed is true, failures should be an empty list"
     ),
-    default_tools=["read_file", "write_file", "list_directory", "search_files", "run_command", "task_complete"],
+    default_tools=["read_file", "write_file", "list_directory", "search_files", "run_command", "task_complete", "create_subtask"],
     tool_rule_categories=["testing", "quality", "general"],
 ))
 

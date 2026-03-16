@@ -1536,26 +1536,203 @@ class AgentCoordinator:
     async def _create_test_fix_subtasks(
         self, todo: dict, provider: AIProvider, test_results: dict, workspace_path: str | None,
     ) -> None:
-        """When testing fails, create coder subtask(s) to fix the issues."""
-        error_output = test_results.get("error_output", "Unknown test failures")
+        """When testing fails, create coder subtask(s) to fix the issues.
 
-        fix_description = (
-            "The testing phase found failures that need to be fixed:\n\n"
-            f"```\n{error_output[:3000]}\n```\n\n"
-            "Investigate these failures and fix the underlying code issues. "
-            "Do NOT disable tests or skip checks -- fix the actual problems."
-        )
+        Groups failures by phase (build/quality/test) and creates a separate
+        fix subtask for each category so coders get focused, actionable tasks.
+        """
+        steps = test_results.get("steps", [])
+        failed_steps = [s for s in steps if not s.get("passed")]
 
-        await self._create_guardrail_subtask(
-            title="Fix test failures from testing phase",
-            description=fix_description,
-            role="coder",
-            depends_on=[],
-        )
+        if not failed_steps:
+            # Fallback: no structured steps, use raw error_output
+            error_output = test_results.get("error_output", "Unknown test failures")
+            await self._create_guardrail_subtask(
+                title="Fix test failures from testing phase",
+                description=(
+                    "The testing phase found failures that need to be fixed:\n\n"
+                    f"```\n{error_output[:3000]}\n```\n\n"
+                    "Investigate these failures and fix the underlying code issues. "
+                    "Do NOT disable tests or skip checks -- fix the actual problems."
+                ),
+                role="coder",
+                depends_on=[],
+            )
+            await self._post_system_message(
+                f"**Testing failed.** Creating fix subtask and retrying.\n\n"
+                f"Failures:\n```\n{error_output[:500]}\n```"
+            )
+            return
+
+        # Group failed steps by phase
+        by_phase: dict[str, list[dict]] = {}
+        for step in failed_steps:
+            phase = step.get("phase", "test")
+            by_phase.setdefault(phase, []).append(step)
+
+        phase_labels = {
+            "install": "dependency installation",
+            "build": "build",
+            "quality": "quality/lint checks",
+            "test": "test suite",
+        }
+
+        created_ids = []
+        for phase, phase_steps in by_phase.items():
+            label = phase_labels.get(phase, phase)
+            errors_block = "\n\n".join(
+                f"**Command:** `{s['command']}`\n```\n{s['output'][:1500]}\n```"
+                for s in phase_steps
+            )
+            fix_desc = (
+                f"The {label} failed during the testing phase. Fix the issues below.\n\n"
+                f"{errors_block}\n\n"
+                "Fix the actual problems in the source code. "
+                "Do NOT disable tests, skip checks, or remove failing commands."
+            )
+            st_id = await self._create_guardrail_subtask(
+                title=f"Fix {label} failures",
+                description=fix_desc,
+                role="coder",
+                depends_on=[],
+            )
+            created_ids.append(st_id)
+
+        summary_lines = []
+        for phase, phase_steps in by_phase.items():
+            cmds = ", ".join(f"`{s['command']}`" for s in phase_steps)
+            summary_lines.append(f"- **{phase_labels.get(phase, phase)}**: {cmds}")
 
         await self._post_system_message(
-            f"**Testing failed.** Creating fix subtask and retrying.\n\n"
-            f"Failures:\n```\n{error_output[:500]}\n```"
+            f"**Testing failed.** Creating {len(created_ids)} fix subtask(s) and retrying.\n\n"
+            + "\n".join(summary_lines)
+        )
+
+    _MAX_TEST_FIX_ROUNDS = 3  # Max tester→fix→retest cycles
+
+    async def _create_test_fix_subtasks_from_tester(
+        self,
+        tester_st: dict,
+        chain_id,
+        failures: list[dict],
+        summary: str,
+    ) -> None:
+        """Create structured coder fix subtasks from a tester subtask's failure output.
+
+        Groups failures by type (build, type_error, test, lint, runtime) and creates
+        one coder fix subtask per category. Then creates a new tester subtask that
+        depends on all fixes to re-validate.
+        """
+        # Check how many test-fix rounds have already happened in this chain
+        fix_rounds = await self.db.fetchval(
+            "SELECT COUNT(*) FROM sub_tasks "
+            "WHERE todo_id = $1 AND review_chain_id = $2 AND agent_role = 'tester'",
+            self.todo_id, chain_id,
+        ) or 0
+        if fix_rounds >= self._MAX_TEST_FIX_ROUNDS:
+            logger.warning(
+                "[%s] Test-fix loop capped at %d rounds for chain %s — letting reviewer proceed",
+                self.todo_id, self._MAX_TEST_FIX_ROUNDS, chain_id,
+            )
+            await self._post_system_message(
+                f"**Test-fix loop capped at {self._MAX_TEST_FIX_ROUNDS} rounds.** "
+                "Proceeding to review with known test failures."
+            )
+            return
+
+        # Group failures by type
+        by_type: dict[str, list[dict]] = {}
+        for f in failures:
+            ftype = f.get("type", "test") if isinstance(f, dict) else "test"
+            by_type.setdefault(ftype, []).append(f)
+
+        type_labels = {
+            "build": "Build errors",
+            "type_error": "Type errors",
+            "test": "Test failures",
+            "lint": "Lint violations",
+            "runtime": "Runtime errors",
+        }
+
+        tester_id = str(tester_st["id"])
+        fix_ids = []
+
+        for ftype, type_failures in by_type.items():
+            label = type_labels.get(ftype, ftype)
+
+            # Build structured error description
+            error_lines = []
+            for f in type_failures:
+                if not isinstance(f, dict):
+                    error_lines.append(f"- {f}")
+                    continue
+                file_path = f.get("file", "")
+                error_msg = f.get("error", str(f))
+                if file_path:
+                    error_lines.append(f"**{file_path}**:\n```\n{error_msg[:1000]}\n```")
+                else:
+                    error_lines.append(f"```\n{error_msg[:1000]}\n```")
+
+            fix_desc = (
+                f"The tester found {len(type_failures)} {label.lower()} that need to be fixed:\n\n"
+                + "\n\n".join(error_lines)
+                + "\n\nFix the actual problems in the source code. "
+                "Do NOT disable tests, skip checks, or suppress errors."
+            )
+
+            fix_id = await self._create_guardrail_subtask(
+                title=f"Fix {label.lower()}",
+                description=fix_desc,
+                role="coder",
+                depends_on=[tester_id],
+                review_chain_id=chain_id,
+            )
+            fix_ids.append(fix_id)
+
+        # Create a new tester subtask that depends on all fixes to re-validate
+        retest_desc = (
+            "Re-run all build, typecheck, lint, and test commands to verify "
+            "the fixes resolved the previously reported failures.\n\n"
+            f"Previous failures summary: {summary[:500]}\n\n"
+            "Run ALL checks and report structured results."
+        )
+        await self._create_guardrail_subtask(
+            title="Re-test after fixes",
+            description=retest_desc,
+            role="tester",
+            depends_on=fix_ids,
+            review_loop=True,
+            review_chain_id=chain_id,
+        )
+
+        # Block the existing reviewer by adding the new fix subtasks as dependencies
+        # Find the pending reviewer in this chain
+        reviewer = await self.db.fetchrow(
+            "SELECT id, depends_on FROM sub_tasks "
+            "WHERE todo_id = $1 AND review_chain_id = $2 AND agent_role = 'reviewer' "
+            "AND status = 'pending' LIMIT 1",
+            self.todo_id, chain_id,
+        )
+        if reviewer:
+            existing_deps = reviewer.get("depends_on") or []
+            new_deps = list(set(existing_deps + fix_ids))
+            await self.db.execute(
+                "UPDATE sub_tasks SET depends_on = $2 WHERE id = $1",
+                reviewer["id"], new_deps,
+            )
+            logger.info(
+                "[%s] Updated reviewer %s deps to include fix subtasks: %s",
+                self.todo_id, reviewer["id"], fix_ids,
+            )
+
+        # Summary for the user
+        type_summary = ", ".join(
+            f"{len(fs)} {type_labels.get(ft, ft).lower()}"
+            for ft, fs in by_type.items()
+        )
+        await self._post_system_message(
+            f"**Tester found failures:** {type_summary}.\n\n"
+            f"Creating {len(fix_ids)} fix subtask(s) + re-test."
         )
 
     async def _get_project_settings(self, todo: dict) -> dict:
@@ -2542,6 +2719,40 @@ class AgentCoordinator:
             # Commit/push/PR happens later, after reviewer approval.
             await self._create_reviewer_subtask(st, chain_id, workspace_path)
 
+        elif role == "tester":
+            # Tester finished → parse pass/fail verdict from structured output.
+            # If tests failed, create coder fix subtasks with error details.
+            output = st.get("output_result") or {}
+            tester_passed = True
+            tester_failures = []
+
+            if isinstance(output, dict):
+                tester_passed = output.get("passed", True)
+                tester_failures = output.get("failures", [])
+                # Also try parsing from content if structured fields missing
+                if tester_passed and not tester_failures:
+                    content = output.get("content", "") or output.get("raw_content", "")
+                    parsed = parse_llm_json(content) if content else None
+                    if parsed and isinstance(parsed, dict):
+                        tester_passed = parsed.get("passed", True)
+                        tester_failures = parsed.get("failures", [])
+
+            if tester_passed or not tester_failures:
+                logger.info(
+                    "[%s] Tester subtask %s passed — reviewer can proceed",
+                    self.todo_id, st["id"],
+                )
+            else:
+                # Tests failed — create fix subtasks and block reviewer
+                logger.info(
+                    "[%s] Tester subtask %s found %d failures — creating fix subtasks",
+                    self.todo_id, st["id"], len(tester_failures),
+                )
+                summary = output.get("summary", "") if isinstance(output, dict) else ""
+                await self._create_test_fix_subtasks_from_tester(
+                    st, chain_id, tester_failures, summary,
+                )
+
         elif role == "reviewer":
             # Parse verdict — prefer structured output field, fall back to heuristic
             verdict = st.get("review_verdict")
@@ -3006,20 +3217,30 @@ class AgentCoordinator:
         created: list[tuple[str, str]] = []
         coder_ids = [str(st["id"]) for st in unreviewed_coders]
         coder_titles = [st["title"] for st in unreviewed_coders]
+        # Use first coder's ID as the chain root
+        chain_id = coder_ids[0]
 
         # 1. Tester guardrail
         if "tester" not in existing:
             tester_desc = (
-                "Write and run tests to validate the code changes made by the coder subtask(s):\n"
+                "Validate the code changes made by the coder subtask(s):\n"
                 + "\n".join(f"- {t}" for t in coder_titles)
-                + "\n\nFocus on: unit tests for new/changed functions, edge cases, "
-                "and regression tests. Run the test suite and report results."
+                + "\n\nRun ALL build, typecheck, lint, and test commands. "
+                "Write additional tests for new/changed functions if needed.\n\n"
+                "You MUST output structured JSON via task_complete:\n"
+                '```json\n'
+                '{"passed": true/false, "summary": "...", "failures": [\n'
+                '  {"file": "path", "type": "build|type_error|test|lint|runtime", "error": "message"}\n'
+                ']}\n'
+                '```'
             )
             tester_id = await self._create_guardrail_subtask(
                 title="Test implemented changes",
                 description=tester_desc,
                 role="tester",
                 depends_on=coder_ids,
+                review_loop=True,
+                review_chain_id=chain_id,
             )
             created.append(("tester", tester_id))
 
@@ -3040,6 +3261,8 @@ class AgentCoordinator:
                 description=reviewer_desc,
                 role="reviewer",
                 depends_on=deps,
+                review_loop=True,
+                review_chain_id=chain_id,
             )
             created.append(("reviewer", reviewer_id))
 
@@ -3062,6 +3285,9 @@ class AgentCoordinator:
         description: str,
         role: str,
         depends_on: list[str],
+        *,
+        review_loop: bool = False,
+        review_chain_id: str | None = None,
     ) -> str:
         """Create a guardrail subtask and return its ID as string."""
         # Compute execution_order: max of dependencies + 1
@@ -3077,9 +3303,9 @@ class AgentCoordinator:
             """
             INSERT INTO sub_tasks (
                 todo_id, title, description, agent_role,
-                execution_order, depends_on
+                execution_order, depends_on, review_loop, review_chain_id
             )
-            VALUES ($1, $2, $3, $4, $5, $6)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
             RETURNING id
             """,
             self.todo_id,
@@ -3088,11 +3314,13 @@ class AgentCoordinator:
             role,
             max_order + 1,
             depends_on,
+            review_loop,
+            review_chain_id,
         )
         st_id = str(row["id"])
         logger.info(
-            "[%s] Created guardrail subtask %s: role=%s title=%s depends_on=%s",
-            self.todo_id, st_id, role, title, depends_on,
+            "[%s] Created guardrail subtask %s: role=%s title=%s depends_on=%s review_loop=%s chain=%s",
+            self.todo_id, st_id, role, title, depends_on, review_loop, review_chain_id,
         )
         return st_id
 
@@ -3880,8 +4108,8 @@ class AgentCoordinator:
         )
         if current == "review":
             logger.info("[%s] Already in review state, skipping transition", self.todo_id)
-        elif current == "in_progress":
-            await self._transition_todo( "review")
+        elif current in ("in_progress", "testing"):
+            await self._transition_todo("review")
         else:
             logger.warning("[%s] Cannot enter review from state=%s, skipping review phase", self.todo_id, current)
             return

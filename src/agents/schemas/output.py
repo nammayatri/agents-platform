@@ -43,19 +43,24 @@ class CoderOutput(BaseAgentOutput):
 # ── Tester ──────────────────────────────────────────────────────────
 
 
+class TestFailure(BaseModel):
+    file: str = Field(default="", description="File path where the failure occurred")
+    type: Literal["build", "type_error", "test", "lint", "runtime"] = Field(
+        description="Failure category",
+    )
+    error: str = Field(description="Error message or output")
+
+
 class TesterOutput(BaseAgentOutput):
+    passed: bool = Field(description="Whether all tests/checks passed")
+    summary: str = Field(description="Brief summary of test results")
     test_files: list[str] = Field(
         default_factory=list,
-        description="Test file paths created",
+        description="Test file paths created or run",
     )
-    test_summary: str = Field(description="What tests cover")
-    bug_reproduced_before_fix: bool = Field(
-        default=False,
-        description="Bug reproduced before fix",
-    )
-    bug_resolved_after_fix: bool = Field(
-        default=False,
-        description="Bug resolved after fix",
+    failures: list[TestFailure] = Field(
+        default_factory=list,
+        description="Structured list of failures found",
     )
 
 

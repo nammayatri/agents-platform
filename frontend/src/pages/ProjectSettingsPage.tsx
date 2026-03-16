@@ -1,7 +1,7 @@
 import { useEffect, useState, useCallback } from 'react'
 import { useParams, useNavigate, useSearchParams } from 'react-router-dom'
 import { projects as projectsApi, providers as providersApi, gitProviders as gitProvidersApi, skills as skillsApi, mcpServers as mcpApi, projectConfig as projectConfigApi } from '../services/api'
-import type { Project, ProjectDependency, ProjectMember, ProviderConfig, GitProviderConfig, Skill, McpServer, WorkRules } from '../types'
+import type { Project, ProjectDependency, ProjectMember, ProviderConfig, GitProviderConfig, Skill, McpServer, WorkRules, ProjectMemory } from '../types'
 
 import ProjectWizard from '../components/project/ProjectWizard'
 import ProjectGeneralTab from '../components/project/ProjectGeneralTab'
@@ -60,8 +60,14 @@ export default function ProjectSettingsPage() {
   const [buildCommands, setBuildCommands] = useState<string[]>([])
   const [mergeMethod, setMergeMethod] = useState<'merge' | 'squash' | 'rebase'>('squash')
   const [requireMergeApproval, setRequireMergeApproval] = useState(false)
+  const [memories, setMemories] = useState<ProjectMemory[]>([])
+  const [memoriesLoading, setMemoriesLoading] = useState(false)
+  const [architectEditorEnabled, setArchitectEditorEnabled] = useState(false)
+  const [architectModel, setArchitectModel] = useState('')
+  const [editorModel, setEditorModel] = useState('')
+  const [providerModels, setProviderModels] = useState<{id: string; name: string}[]>([])
 
-  const editTabs = ['General', 'Repository', 'Dependencies', 'Rules', 'Build & Merge', 'Debug', 'Capabilities', 'Members', 'Understanding', 'Agents']
+  const editTabs = ['General', 'Repository', 'Dependencies', 'Rules', 'Build & Merge', 'Debug', 'Capabilities', 'Members', 'Understanding', 'Agents', 'Memories']
   const activeTab = searchParams.get('tab') || editTabs[0]
   const setActiveTab = (t: string) => setSearchParams({ tab: t })
 
@@ -86,6 +92,9 @@ export default function ProjectSettingsPage() {
       setBuildCommands((settings?.build_commands as string[]) || [])
       setMergeMethod((settings?.merge_method as 'merge' | 'squash' | 'rebase') || 'squash')
       setRequireMergeApproval(!!settings?.require_merge_approval)
+      setArchitectEditorEnabled(!!p.architect_editor_enabled)
+      setArchitectModel(p.architect_model || '')
+      setEditorModel(p.editor_model || '')
       try {
         const m = await projectsApi.members.list(projectId!)
         setMemberOwner(m.owner as ProjectMember)
@@ -113,6 +122,26 @@ export default function ProjectSettingsPage() {
     }
   }, [loadProject, projectId])
 
+  // Load memories when Memories tab is selected
+  useEffect(() => {
+    if (activeTab === 'Memories' && projectId && memories.length === 0 && !memoriesLoading) {
+      setMemoriesLoading(true)
+      projectsApi.memories.list(projectId).then((m) => {
+        setMemories(m as ProjectMemory[])
+      }).catch(() => {}).finally(() => setMemoriesLoading(false))
+    }
+  }, [activeTab, projectId]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Load provider models for architect/editor dropdowns
+  useEffect(() => {
+    if (aiProviderId) {
+      providersApi.listModels(aiProviderId).then((resp) => {
+        const r = resp as { models?: {id: string; name: string}[] }
+        setProviderModels(r.models || [])
+      }).catch(() => {})
+    }
+  }, [aiProviderId])
+
   const handleSave = async () => {
     if (!name.trim()) { setError('Project name is required'); return }
     setSaving(true)
@@ -125,6 +154,9 @@ export default function ProjectSettingsPage() {
         repo_url: repoUrl.trim() || undefined,
         default_branch: defaultBranch.trim() || 'main',
         ai_provider_id: aiProviderId || undefined,
+        architect_editor_enabled: architectEditorEnabled,
+        architect_model: architectModel || undefined,
+        editor_model: editorModel || undefined,
         context_docs: validDeps.length > 0 ? validDeps : undefined,
         git_provider_id: gitProviderId || undefined,
         icon_url: iconUrl.trim() || undefined,
@@ -276,6 +308,110 @@ export default function ProjectSettingsPage() {
         )}
 
         {activeTab === 'Agents' && <ProjectAgentsTab />}
+
+        {activeTab === 'Memories' && (
+          <div className="space-y-4">
+            <div>
+              <h3 className="text-sm font-medium text-gray-300 mb-1">Project Memories</h3>
+              <p className="text-xs text-gray-600">Learnings extracted from completed tasks. These are automatically injected into agent context for future tasks.</p>
+            </div>
+            {memoriesLoading && (
+              <div className="animate-pulse space-y-2">
+                {[1,2,3].map(i => <div key={i} className="h-16 bg-gray-800 rounded-lg" />)}
+              </div>
+            )}
+            {!memoriesLoading && memories.length === 0 && (
+              <div className="py-6 text-center text-sm text-gray-600 border border-dashed border-gray-800 rounded-lg">
+                No memories yet. Memories are automatically extracted when tasks complete.
+              </div>
+            )}
+            {!memoriesLoading && memories.map((mem) => (
+              <div key={mem.id} className="px-4 py-3 bg-gray-900 border border-gray-800 rounded-lg group">
+                <div className="flex items-center gap-2 mb-1.5">
+                  <span className={`px-2 py-0.5 rounded text-[10px] font-medium ${
+                    mem.category === 'architecture' ? 'bg-purple-500/10 text-purple-400' :
+                    mem.category === 'pattern' ? 'bg-blue-500/10 text-blue-400' :
+                    mem.category === 'convention' ? 'bg-cyan-500/10 text-cyan-400' :
+                    mem.category === 'pitfall' ? 'bg-red-500/10 text-red-400' :
+                    'bg-emerald-500/10 text-emerald-400'
+                  }`}>
+                    {mem.category}
+                  </span>
+                  <span className="text-[10px] text-gray-600">
+                    confidence: {(mem.confidence * 100).toFixed(0)}%
+                  </span>
+                  <span className="text-[10px] text-gray-700 ml-auto">
+                    {new Date(mem.created_at).toLocaleDateString()}
+                  </span>
+                  {userRole === 'owner' && (
+                    <button
+                      onClick={async () => {
+                        if (confirm('Delete this memory?')) {
+                          await projectsApi.memories.delete(projectId!, mem.id)
+                          setMemories(memories.filter(m => m.id !== mem.id))
+                        }
+                      }}
+                      className="text-red-400/60 hover:text-red-400 text-[11px] hidden group-hover:inline transition-colors"
+                    >
+                      delete
+                    </button>
+                  )}
+                </div>
+                <p className="text-sm text-gray-400 leading-relaxed">{mem.content}</p>
+              </div>
+            ))}
+
+            {/* Architect/Editor Split Settings */}
+            <div className="mt-8 pt-6 border-t border-gray-800">
+              <h3 className="text-sm font-medium text-gray-300 mb-1">Architect / Editor Split</h3>
+              <p className="text-xs text-gray-600 mb-4">Use a powerful model for analysis and planning, and a fast model for applying code changes.</p>
+
+              <label className="flex items-center gap-3 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={architectEditorEnabled}
+                  onChange={(e) => setArchitectEditorEnabled(e.target.checked)}
+                  disabled={userRole !== 'owner'}
+                  className="w-4 h-4 rounded bg-gray-900 border-gray-700 text-indigo-500 focus:ring-indigo-500"
+                />
+                <span className="text-sm text-gray-300">Enable dual-model execution</span>
+              </label>
+
+              {architectEditorEnabled && (
+                <div className="mt-4 space-y-3 pl-7">
+                  <div>
+                    <label className="text-xs text-gray-500 mb-1 block">Architect Model (reasoning)</label>
+                    <select
+                      value={architectModel}
+                      onChange={(e) => setArchitectModel(e.target.value)}
+                      disabled={userRole !== 'owner'}
+                      className="w-full px-3 py-2 bg-gray-900 border border-gray-800 rounded-lg text-white text-sm focus:outline-none focus:border-indigo-500 transition-colors"
+                    >
+                      <option value="">Use provider default</option>
+                      {providerModels.map(m => (
+                        <option key={m.id} value={m.id}>{m.name}</option>
+                      ))}
+                    </select>
+                  </div>
+                  <div>
+                    <label className="text-xs text-gray-500 mb-1 block">Editor Model (fast writes)</label>
+                    <select
+                      value={editorModel}
+                      onChange={(e) => setEditorModel(e.target.value)}
+                      disabled={userRole !== 'owner'}
+                      className="w-full px-3 py-2 bg-gray-900 border border-gray-800 rounded-lg text-white text-sm focus:outline-none focus:border-indigo-500 transition-colors"
+                    >
+                      <option value="">Use provider default</option>
+                      {providerModels.map(m => (
+                        <option key={m.id} value={m.id}>{m.name}</option>
+                      ))}
+                    </select>
+                  </div>
+                </div>
+              )}
+            </div>
+          </div>
+        )}
 
         {/* Error */}
         {error && (

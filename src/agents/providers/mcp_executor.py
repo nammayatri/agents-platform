@@ -318,30 +318,53 @@ class McpToolExecutor:
                 with open(real_path, "r", errors="replace") as f:
                     content = f.read()
 
-                count = content.count(old_text)
-                if count == 0:
-                    logger.info("builtin[edit_file]: old_text not found in %s", path)
+                # Use progressive fuzzy matching instead of exact-only matching
+                try:
+                    from agents.utils.edit_match import apply_edit, EditMatchError
+                    try:
+                        new_content, match = apply_edit(content, old_text, new_text)
+                        with open(real_path, "w") as f:
+                            f.write(new_content)
+                        self.file_cache.put(real_path, new_content)
+                        logger.info(
+                            "builtin[edit_file]: %s — replaced %d chars with %d chars (method=%s, confidence=%.2f)",
+                            path, len(old_text), len(new_text), match.method, match.confidence,
+                        )
+                        return json.dumps({
+                            "status": "ok",
+                            "path": path,
+                            "chars_removed": len(match.matched_text),
+                            "chars_added": len(new_text),
+                            "match_method": match.method,
+                            "match_confidence": round(match.confidence, 3),
+                        })
+                    except EditMatchError as e:
+                        logger.info("builtin[edit_file]: fuzzy match failed in %s: %s", path, str(e)[:200])
+                        return json.dumps({"error": str(e)})
+                except ImportError:
+                    # Fallback to exact matching if edit_match module not available
+                    count = content.count(old_text)
+                    if count == 0:
+                        logger.info("builtin[edit_file]: old_text not found in %s", path)
+                        return json.dumps({
+                            "error": "old_text not found in the file. Make sure it matches exactly (including whitespace/indentation).",
+                        })
+                    if count > 1:
+                        logger.info("builtin[edit_file]: old_text matched %d times in %s", count, path)
+                        return json.dumps({
+                            "error": f"old_text matched {count} times — it must be unique. Include more surrounding context to make it unique.",
+                        })
+                    new_content = content.replace(old_text, new_text, 1)
+                    with open(real_path, "w") as f:
+                        f.write(new_content)
+                    self.file_cache.put(real_path, new_content)
+                    logger.info("builtin[edit_file]: %s — replaced %d chars with %d chars", path, len(old_text), len(new_text))
                     return json.dumps({
-                        "error": "old_text not found in the file. Make sure it matches exactly (including whitespace/indentation).",
+                        "status": "ok",
+                        "path": path,
+                        "chars_removed": len(old_text),
+                        "chars_added": len(new_text),
                     })
-                if count > 1:
-                    logger.info("builtin[edit_file]: old_text matched %d times in %s", count, path)
-                    return json.dumps({
-                        "error": f"old_text matched {count} times — it must be unique. Include more surrounding context to make it unique.",
-                    })
-
-                new_content = content.replace(old_text, new_text, 1)
-                with open(real_path, "w") as f:
-                    f.write(new_content)
-                # Update file cache
-                self.file_cache.put(real_path, new_content)
-                logger.info("builtin[edit_file]: %s — replaced %d chars with %d chars", path, len(old_text), len(new_text))
-                return json.dumps({
-                    "status": "ok",
-                    "path": path,
-                    "chars_removed": len(old_text),
-                    "chars_added": len(new_text),
-                })
 
             elif tool_name == "list_directory":
                 path = tool_input.get("path", "")
@@ -475,6 +498,27 @@ class McpToolExecutor:
                     proc.kill()
                     logger.warning("builtin[run_command]: timed out after 120s cmd=%s", actual_command[:200])
                     return json.dumps({"error": "Command timed out after 120s"})
+
+            elif tool_name == "semantic_search":
+                query = tool_input.get("query", "")
+                top_k = tool_input.get("top_k", 10)
+                if not query:
+                    return json.dumps({"error": "query is required"})
+                try:
+                    from agents.indexing.search_tool import execute_semantic_search
+                    # Use shared project-level index directory if available
+                    index_dir = tool_meta.get("_index_dir")
+                    result = execute_semantic_search(repo_dir, query, top_k=top_k, cache_dir=index_dir)
+                    logger.info("builtin[semantic_search]: query=%s top_k=%d cache=%s", query[:100], top_k, index_dir or "per-repo")
+                    return result
+                except ImportError:
+                    logger.info("builtin[semantic_search]: module not available, falling back to search_files hint")
+                    return json.dumps({
+                        "error": "Semantic search is not available (missing dependencies). Use search_files tool instead.",
+                    })
+                except Exception as e:
+                    logger.warning("builtin[semantic_search]: failed: %s", e)
+                    return json.dumps({"error": f"Semantic search failed: {e}. Use search_files instead."})
 
             elif tool_name == "task_complete":
                 summary = tool_input.get("summary", "")

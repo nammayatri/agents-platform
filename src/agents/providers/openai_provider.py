@@ -1,9 +1,12 @@
+import logging
 from collections.abc import AsyncIterator
 
 import openai
 
 from agents.providers.base import AIProvider
 from agents.schemas.agent import LLMMessage, LLMResponse, StreamChunk
+
+logger = logging.getLogger(__name__)
 
 PRICING = {
     "gpt-4o": {"input": 2.50, "output": 10.0},
@@ -111,10 +114,18 @@ class OpenAIProvider(AIProvider):
             import json
 
             for tc in choice.message.tool_calls:
+                try:
+                    args = json.loads(tc.function.arguments)
+                except (json.JSONDecodeError, TypeError):
+                    logger.warning(
+                        "Failed to parse tool call arguments for %s: %s",
+                        tc.function.name, tc.function.arguments[:200] if tc.function.arguments else "None",
+                    )
+                    args = {"_raw_arguments": tc.function.arguments or ""}
                 tool_calls.append({
                     "id": tc.id,
                     "name": tc.function.name,
-                    "arguments": json.loads(tc.function.arguments),
+                    "arguments": args,
                 })
 
         tokens_in = response.usage.prompt_tokens if response.usage else 0

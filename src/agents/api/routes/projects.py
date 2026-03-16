@@ -36,6 +36,9 @@ class UpdateProjectInput(BaseModel):
     context_docs: list[ProjectDependency] | None = None
     git_provider_id: str | None = None
     icon_url: str | None = None
+    architect_editor_enabled: bool | None = None
+    architect_model: str | None = None
+    editor_model: str | None = None
 
 
 def _sanitize_project(row: dict) -> dict:
@@ -451,6 +454,75 @@ async def update_build_settings(
         "merge_method": settings.get("merge_method", "squash"),
         "require_merge_approval": settings.get("require_merge_approval", False),
     }
+
+
+# ── Project Memories ──────────────────────────────────────────
+
+
+class UpdateMemoryInput(BaseModel):
+    content: str | None = None
+    category: str | None = None
+    confidence: float | None = None
+
+
+@router.get("/{project_id}/memories")
+async def list_memories(project_id: str, user: CurrentUser, db: DB):
+    """List project memories with optional category filter."""
+    await check_project_access(db, project_id, user)
+    rows = await db.fetch(
+        """
+        SELECT id, project_id, category, content, source_todo_id,
+               confidence, created_at, updated_at
+        FROM project_memories
+        WHERE project_id = $1
+        ORDER BY confidence DESC, created_at DESC
+        """,
+        project_id,
+    )
+    return [dict(r) for r in rows]
+
+
+@router.put("/{project_id}/memories/{memory_id}")
+async def update_memory(
+    project_id: str, memory_id: str, body: UpdateMemoryInput,
+    user: CurrentUser, db: DB,
+):
+    """Update a memory's content or category. Owner-only."""
+    await check_project_owner(db, project_id, user)
+    row = await db.fetchrow(
+        "SELECT id FROM project_memories WHERE id = $1 AND project_id = $2",
+        memory_id, project_id,
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail="Memory not found")
+
+    updates = body.model_dump(exclude_none=True)
+    if not updates:
+        return {"status": "no changes"}
+
+    set_parts = []
+    values = []
+    for i, (k, v) in enumerate(updates.items()):
+        set_parts.append(f"{k} = ${i+3}")
+        values.append(v)
+
+    await db.execute(
+        f"UPDATE project_memories SET {', '.join(set_parts)}, updated_at = NOW() WHERE id = $1 AND project_id = $2",
+        memory_id, project_id, *values,
+    )
+    return {"status": "ok"}
+
+
+@router.delete("/{project_id}/memories/{memory_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_memory(project_id: str, memory_id: str, user: CurrentUser, db: DB):
+    """Delete a memory. Owner-only."""
+    await check_project_owner(db, project_id, user)
+    result = await db.execute(
+        "DELETE FROM project_memories WHERE id = $1 AND project_id = $2",
+        memory_id, project_id,
+    )
+    if result == "DELETE 0":
+        raise HTTPException(status_code=404, detail="Memory not found")
 
 
 async def _analyze_project(project_id: str, db, redis=None) -> None:

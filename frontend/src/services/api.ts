@@ -8,7 +8,7 @@ import type {
   ProviderCreatePayload, ProviderUpdatePayload,
   GitProviderPayload, SkillPayload, McpServerPayload,
   NotificationChannelPayload, AgentCreatePayload, AgentUpdatePayload,
-  ProjectMember, DebugContext,
+  ProjectMember, DebugContext, ProjectMemory,
   FileTreeNode, FileContent, GitStatus,
 } from '../types'
 
@@ -115,6 +115,17 @@ export const projects = {
       ),
     remove: (projectId: string, userId: string) =>
       request<void>(`/projects/${projectId}/members/${userId}`, { method: 'DELETE' }),
+  },
+  memories: {
+    list: (projectId: string) =>
+      request<ProjectMemory[]>(`/projects/${projectId}/memories`),
+    update: (projectId: string, memoryId: string, data: { content?: string; category?: string; confidence?: number }) =>
+      request<{ status: string }>(`/projects/${projectId}/memories/${memoryId}`, {
+        method: 'PUT',
+        body: JSON.stringify(data),
+      }),
+    delete: (projectId: string, memoryId: string) =>
+      request<void>(`/projects/${projectId}/memories/${memoryId}`, { method: 'DELETE' }),
   },
 }
 

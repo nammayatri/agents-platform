@@ -1,5 +1,5 @@
 import { create } from 'zustand'
-import type { TodoItem, ChatMessage, Deliverable, AgentRun, SubTask, ProviderConfig } from '../types'
+import type { TodoItem, ChatMessage, Deliverable, AgentRun, SubTask, ProviderConfig, ExecutionEvent } from '../types'
 import { todos as todosApi, chat as chatApi, deliverables as delApi, agentRuns as agentRunsApi, providers as providersApi } from '../services/api'
 
 interface TodoState {
@@ -16,6 +16,8 @@ interface TodoState {
   activityLogs: Record<string, string[]>
   /** Per-subtask latest LLM response: subtaskId → { content, iteration } */
   llmResponses: Record<string, { content: string; iteration: number }>
+  /** Per-todo execution events for streaming visibility */
+  executionEvents: Record<string, ExecutionEvent[]>
 
   fetchProviders: () => Promise<void>
   fetchTodos: (projectId: string) => Promise<void>
@@ -46,6 +48,7 @@ interface TodoState {
   batchAppendActivity: (entries: [string, string[]][]) => void
   clearActivity: (subTaskId: string) => void
   setLlmResponse: (subTaskId: string, content: string, iteration: number) => void
+  appendExecutionEvent: (todoId: string, event: ExecutionEvent) => void
   setActiveTodo: (todoId: string | null) => void
 }
 
@@ -63,6 +66,7 @@ export const useTodoStore = create<TodoState>((set, get) => ({
   createError: null,
   activityLogs: {},
   llmResponses: {},
+  executionEvents: {},
 
   fetchProviders: async () => {
     const items = await providersApi.list() as ProviderConfig[]
@@ -260,6 +264,12 @@ export const useTodoStore = create<TodoState>((set, get) => ({
   setLlmResponse: (subTaskId, content, iteration) => {
     const { llmResponses } = get()
     set({ llmResponses: { ...llmResponses, [subTaskId]: { content, iteration } } })
+  },
+
+  appendExecutionEvent: (todoId, event) => {
+    const { executionEvents } = get()
+    const current = executionEvents[todoId] || []
+    set({ executionEvents: { ...executionEvents, [todoId]: [...current, event] } })
   },
 
   setActiveTodo: (todoId) => set({ activeTodoId: todoId }),
