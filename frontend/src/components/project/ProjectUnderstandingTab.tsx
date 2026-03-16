@@ -1,4 +1,4 @@
-import { useState, useCallback } from 'react'
+import { useState, useCallback, useEffect, useRef } from 'react'
 import { projects as projectsApi } from '../../services/api'
 import { useAnalysisWebSocket } from '../../hooks/useAnalysisWebSocket'
 
@@ -39,6 +39,7 @@ export default function ProjectUnderstandingTab({
   setAnalysisStatus, setProjectUnderstanding, setError,
 }: ProjectUnderstandingTabProps) {
   const [starting, setStarting] = useState(false)
+  const [cancelling, setCancelling] = useState(false)
   const isAnalyzing = analysisStatus === 'analyzing'
 
   const handleComplete = useCallback(async () => {
@@ -62,11 +63,50 @@ export default function ProjectUnderstandingTab({
     projectId, isAnalyzing, handleComplete, handleFailed,
   )
 
+  // Polling fallback: check DB status every 5s when analyzing,
+  // in case WebSocket misses the completion/failure event
+  const setAnalysisStatusRef = useRef(setAnalysisStatus)
+  const setProjectUnderstandingRef = useRef(setProjectUnderstanding)
+  setAnalysisStatusRef.current = setAnalysisStatus
+  setProjectUnderstandingRef.current = setProjectUnderstanding
+
+  useEffect(() => {
+    if (!isAnalyzing || !projectId) return
+    const interval = setInterval(async () => {
+      try {
+        const p = await projectsApi.get(projectId)
+        const settings = typeof p.settings_json === 'string' ? JSON.parse(p.settings_json) : p.settings_json
+        const status = settings?.analysis_status
+        if (status && status !== 'analyzing') {
+          setAnalysisStatusRef.current(status)
+          if (status === 'complete') {
+            setProjectUnderstandingRef.current(settings?.project_understanding || null)
+          }
+        }
+      } catch { /* ignore polling errors */ }
+    }, 5000)
+    return () => clearInterval(interval)
+  }, [isAnalyzing, projectId])
+
+  const handleCancel = async () => {
+    if (!projectId) return
+    setCancelling(true)
+    try {
+      await projectsApi.cancelAnalysis(projectId)
+      setAnalysisStatus(null)
+      reset()
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Failed to cancel')
+    } finally {
+      setCancelling(false)
+    }
+  }
+
   return (
     <>
       <div className="flex items-center justify-between">
         <p className="text-xs text-gray-600">AI-generated understanding of the project from its repository.</p>
-        {repoUrl && (
+        {repoUrl && !isAnalyzing && (
           <button
             onClick={async () => {
               if (!projectId) return
@@ -78,7 +118,7 @@ export default function ProjectUnderstandingTab({
               } catch (e) { setError(e instanceof Error ? e.message : 'Analysis failed') }
               finally { setStarting(false) }
             }}
-            disabled={starting || isAnalyzing}
+            disabled={starting}
             className="text-xs text-indigo-400 hover:text-indigo-300 disabled:opacity-40 transition-colors shrink-0"
           >
             {starting ? 'Starting...' : analysisStatus === 'complete' ? 'Re-analyze' : 'Analyze'}
@@ -132,6 +172,15 @@ export default function ProjectUnderstandingTab({
               </div>
             )
           })}
+          <div className="pt-1 flex justify-end">
+            <button
+              onClick={handleCancel}
+              disabled={cancelling}
+              className="text-[11px] text-gray-600 hover:text-gray-400 disabled:opacity-40 transition-colors"
+            >
+              {cancelling ? 'Cancelling...' : 'Cancel'}
+            </button>
+          </div>
         </div>
       )}
 

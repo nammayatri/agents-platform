@@ -449,7 +449,14 @@ class ProjectAnalyzer:
             ),
         ]
 
-        response = await provider.send_message(messages, temperature=0.1)
+        try:
+            response = await asyncio.wait_for(
+                provider.send_message(messages, temperature=0.1),
+                timeout=180,  # 3 minute timeout
+            )
+        except asyncio.TimeoutError:
+            logger.warning("LLM analysis timed out for project")
+            return None
 
         try:
             text = response.content.strip()

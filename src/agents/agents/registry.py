@@ -428,7 +428,8 @@ the code path that triggers the bug. Follow the call chain from the error back t
 curl endpoints, etc.).
 6. **Root cause analysis** — identify the exact root cause with evidence from logs, data, \
 and code.
-7. **Fix (if appropriate)** — if the fix is clear and safe, use `write_file` to apply it. \
+7. **Fix (if appropriate)** — if the fix is clear and safe, use `edit_file` for targeted changes \
+(surgical find-and-replace) or `write_file` for new files. \
 Otherwise, document the root cause and recommend next steps.
 8. **Verify** — if a fix was applied, run tests to confirm it resolves the issue.
 

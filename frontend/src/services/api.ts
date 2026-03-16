@@ -72,6 +72,7 @@ export const projects = {
     request<Project>(`/projects/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
   delete: (id: string) => request<void>(`/projects/${id}`, { method: 'DELETE' }),
   analyze: (id: string) => request<{ status: string }>(`/projects/${id}/analyze`, { method: 'POST' }),
+  cancelAnalysis: (id: string) => request<{ status: string }>(`/projects/${id}/cancel-analysis`, { method: 'POST' }),
   rules: {
     get: (projectId: string) =>
       request<Record<string, string[]>>(`/projects/${projectId}/rules`),
@@ -268,6 +269,7 @@ export const gitProviders = {
   update: (id: string, data: Partial<GitProviderPayload>) =>
     request<GitProviderConfig>(`/config/git-providers/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
   delete: (id: string) => request<void>(`/config/git-providers/${id}`, { method: 'DELETE' }),
+  test: (id: string) => request<{ status: string; detail?: string }>(`/config/git-providers/${id}/test`, { method: 'POST' }),
 }
 
 // Skills

@@ -927,6 +927,89 @@ async def update_git_provider(gp_id: str, body: GitProviderUpdate, user: Current
     return _sanitize_git_provider(dict(row))
 
 
+@router.post("/git-providers/{gp_id}/test")
+async def test_git_provider(gp_id: str, user: CurrentUser, db: DB):
+    """Test git provider credentials by calling the provider's API."""
+    import httpx
+
+    row = await db.fetchrow("SELECT * FROM git_provider_configs WHERE id = $1", gp_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Git provider not found")
+    if str(row["owner_id"]) != str(user["id"]):
+        raise HTTPException(status_code=403, detail="Access denied")
+
+    token = decrypt(row["token_enc"]) if row.get("token_enc") else None
+    if not token:
+        return {"status": "error", "detail": "No token configured for this provider"}
+
+    provider_type = row["provider_type"]
+    api_base_url = row.get("api_base_url") or ""
+
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            if provider_type == "github":
+                base = api_base_url or "https://api.github.com"
+                resp = await client.get(
+                    f"{base.rstrip('/')}/user",
+                    headers={
+                        "Authorization": f"Bearer {token}",
+                        "Accept": "application/vnd.github.v3+json",
+                    },
+                )
+                if resp.status_code == 200:
+                    user_data = resp.json()
+                    return {
+                        "status": "ok",
+                        "detail": f"Authenticated as {user_data.get('login', 'unknown')}",
+                    }
+                return {
+                    "status": "error",
+                    "detail": f"GitHub API returned {resp.status_code}: {resp.text[:200]}",
+                }
+
+            elif provider_type == "gitlab":
+                base = api_base_url or "https://gitlab.com"
+                resp = await client.get(
+                    f"{base.rstrip('/')}/api/v4/user",
+                    headers={"PRIVATE-TOKEN": token},
+                )
+                if resp.status_code == 200:
+                    user_data = resp.json()
+                    return {
+                        "status": "ok",
+                        "detail": f"Authenticated as {user_data.get('username', 'unknown')}",
+                    }
+                return {
+                    "status": "error",
+                    "detail": f"GitLab API returned {resp.status_code}: {resp.text[:200]}",
+                }
+
+            elif provider_type == "bitbucket":
+                base = api_base_url or "https://api.bitbucket.org"
+                resp = await client.get(
+                    f"{base.rstrip('/')}/2.0/user",
+                    headers={"Authorization": f"Bearer {token}"},
+                )
+                if resp.status_code == 200:
+                    user_data = resp.json()
+                    return {
+                        "status": "ok",
+                        "detail": f"Authenticated as {user_data.get('display_name', 'unknown')}",
+                    }
+                return {
+                    "status": "error",
+                    "detail": f"Bitbucket API returned {resp.status_code}: {resp.text[:200]}",
+                }
+
+            else:
+                return {"status": "error", "detail": f"Test not supported for provider type: {provider_type}"}
+
+    except httpx.ConnectError as e:
+        return {"status": "error", "detail": f"Connection failed: {e}"}
+    except Exception as e:
+        return {"status": "error", "detail": str(e)}
+
+
 @router.delete("/git-providers/{gp_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_git_provider(gp_id: str, user: CurrentUser, db: DB):
     existing = await db.fetchrow(

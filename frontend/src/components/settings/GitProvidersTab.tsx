@@ -23,6 +23,11 @@ export default function GitProvidersTab({ isAdmin: _isAdmin }: Props) {
     api_base_url: '',
     token: '',
   })
+  const [error, setError] = useState('')
+  const [success, setSuccess] = useState('')
+  const [saving, setSaving] = useState(false)
+  const [testingId, setTestingId] = useState<string | null>(null)
+  const [testResult, setTestResult] = useState<{ id: string; status: string; detail?: string } | null>(null)
 
   useEffect(() => {
     gitProvidersApi.list().then((g) => setGitProviderList(g as GitProviderConfig[])).catch(() => {})
@@ -46,22 +51,47 @@ export default function GitProvidersTab({ isAdmin: _isAdmin }: Props) {
   }
 
   const handleSaveGitProvider = async () => {
-    const data: Record<string, unknown> = {
-      provider_type: gitProviderForm.provider_type,
-      display_name: gitProviderForm.display_name,
-      api_base_url: gitProviderForm.api_base_url || undefined,
+    setError('')
+    setSuccess('')
+    setSaving(true)
+    try {
+      const data: Record<string, unknown> = {
+        provider_type: gitProviderForm.provider_type,
+        display_name: gitProviderForm.display_name,
+        api_base_url: gitProviderForm.api_base_url || undefined,
+      }
+      if (gitProviderForm.token) {
+        data.token = gitProviderForm.token
+      }
+      if (editingGitProviderId) {
+        await gitProvidersApi.update(editingGitProviderId, data)
+        setSuccess('Git provider updated successfully' + (gitProviderForm.token ? ' (token updated)' : ''))
+      } else {
+        await gitProvidersApi.create(data as never)
+        setSuccess('Git provider created successfully')
+      }
+      resetGitProviderForm()
+      const updated = await gitProvidersApi.list()
+      setGitProviderList(updated as GitProviderConfig[])
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Failed to save git provider')
+    } finally {
+      setSaving(false)
     }
-    if (gitProviderForm.token) {
-      data.token = gitProviderForm.token
+  }
+
+  const handleTestGitProvider = async (id: string) => {
+    setTestResult(null)
+    setTestingId(id)
+    setError('')
+    try {
+      const result = await gitProvidersApi.test(id) as { status: string; detail?: string }
+      setTestResult({ id, ...result })
+    } catch (e) {
+      setTestResult({ id, status: 'error', detail: e instanceof Error ? e.message : 'Test failed' })
+    } finally {
+      setTestingId(null)
     }
-    if (editingGitProviderId) {
-      await gitProvidersApi.update(editingGitProviderId, data)
-    } else {
-      await gitProvidersApi.create(data as never)
-    }
-    resetGitProviderForm()
-    const updated = await gitProvidersApi.list()
-    setGitProviderList(updated as GitProviderConfig[])
   }
 
   const handleDeleteGitProvider = async (id: string) => {
@@ -114,6 +144,13 @@ export default function GitProvidersTab({ isAdmin: _isAdmin }: Props) {
               </div>
               <div className="flex gap-2">
                 <button
+                  onClick={() => handleTestGitProvider(g.id)}
+                  disabled={testingId === g.id}
+                  className="px-2 py-1 text-xs text-emerald-400 hover:text-emerald-300 disabled:opacity-50 transition-colors"
+                >
+                  {testingId === g.id ? 'Testing...' : 'Test'}
+                </button>
+                <button
                   onClick={() => startEditGitProvider(g)}
                   className="px-2 py-1 text-xs text-indigo-400 hover:text-indigo-300 transition-colors"
                 >
@@ -124,6 +161,17 @@ export default function GitProvidersTab({ isAdmin: _isAdmin }: Props) {
                 </button>
               </div>
             </div>
+            {testResult && testResult.id === g.id && (
+              <div className={`mt-1 px-3 py-2 rounded-lg text-xs ${
+                testResult.status === 'ok'
+                  ? 'bg-emerald-500/10 border border-emerald-500/20 text-emerald-400'
+                  : 'bg-red-500/10 border border-red-500/20 text-red-400'
+              }`}>
+                {testResult.status === 'ok'
+                  ? `Connection successful — ${testResult.detail || 'credentials are valid'}`
+                  : `Failed: ${testResult.detail || 'Unknown error'}`}
+              </div>
+            )}
             {/* Inline edit form */}
             {editingGitProviderId === g.id && showGitProviderForm && (
               <div className="mt-1 p-4 bg-gray-900 border border-indigo-900/50 rounded-lg space-y-3">
@@ -167,8 +215,8 @@ export default function GitProvidersTab({ isAdmin: _isAdmin }: Props) {
                   onChange={(e) => setGitProviderForm({ ...gitProviderForm, token: e.target.value })}
                 />
                 <div className="flex gap-2">
-                  <button onClick={handleSaveGitProvider} className={btnPrimary}>Update</button>
-                  <button onClick={resetGitProviderForm} className={btnSecondary}>Cancel</button>
+                  <button onClick={handleSaveGitProvider} disabled={saving} className={btnPrimary}>{saving ? 'Saving...' : 'Update'}</button>
+                  <button onClick={resetGitProviderForm} disabled={saving} className={btnSecondary}>Cancel</button>
                 </div>
               </div>
             )}
@@ -230,9 +278,19 @@ export default function GitProvidersTab({ isAdmin: _isAdmin }: Props) {
             onChange={(e) => setGitProviderForm({ ...gitProviderForm, token: e.target.value })}
           />
           <div className="flex gap-2">
-            <button onClick={handleSaveGitProvider} className={btnPrimary}>Save</button>
-            <button onClick={resetGitProviderForm} className={btnSecondary}>Cancel</button>
+            <button onClick={handleSaveGitProvider} disabled={saving} className={btnPrimary}>{saving ? 'Saving...' : 'Save'}</button>
+            <button onClick={resetGitProviderForm} disabled={saving} className={btnSecondary}>Cancel</button>
           </div>
+        </div>
+      )}
+      {error && (
+        <div className="px-4 py-2.5 bg-red-500/10 border border-red-500/20 rounded-lg text-red-400 text-sm">
+          {error}
+        </div>
+      )}
+      {success && (
+        <div className="px-4 py-2.5 bg-emerald-500/10 border border-emerald-500/20 rounded-lg text-emerald-400 text-sm">
+          {success}
         </div>
       )}
     </section>

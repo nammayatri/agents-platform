@@ -1,0 +1,102 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: backend
+  namespace: atlas-ai
+  labels:
+    app: backend
+spec:
+  serviceName: backend
+  replicas: 1
+  selector:
+    matchLabels:
+      app: backend
+  template:
+    metadata:
+      labels:
+        app: backend
+    spec:
+      containers:
+        - name: backend
+          image: ghcr.io/nammayatri/agents-platform/backend:8109d7f
+          ports:
+            - containerPort: 8000
+          env:
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: agents-secrets
+                  key: POSTGRES_PASSWORD
+            - name: DATABASE_URL
+              value: "postgresql://agents:$(POSTGRES_PASSWORD)@postgres:5432/agents"
+            - name: REDIS_URL
+              value: "redis://redis:6379/0"
+            - name: JWT_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: agents-secrets
+                  key: JWT_SECRET_KEY
+            - name: JWT_ALGORITHM
+              value: "HS256"
+            - name: JWT_EXPIRE_MINUTES
+              value: "1440"
+            - name: ENCRYPTION_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: agents-secrets
+                  key: ENCRYPTION_KEY
+            - name: ORCHESTRATOR_POLL_INTERVAL
+              value: "5"
+            - name: ORCHESTRATOR_MAX_CONCURRENT
+              value: "50"
+            - name: ORCHESTRATOR_LOCK_TTL
+              value: "300"
+            - name: CORS_ORIGINS
+              value: "*"
+            - name: LOG_LEVEL
+              value: "INFO"
+            - name: WORKSPACE_ROOT
+              value: "/data/workspaces"
+          volumeMounts:
+            - name: workspace-data
+              mountPath: /data/workspaces
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8000
+            initialDelaySeconds: 30
+            periodSeconds: 15
+  volumeClaimTemplates:
+    - metadata:
+        name: workspace-data
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: 10Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: backend
+  namespace: atlas-ai
+spec:
+  selector:
+    app: backend
+  ports:
+    - port: 8000
+      targetPort: 8000

@@ -176,6 +176,26 @@ async def analyze_project(project_id: str, user: CurrentUser, db: DB, redis: Red
     return {"status": "analyzing"}
 
 
+@router.post("/{project_id}/cancel-analysis")
+async def cancel_analysis(project_id: str, user: CurrentUser, db: DB):
+    """Cancel/reset a stuck analysis."""
+    await check_project_access(db, project_id, user)
+    row = await db.fetchrow("SELECT settings_json FROM projects WHERE id = $1", project_id)
+    if not row:
+        raise HTTPException(status_code=404)
+    settings = row["settings_json"] or {}
+    if isinstance(settings, str):
+        settings = json.loads(settings)
+    if settings.get("analysis_status") == "analyzing":
+        settings["analysis_status"] = None
+        await db.execute(
+            "UPDATE projects SET settings_json = $2, updated_at = NOW() WHERE id = $1",
+            project_id,
+            settings,
+        )
+    return {"status": "cancelled"}
+
+
 @router.delete("/{project_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_project(project_id: str, user: CurrentUser, db: DB):
     await check_project_owner(db, project_id, user)

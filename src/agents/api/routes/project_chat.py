@@ -161,6 +161,8 @@ async def send_session_message(
     """Send a message in a session."""
     session = await _load_session(session_id, project_id, user, db)
     project = await db.fetchrow("SELECT * FROM projects WHERE id = $1", project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
 
     # Auto-title: use first user message as session title
     if dict(session).get("title") in ("New Chat", "New Plan"):
@@ -419,6 +421,8 @@ async def _check_project_access_local(project_id: str, user: dict, db) -> dict:
     """Verify access and return the project row."""
     await check_project_access(db, project_id, user)
     project = await db.fetchrow("SELECT * FROM projects WHERE id = $1", project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
     return dict(project)
 
 
