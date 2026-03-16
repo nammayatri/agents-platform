@@ -56,6 +56,9 @@ export interface Project {
   git_provider_id?: string
   workspace_path?: string
   icon_url?: string
+  architect_editor_enabled?: boolean
+  architect_model?: string
+  editor_model?: string
   user_role?: 'owner' | 'member'
   settings_json?: {
     analysis_status?: 'analyzing' | 'complete' | 'failed' | 'no_docs'
@@ -84,7 +87,7 @@ export interface ProjectMember {
   added_at?: string
 }
 
-export type TodoState = 'scheduled' | 'intake' | 'planning' | 'plan_ready' | 'in_progress' | 'review' | 'completed' | 'failed' | 'cancelled'
+export type TodoState = 'scheduled' | 'intake' | 'planning' | 'plan_ready' | 'in_progress' | 'testing' | 'review' | 'completed' | 'failed' | 'cancelled'
 
 export interface IterationLogEntry {
   iteration: number
@@ -454,7 +457,7 @@ export interface ProjectChatMessage {
 }
 
 export interface WSEvent {
-  type: 'state_change' | 'subtask_update' | 'chat_message' | 'progress' | 'activity' | 'deliverable_created' | 'task_cancelled' | 'llm_response' | 'workspace_commit' | 'workspace_push' | 'ping'
+  type: 'state_change' | 'subtask_update' | 'chat_message' | 'progress' | 'activity' | 'deliverable_created' | 'task_cancelled' | 'llm_response' | 'workspace_commit' | 'workspace_push' | 'tool_start' | 'tool_result' | 'llm_thinking' | 'iteration_start' | 'iteration_end' | 'testing_step' | 'ping'
   state?: TodoState
   status?: string
   message?: string | { role: string; content: string; id?: string }
@@ -466,6 +469,19 @@ export interface WSEvent {
   iteration?: number
   error_message?: string
   sub_state?: string
+  // Streaming execution event fields
+  name?: string
+  args_summary?: string
+  result_preview?: string
+  chars?: number
+  tokens_in?: number
+  tokens_out?: number
+  round?: number
+  tool_index?: number
+  total_tools?: number
+  subtask?: string
+  // Testing phase event fields
+  command?: string
 }
 
 // ── API Payload Types ──────────────────────────────────────────────
@@ -491,6 +507,9 @@ export interface ProjectUpdatePayload {
   git_provider_id?: string
   icon_url?: string
   settings_json?: Record<string, unknown>
+  architect_editor_enabled?: boolean
+  architect_model?: string
+  editor_model?: string
 }
 
 export interface TodoCreatePayload {
@@ -591,6 +610,39 @@ export interface GitStatus {
   branch: string
   files: GitFileStatus[]
   clean: boolean
+}
+
+// ── Project Memories ──────────────────────────────────────────────
+
+export interface ProjectMemory {
+  id: string
+  project_id: string
+  category: 'architecture' | 'pattern' | 'convention' | 'pitfall' | 'dependency'
+  content: string
+  source_todo_id?: string
+  confidence: number
+  created_at: string
+  updated_at: string
+}
+
+// ── Execution Events ──────────────────────────────────────────────
+
+export interface ExecutionEvent {
+  type: 'iteration_start' | 'tool_start' | 'tool_result' | 'llm_thinking' | 'iteration_end' | 'activity'
+  timestamp: number
+  iteration?: number
+  subtask?: string
+  name?: string
+  args_summary?: string
+  result_preview?: string
+  chars?: number
+  tokens_in?: number
+  tokens_out?: number
+  round?: number
+  status?: string
+  tool_index?: number
+  total_tools?: number
+  message?: string
 }
 
 export interface AgentCreatePayload {

@@ -4,8 +4,9 @@ Each TODO item gets one AgentCoordinator instance. It manages:
 1. INTAKE: AI interviewer that asks thorough questions upfront
 2. PLANNING: Decomposes task into sub-tasks with agent assignments
 3. EXECUTION: Runs sub-tasks in parallel (respecting dependencies)
-4. REVIEW: Auto-reviews deliverables, only escalates if needed
-5. CHAT: Handles user messages between steps for steering
+4. TESTING: Installs deps, builds, runs tests — loops back for fixes if needed
+5. REVIEW: Auto-reviews deliverables, only escalates if needed
+6. CHAT: Handles user messages between steps for steering
 """
 
 import asyncio
@@ -253,11 +254,15 @@ class AgentCoordinator:
                                 self.todo_id, len(plan.get("sub_tasks", [])))
                     await self._auto_approve_plan(todo, plan)
                 else:
-                    logger.warning("[%s] plan_ready but no plan_json! Will re-plan on next cycle",
+                    logger.warning("[%s] plan_ready but no plan_json! Transitioning back to planning",
                                    self.todo_id)
+                    await self._transition_todo("planning", sub_state="re_planning_no_plan")
             case "in_progress":
                 logger.info("[%s] → entering _phase_execution", self.todo_id)
                 await self._phase_execution(todo, provider)
+            case "testing":
+                logger.info("[%s] → entering _phase_testing", self.todo_id)
+                await self._phase_testing(todo, provider)
             case _:
                 logger.warning("[%s] coordinator.run() unhandled state: %s", self.todo_id, todo["state"])
 
@@ -291,8 +296,25 @@ class AgentCoordinator:
 
         result = parse_llm_json(response.content)
         if result is None:
-            # If the LLM didn't output clean JSON, default to ready — don't block on bad parsing
-            logger.warning("Intake: failed to parse JSON, defaulting to ready=true")
+            # Retry once with a correction prompt before defaulting
+            logger.warning("Intake: failed to parse JSON, retrying with correction prompt")
+            messages.append(LLMMessage(role="assistant", content=response.content))
+            messages.append(LLMMessage(
+                role="user",
+                content=(
+                    "Your response was not valid JSON. Please respond with ONLY a JSON object "
+                    'with keys: "ready" (boolean), "requirements" (string or object), '
+                    '"approach" (string). If you need to ask questions, include '
+                    '"questions" (list of strings) and set "ready" to false.'
+                ),
+            ))
+            retry_response = await provider.send_message(messages, temperature=0.1)
+            await self._track_tokens(retry_response)
+            result = parse_llm_json(retry_response.content)
+
+        if result is None:
+            # If retry also failed, default to ready with the task title as requirements
+            logger.warning("Intake: JSON parse failed after retry, defaulting to ready=true")
             result = {
                 "ready": True,
                 "requirements": todo["title"],
@@ -479,6 +501,11 @@ class AgentCoordinator:
         planner_tools = None
         if workspace_path:
             planner_tools = self._get_builtin_tools(workspace_path, "planner")
+            # Inject shared per-project index directory for semantic_search
+            _plan_idx = os.path.normpath(os.path.join(workspace_path, "..", ".agent_index"))
+            for _bt in planner_tools:
+                if _bt["name"] == "semantic_search":
+                    _bt["_index_dir"] = _plan_idx
 
             # Also include MCP tools if configured
             mcp_tools = await self.tools_registry.resolve_tools(
@@ -607,6 +634,7 @@ class AgentCoordinator:
             logger.error("[%s] _auto_approve_plan: NO sub_tasks in plan! Plan: %.1000s",
                          self.todo_id, json.dumps(plan, default=str))
         sub_task_ids = []
+        plan_index_to_id: dict[int, str] = {}  # plan index → DB id for dependency resolution
         first_chain_id = None  # track chain for review_loop sub-tasks
         for i, st in enumerate(plan.get("sub_tasks", [])):
             target_repo = st.get("target_repo")
@@ -636,27 +664,31 @@ class AgentCoordinator:
                 )
                 st_id = str(row["id"])
                 sub_task_ids.append(st_id)
+                # Map plan index → DB id for dependency resolution
+                plan_index_to_id[i] = st_id
                 logger.info("[%s] Inserted sub_task[%d] id=%s", self.todo_id, i, st_id)
+
+                # For review_loop sub-tasks, set review_chain_id to themselves (chain root)
+                if st.get("review_loop"):
+                    await self.db.execute(
+                        "UPDATE sub_tasks SET review_chain_id = $1 WHERE id = $1",
+                        row["id"],
+                    )
             except Exception:
                 logger.exception("[%s] FAILED to insert sub_task[%d]: %s",
                                  self.todo_id, i, st.get("title"))
 
-            # For review_loop sub-tasks, set review_chain_id to themselves (chain root)
-            if st.get("review_loop"):
-                await self.db.execute(
-                    "UPDATE sub_tasks SET review_chain_id = $1 WHERE id = $1",
-                    row["id"],
-                )
-
-        # Set up dependencies
+        # Set up dependencies using plan index mapping (resilient to failed inserts)
         for i, st in enumerate(plan.get("sub_tasks", [])):
+            if i not in plan_index_to_id:
+                continue  # This sub-task failed to insert
             depends_on = st.get("depends_on", [])
             if depends_on:
-                dep_ids = [sub_task_ids[j] for j in depends_on if j < len(sub_task_ids)]
+                dep_ids = [plan_index_to_id[j] for j in depends_on if j in plan_index_to_id]
                 if dep_ids:
                     await self.db.execute(
                         "UPDATE sub_tasks SET depends_on = $2 WHERE id = $1",
-                        sub_task_ids[i],
+                        plan_index_to_id[i],
                         dep_ids,
                     )
 
@@ -814,8 +846,8 @@ class AgentCoordinator:
                         error_message=f"Sub-tasks failed: {err_detail}",
                     )
                 else:
-                    # All done — run review
-                    await self._phase_review(todo, provider)
+                    # All done — run testing then review
+                    await self._enter_testing_or_review(todo, provider)
             # else: some tasks still running, will be picked up next cycle
             return
 
@@ -1047,7 +1079,7 @@ class AgentCoordinator:
                         )
                         if merge_st:
                             await self._execute_merge_subtask(dict(merge_st), provider, workspace_path)
-                    await self._phase_review(todo, provider)
+                    await self._enter_testing_or_review(todo, provider)
                 elif all_done and any_failed:
                     failed_tasks = await self.db.fetch(
                         "SELECT title, error_message FROM sub_tasks "
@@ -1074,7 +1106,7 @@ class AgentCoordinator:
                     )
                     if merge_st:
                         await self._execute_merge_subtask(dict(merge_st), provider, workspace_path)
-                await self._phase_review(todo, provider)
+                await self._enter_testing_or_review(todo, provider)
         elif all_done and any_failed:
             # Check if we should retry
             if todo["retry_count"] < todo["max_retries"]:
@@ -1141,6 +1173,389 @@ class AgentCoordinator:
                     parts.append(f"- {item}")
         return "\n".join(parts)
 
+    # ---- TESTING PHASE ----
+
+    TESTING_SYSTEM_PROMPT = (
+        "You are a build and test verification agent. Your job is to verify that the implemented "
+        "code changes can be built, dependencies are installed, and all tests pass.\n\n"
+        "## Workflow\n"
+        "1. Install dependencies (npm install, pip install, cargo build, etc.)\n"
+        "2. Run build commands to ensure the project compiles/builds\n"
+        "3. Run the full test suite\n"
+        "4. Report results with specific pass/fail details\n\n"
+        "## Rules\n"
+        "- Run ALL provided commands; do not skip any\n"
+        "- If a command fails, capture the full error output\n"
+        "- Do not attempt to fix code -- only report results\n"
+        "- Be thorough: check for missing dependencies, broken imports, type errors\n"
+    )
+
+    _MAX_TEST_RETRIES = 2  # Max times to loop back for test fixes
+
+    async def _enter_testing_or_review(self, todo: dict, provider: AIProvider) -> None:
+        """Route to testing phase if code work was done, otherwise skip to review."""
+        coder_count = await self.db.fetchval(
+            "SELECT COUNT(*) FROM sub_tasks "
+            "WHERE todo_id = $1 AND agent_role = 'coder' AND status = 'completed'",
+            self.todo_id,
+        )
+        if coder_count and coder_count > 0:
+            logger.info(
+                "[%s] Code work detected (%d coder subtasks), entering testing phase",
+                self.todo_id, coder_count,
+            )
+            await self._phase_testing(todo, provider)
+        else:
+            logger.info("[%s] No coder work detected, skipping testing → review", self.todo_id)
+            await self._phase_review(todo, provider)
+
+    async def _phase_testing(self, todo: dict, provider: AIProvider) -> None:
+        """Dedicated testing phase: install deps, build, run tests.
+
+        Transitions to review on success, back to in_progress if fixes needed.
+        """
+        # Transition to testing state
+        current = await self.db.fetchval(
+            "SELECT state FROM todo_items WHERE id = $1", self.todo_id,
+        )
+        if current == "testing":
+            logger.info("[%s] Already in testing state", self.todo_id)
+        elif current == "in_progress":
+            await self._transition_todo("testing", sub_state="build_and_test")
+        else:
+            logger.warning("[%s] Cannot enter testing from state=%s", self.todo_id, current)
+            return
+
+        await self._post_system_message(
+            "**Entering testing phase.** Installing dependencies, building, and running tests..."
+        )
+
+        # 1. Resolve workspace
+        workspace_path = None
+        try:
+            project = await self.db.fetchrow(
+                "SELECT repo_url FROM projects WHERE id = $1", todo["project_id"]
+            )
+            if project and project.get("repo_url"):
+                workspace_path = await self.workspace_mgr.setup_task_workspace(self.todo_id)
+        except Exception:
+            logger.warning("[%s] Could not set up workspace for testing", self.todo_id, exc_info=True)
+
+        if not workspace_path:
+            logger.info("[%s] No workspace for testing, skipping to review", self.todo_id)
+            todo = await self._load_todo()
+            await self._phase_review(todo, provider)
+            return
+
+        repo_dir = os.path.join(workspace_path, "repo")
+        if not os.path.isdir(repo_dir):
+            repo_dir = workspace_path
+
+        # 2. Resolve build/test commands from project settings and work rules
+        work_rules = await self._resolve_work_rules(todo)
+        project_settings = await self._get_project_settings(todo)
+
+        build_commands = project_settings.get("build_commands", [])
+        quality_commands = work_rules.get("quality", [])
+        testing_rules = work_rules.get("testing", [])
+
+        has_explicit_commands = bool(build_commands or quality_commands or testing_rules)
+
+        # 3. Run tests
+        if has_explicit_commands:
+            test_results = await self._run_testing_commands(
+                repo_dir, build_commands, quality_commands, testing_rules,
+            )
+        else:
+            test_results = await self._run_testing_with_discovery(
+                todo, provider, workspace_path,
+            )
+
+        # 4. Evaluate results
+        if test_results["passed"]:
+            summary = test_results.get("summary", "All checks passed.")
+            await self._post_system_message(
+                f"**Testing passed.** {summary}\n\nProceeding to review."
+            )
+            await self.db.execute(
+                "UPDATE todo_items SET sub_state = 'tests_passed', updated_at = NOW() WHERE id = $1",
+                self.todo_id,
+            )
+            todo = await self._load_todo()
+            await self._phase_review(todo, provider)
+        else:
+            # Check retry count
+            retry_count = todo.get("retry_count", 0)
+            if retry_count < self._MAX_TEST_RETRIES:
+                await self._create_test_fix_subtasks(
+                    todo, provider, test_results, workspace_path,
+                )
+                await self._transition_todo(
+                    "in_progress", sub_state="fixing_test_failures",
+                )
+                todo = await self._load_todo()
+                await self._phase_execution(todo, provider)
+            else:
+                error_output = test_results.get("error_output", "Unknown failures")
+                await self._post_system_message(
+                    f"**Testing failed after {retry_count + 1} attempts.**\n\n"
+                    f"Failures:\n```\n{error_output[:1000]}\n```\n\n"
+                    "Proceeding to review with known test failures."
+                )
+                todo = await self._load_todo()
+                await self._phase_review(todo, provider)
+
+    async def _run_testing_commands(
+        self,
+        repo_dir: str,
+        build_commands: list[str],
+        quality_commands: list[str],
+        testing_rules: list[str],
+    ) -> dict:
+        """Run explicit build/test commands and return results.
+
+        Returns {"passed": bool, "summary": str, "error_output": str | None, "steps": list}.
+        """
+        steps: list[dict] = []
+        all_passed = True
+
+        # Phase 1: Install dependencies (auto-detect)
+        dep_install_cmds = self._detect_dependency_install_commands(repo_dir)
+        for cmd in dep_install_cmds:
+            try:
+                exit_code, output = await self.workspace_mgr.run_command(cmd, repo_dir, timeout=180)
+                passed = exit_code == 0
+                steps.append({"command": cmd, "passed": passed, "output": output[:2000], "phase": "install"})
+                if not passed:
+                    all_passed = False
+                await self._publish_testing_progress(cmd, passed)
+            except Exception as e:
+                steps.append({"command": cmd, "passed": False, "output": str(e)[:500], "phase": "install"})
+                all_passed = False
+                await self._publish_testing_progress(cmd, False)
+
+        # Phase 2: Build commands (from project settings)
+        for cmd in build_commands:
+            try:
+                exit_code, output = await self.workspace_mgr.run_command(cmd, repo_dir, timeout=120)
+                passed = exit_code == 0
+                steps.append({"command": cmd, "passed": passed, "output": output[:2000], "phase": "build"})
+                if not passed:
+                    all_passed = False
+                await self._publish_testing_progress(cmd, passed)
+            except Exception as e:
+                steps.append({"command": cmd, "passed": False, "output": str(e)[:500], "phase": "build"})
+                all_passed = False
+                await self._publish_testing_progress(cmd, False)
+
+        # Phase 3: Quality checks (from work_rules.quality)
+        for cmd in quality_commands:
+            try:
+                exit_code, output = await self.workspace_mgr.run_command(cmd, repo_dir, timeout=120)
+                passed = exit_code == 0
+                steps.append({"command": cmd, "passed": passed, "output": output[:2000], "phase": "quality"})
+                if not passed:
+                    all_passed = False
+                await self._publish_testing_progress(cmd, passed)
+            except Exception as e:
+                steps.append({"command": cmd, "passed": False, "output": str(e)[:500], "phase": "quality"})
+                all_passed = False
+                await self._publish_testing_progress(cmd, False)
+
+        # Phase 4: Testing rules (from work_rules.testing)
+        for cmd in testing_rules:
+            try:
+                exit_code, output = await self.workspace_mgr.run_command(cmd, repo_dir, timeout=180)
+                passed = exit_code == 0
+                steps.append({"command": cmd, "passed": passed, "output": output[:2000], "phase": "test"})
+                if not passed:
+                    all_passed = False
+                await self._publish_testing_progress(cmd, passed)
+            except Exception as e:
+                steps.append({"command": cmd, "passed": False, "output": str(e)[:500], "phase": "test"})
+                all_passed = False
+                await self._publish_testing_progress(cmd, False)
+
+        failed_steps = [s for s in steps if not s["passed"]]
+        error_output = "\n".join(
+            f"[FAIL] {s['command']}:\n{s['output']}" for s in failed_steps
+        ) if failed_steps else None
+
+        summary = f"{len(steps)} commands run, {len(failed_steps)} failed" if steps else "No commands to run"
+        return {
+            "passed": all_passed,
+            "summary": summary,
+            "error_output": error_output,
+            "steps": steps,
+        }
+
+    @staticmethod
+    def _detect_dependency_install_commands(repo_dir: str) -> list[str]:
+        """Auto-detect dependency installation commands from the repo."""
+        commands: list[str] = []
+
+        # Node.js
+        package_json = os.path.join(repo_dir, "package.json")
+        if os.path.isfile(package_json):
+            pnpm_lock = os.path.join(repo_dir, "pnpm-lock.yaml")
+            yarn_lock = os.path.join(repo_dir, "yarn.lock")
+            lock_file = os.path.join(repo_dir, "package-lock.json")
+            if os.path.isfile(pnpm_lock):
+                commands.append("pnpm install --frozen-lockfile")
+            elif os.path.isfile(yarn_lock):
+                commands.append("yarn install --frozen-lockfile")
+            elif os.path.isfile(lock_file):
+                commands.append("npm ci")
+            else:
+                commands.append("npm install")
+
+        # Python
+        requirements = os.path.join(repo_dir, "requirements.txt")
+        pyproject = os.path.join(repo_dir, "pyproject.toml")
+        if os.path.isfile(requirements):
+            commands.append("pip install -r requirements.txt")
+        elif os.path.isfile(pyproject):
+            commands.append("pip install -e .")
+
+        # Rust
+        cargo_toml = os.path.join(repo_dir, "Cargo.toml")
+        if os.path.isfile(cargo_toml):
+            commands.append("cargo build")
+
+        # Go
+        go_mod = os.path.join(repo_dir, "go.mod")
+        if os.path.isfile(go_mod):
+            commands.append("go mod download")
+
+        return commands
+
+    async def _run_testing_with_discovery(
+        self, todo: dict, provider: AIProvider, workspace_path: str,
+    ) -> dict:
+        """Use an LLM agent to discover and run build/test commands."""
+        repo_dir = os.path.join(workspace_path, "repo")
+        if not os.path.isdir(repo_dir):
+            repo_dir = workspace_path
+
+        # Install detected dependencies first
+        dep_cmds = self._detect_dependency_install_commands(repo_dir)
+        for cmd in dep_cmds:
+            try:
+                await self.workspace_mgr.run_command(cmd, repo_dir, timeout=180)
+                await self._publish_testing_progress(cmd, True)
+            except Exception:
+                logger.warning("[%s] Dep install failed: %s", self.todo_id, cmd, exc_info=True)
+                await self._publish_testing_progress(cmd, False)
+
+        # Build system prompt for LLM-driven test discovery
+        tester_context = await self._build_tester_context(todo)
+        system_prompt = self.TESTING_SYSTEM_PROMPT + tester_context
+        system_prompt += build_tools_prompt_block("tester")
+
+        # Add file tree for orientation
+        try:
+            file_tree = self.workspace_mgr.get_file_tree(workspace_path, max_depth=3)
+            system_prompt += f"\n\nProject file structure:\n{file_tree}\n"
+        except Exception:
+            pass
+
+        messages = [
+            LLMMessage(role="system", content=system_prompt),
+            LLMMessage(role="user", content=(
+                "Discover and run all build and test commands for this project. "
+                "Check package.json, pyproject.toml, Makefile, CI configs, etc. "
+                "Install any missing dependencies, then run the commands and report results.\n\n"
+                'You MUST output JSON at the end: {"passed": true/false, "summary": "...", '
+                '"commands_run": ["cmd1", "cmd2"], "failures": ["failure detail"]}'
+            )),
+        ]
+
+        tools = self._get_builtin_tools(workspace_path, "tester")
+
+        try:
+            from agents.providers.base import run_tool_loop
+
+            content, response = await run_tool_loop(
+                provider, messages,
+                tools=tools,
+                tool_executor=lambda name, args: self.mcp_executor.execute_tool(name, args, tools),
+                max_rounds=10,
+                temperature=0.1,
+            )
+            await self._track_tokens(response)
+
+            result = parse_llm_json(content)
+            if result is None:
+                return {"passed": True, "summary": "Testing completed (could not parse LLM result)"}
+
+            return {
+                "passed": result.get("passed", True),
+                "summary": result.get("summary", ""),
+                "error_output": "\n".join(result.get("failures", [])) if result.get("failures") else None,
+            }
+        except Exception as e:
+            logger.error("[%s] LLM test discovery failed: %s", self.todo_id, e, exc_info=True)
+            return {
+                "passed": True,
+                "summary": f"Test discovery failed ({type(e).__name__}), skipping",
+            }
+
+    async def _create_test_fix_subtasks(
+        self, todo: dict, provider: AIProvider, test_results: dict, workspace_path: str | None,
+    ) -> None:
+        """When testing fails, create coder subtask(s) to fix the issues."""
+        error_output = test_results.get("error_output", "Unknown test failures")
+
+        fix_description = (
+            "The testing phase found failures that need to be fixed:\n\n"
+            f"```\n{error_output[:3000]}\n```\n\n"
+            "Investigate these failures and fix the underlying code issues. "
+            "Do NOT disable tests or skip checks -- fix the actual problems."
+        )
+
+        await self._create_guardrail_subtask(
+            title="Fix test failures from testing phase",
+            description=fix_description,
+            role="coder",
+            depends_on=[],
+        )
+
+        # Increment retry count
+        await self.db.execute(
+            "UPDATE todo_items SET retry_count = retry_count + 1, updated_at = NOW() WHERE id = $1",
+            self.todo_id,
+        )
+
+        await self._post_system_message(
+            f"**Testing failed.** Creating fix subtask and retrying.\n\n"
+            f"Failures:\n```\n{error_output[:500]}\n```"
+        )
+
+    async def _get_project_settings(self, todo: dict) -> dict:
+        """Fetch and parse project settings_json."""
+        project = await self.db.fetchrow(
+            "SELECT settings_json FROM projects WHERE id = $1", todo["project_id"]
+        )
+        settings = (project.get("settings_json") or {}) if project else {}
+        if isinstance(settings, str):
+            settings = json.loads(settings)
+        return settings
+
+    async def _publish_testing_progress(self, command: str, passed: bool) -> None:
+        """Publish a testing progress event to the WebSocket channel."""
+        try:
+            status = "passed" if passed else "failed"
+            await self.redis.publish(
+                f"task:{self.todo_id}:events",
+                json.dumps({
+                    "type": "testing_step",
+                    "command": command,
+                    "status": status,
+                }),
+            )
+        except Exception:
+            pass
+
     # ---- RALPH ITERATION LOOP ----
 
     async def _execute_subtask_with_iterations(
@@ -1170,6 +1585,8 @@ class AgentCoordinator:
         unstuck_advice: str | None = None
         agent_signaled_done = False
         agent_done_summary: str | None = None
+        qc_retries_after_done = 0
+        _MAX_QC_RETRIES_AFTER_DONE = 2  # Max extra iterations when agent signals done but QC fails
         role = sub_task["agent_role"]
         role_rules = self._filter_rules_for_role(work_rules or {}, role)
         has_quality_rules = bool(role_rules.get("quality"))
@@ -1184,6 +1601,15 @@ class AgentCoordinator:
         elif todo_for_agent.get("ai_model"):
             model_override = todo_for_agent["ai_model"]
 
+        # Load architect/editor config for this project
+        _ae_project = await self.db.fetchrow(
+            "SELECT architect_editor_enabled, architect_model, editor_model FROM projects WHERE id = $1",
+            (await self._load_todo())["project_id"],
+        )
+        architect_editor_enabled = bool(_ae_project and _ae_project.get("architect_editor_enabled"))
+        architect_model = (_ae_project or {}).get("architect_model")
+        editor_model = (_ae_project or {}).get("editor_model")
+
         for iteration in range(1, max_iterations + 1):
             # Check for cancellation at the start of each iteration
             if await self._is_cancelled():
@@ -1192,6 +1618,20 @@ class AgentCoordinator:
                 return
 
             start_time = time.monotonic()
+
+            # Emit iteration_start event for streaming visibility
+            try:
+                await self.redis.publish(
+                    f"task:{self.todo_id}:events",
+                    json.dumps({
+                        "type": "iteration_start",
+                        "sub_task_id": st_id,
+                        "iteration": iteration,
+                        "subtask": sub_task["title"],
+                    }),
+                )
+            except Exception:
+                pass
 
             # Create agent run record
             run = await self.db.fetchrow(
@@ -1246,6 +1686,11 @@ class AgentCoordinator:
                 # Ensure agents always have workspace tools (built-in fallback)
                 if workspace_path:
                     builtin_tools = self._get_builtin_tools(workspace_path, role)
+                    # Inject shared per-project index directory for semantic_search
+                    shared_index_dir = os.path.normpath(os.path.join(workspace_path, "..", ".agent_index"))
+                    for bt in builtin_tools:
+                        if bt["name"] == "semantic_search":
+                            bt["_index_dir"] = shared_index_dir
                     if mcp_tools:
                         existing_names = {t["name"] for t in mcp_tools}
                         mcp_tools.extend(t for t in builtin_tools if t["name"] not in existing_names)
@@ -1281,14 +1726,90 @@ class AgentCoordinator:
                         )
                     return await self.mcp_executor.execute_tool(name, args, mcp_tools)
 
-                iter_content, response = await run_tool_loop(
-                    provider, messages,
-                    tools=tools_arg,
-                    tool_executor=_iter_tool_exec,
-                    max_rounds=10,
-                    on_activity=lambda msg: self._report_activity(st_id, msg),
-                    **send_kwargs,
-                )
+                async def _on_tool_event(event: dict) -> None:
+                    """Publish structured tool events for streaming execution visibility."""
+                    try:
+                        event["sub_task_id"] = st_id
+                        await self.redis.publish(
+                            f"task:{self.todo_id}:events",
+                            json.dumps(event),
+                        )
+                    except Exception:
+                        pass  # Don't let event publishing break execution
+
+                # Architect/Editor dual-model execution
+                if architect_editor_enabled and architect_model and editor_model:
+                    READ_ONLY_TOOLS = {"read_file", "list_directory", "search_files", "semantic_search"}
+                    WRITE_TOOLS = {"write_file", "edit_file", "run_command", "task_complete", "create_subtask"}
+
+                    # Phase A: Architect — powerful model with read-only tools
+                    architect_tools = [t for t in (tools_arg or []) if t["name"] in READ_ONLY_TOOLS]
+                    architect_kwargs = {**send_kwargs, "model": architect_model}
+
+                    async def _architect_tool_exec(name: str, args: dict) -> str:
+                        return await self.mcp_executor.execute_tool(name, args, mcp_tools)
+
+                    architect_content, architect_response = await run_tool_loop(
+                        provider, list(messages),
+                        tools=architect_tools or None,
+                        tool_executor=_architect_tool_exec,
+                        max_rounds=10,
+                        on_activity=lambda msg, _i=iteration: self._report_activity(st_id, f"[iter {_i}] [Architect] {msg}"),
+                        on_tool_event=_on_tool_event,
+                        **architect_kwargs,
+                    )
+
+                    # Phase B: Editor — fast model with write tools, guided by architect's output
+                    editor_tools = [t for t in (tools_arg or []) if t["name"] in WRITE_TOOLS]
+                    editor_system = (
+                        system_prompt
+                        + "\n\n## Architect's Analysis & Plan\n"
+                        + "Follow the architect's instructions below to make the required changes.\n\n"
+                        + (architect_content or architect_response.content or "No architect output.")
+                    )
+                    editor_messages = [
+                        LLMMessage(role="system", content=editor_system),
+                        LLMMessage(role="user", content=(
+                            "Apply the changes described in the architect's plan above. "
+                            "Use the available write tools to implement the changes."
+                        )),
+                    ]
+                    editor_kwargs = {**send_kwargs, "model": editor_model}
+
+                    iter_content, response = await run_tool_loop(
+                        provider, editor_messages,
+                        tools=editor_tools or None,
+                        tool_executor=_iter_tool_exec,
+                        max_rounds=10,
+                        on_activity=lambda msg, _i=iteration: self._report_activity(st_id, f"[iter {_i}] [Editor] {msg}"),
+                        on_tool_event=_on_tool_event,
+                        **editor_kwargs,
+                    )
+
+                    # Combine token usage from both phases
+                    response.tokens_input += architect_response.tokens_input
+                    response.tokens_output += architect_response.tokens_output
+                    if response.cost_usd and architect_response.cost_usd:
+                        response.cost_usd += architect_response.cost_usd
+                else:
+                    # Standard single-model execution
+                    iter_content, response = await run_tool_loop(
+                        provider, messages,
+                        tools=tools_arg,
+                        tool_executor=_iter_tool_exec,
+                        max_rounds=10,
+                        on_activity=lambda msg, _i=iteration: self._report_activity(st_id, f"[iter {_i}] {msg}"),
+                        on_tool_event=_on_tool_event,
+                        **send_kwargs,
+                    )
+
+                # Detect tool loop truncation — LLM wanted more tool calls but max_rounds hit
+                tool_loop_truncated = response.stop_reason == "max_tool_rounds"
+                if tool_loop_truncated:
+                    logger.warning(
+                        "[%s] Tool loop truncated at max_rounds for subtask %s iteration %d",
+                        self.todo_id, st_id, iteration,
+                    )
 
                 # Broadcast the LLM's text response so the UI can display it
                 if response.content and response.content.strip():
@@ -1338,18 +1859,33 @@ class AgentCoordinator:
                 else:
                     qc_result = {"passed": True, "reason": "no quality rules", "learnings": []}
 
+                # Report QC result as activity
+                if has_quality_rules and workspace_path:
+                    if qc_result["passed"]:
+                        await self._report_activity(st_id, f"[iter {iteration}] Quality check passed")
+                    else:
+                        reason = qc_result.get("reason", "failed")
+                        await self._report_activity(st_id, f"[iter {iteration}] Quality check failed: {reason}")
+
                 # 4. Record iteration
                 action = "implement" if iteration == 1 else ("fix_with_advice" if unstuck_advice else "fix")
+                learnings = qc_result.get("learnings", [])
+                if tool_loop_truncated:
+                    learnings.append(
+                        "Tool loop was truncated (hit max_rounds=10). "
+                        "Agent may not have finished all intended tool calls."
+                    )
                 entry = {
                     "iteration": iteration,
                     "timestamp": datetime.now(timezone.utc).isoformat(),
                     "action": action,
                     "outcome": "passed" if qc_result["passed"] else qc_result.get("reason", "failed"),
                     "error_output": qc_result.get("error_output") if not qc_result["passed"] else None,
-                    "learnings": qc_result.get("learnings", []),
+                    "learnings": learnings,
                     "files_changed": [],
                     "stuck_check": None,
                     "tokens_used": total_tokens,
+                    "tool_loop_truncated": tool_loop_truncated,
                     "llm_response": response.content.strip()[:2000] if response.content else None,
                 }
                 iteration_log.append(entry)
@@ -1360,6 +1896,20 @@ class AgentCoordinator:
                     sub_task["id"],
                     iteration_log,
                 )
+
+                # Emit iteration_end event for streaming visibility
+                try:
+                    await self.redis.publish(
+                        f"task:{self.todo_id}:events",
+                        json.dumps({
+                            "type": "iteration_end",
+                            "sub_task_id": st_id,
+                            "iteration": iteration,
+                            "status": "passed" if qc_result["passed"] else qc_result.get("reason", "failed"),
+                        }),
+                    )
+                except Exception:
+                    pass
 
                 # 5. Quality checks passed -> validate output then DONE
                 if qc_result["passed"]:
@@ -1409,14 +1959,45 @@ class AgentCoordinator:
                     await self._report_progress(st_id, 100, f"Completed: {sub_task['title']}")
                     return
 
-                # 5b. Agent signaled done via task_complete — accept result
+                # 5b. Agent signaled done via task_complete
                 if agent_signaled_done:
-                    qc_note = ""
+                    # If quality checks failed, don't accept — force the agent to fix
+                    if not qc_result["passed"] and qc_retries_after_done < _MAX_QC_RETRIES_AFTER_DONE:
+                        qc_retries_after_done += 1
+                        logger.warning(
+                            "[%s] Agent signaled task_complete on iteration %d but QC failed "
+                            "(retry %d/%d): %s",
+                            self.todo_id, iteration, qc_retries_after_done,
+                            _MAX_QC_RETRIES_AFTER_DONE, qc_result.get("reason", "unknown"),
+                        )
+                        # Record the premature completion attempt in iteration log
+                        entry["outcome"] = f"agent_done_but_qc_failed ({qc_result.get('reason', 'unknown')})"
+                        entry["error_output"] = qc_result.get("error_output")
+                        entry["learnings"].append(
+                            "Agent signaled task_complete but quality checks did not pass. "
+                            "Continuing iteration to fix quality issues."
+                        )
+                        iteration_log[-1] = entry
+                        await self.db.execute(
+                            "UPDATE sub_tasks SET iteration_log = $2 WHERE id = $1",
+                            sub_task["id"], iteration_log,
+                        )
+                        # Reset the signal so the loop continues
+                        agent_signaled_done = False
+                        agent_done_summary = ""
+                        # Skip to next iteration — context builder will include QC failure
+                        continue
+
+                    # QC passed (or retries exhausted) — accept the result
                     if not qc_result["passed"]:
-                        qc_note = f" (quality checks did not pass: {qc_result.get('reason', 'unknown')})"
+                        logger.warning(
+                            "[%s] Agent signaled task_complete, QC still failing after %d retries — "
+                            "accepting with warning",
+                            self.todo_id, _MAX_QC_RETRIES_AFTER_DONE,
+                        )
                     logger.info(
-                        "[%s] Agent signaled task_complete on iteration %d%s",
-                        self.todo_id, iteration, qc_note,
+                        "[%s] Agent signaled task_complete on iteration %d (qc=%s)",
+                        self.todo_id, iteration, "passed" if qc_result["passed"] else "failed_exhausted",
                     )
 
                     from agents.orchestrator.output_validator import (
@@ -1431,6 +2012,10 @@ class AgentCoordinator:
                         }
                     else:
                         validated_output["summary"] = agent_done_summary
+
+                    if not qc_result["passed"]:
+                        validated_output["_qc_failed"] = True
+                        validated_output["_qc_reason"] = qc_result.get("reason", "unknown")
 
                     await self._transition_subtask(
                         st_id, "completed",
@@ -1462,6 +2047,10 @@ class AgentCoordinator:
 
                     if stuck_result.get("stuck"):
                         unstuck_advice = stuck_result.get("advice")
+                        await self._report_activity(
+                            st_id,
+                            f"[iter {iteration}] Stuck detected: {stuck_result.get('pattern', 'loop')} — injecting advice",
+                        )
                         await self._post_system_message(
                             f"**Stuck detection (iteration {iteration}):** {stuck_result.get('pattern', 'Loop detected')}\n\n"
                             f"Injecting supervisor advice for next iteration."
@@ -1632,21 +2221,107 @@ class AgentCoordinator:
             "This stops the iteration loop. Do NOT keep working after you are done."
         )
 
-        # Iteration learnings (last 5 entries condensed)
+        # ── Repo Map (tree-sitter + PageRank) ──
+        if workspace_path:
+            try:
+                from agents.indexing.indexer import RepoIndexer
+                from agents.indexing.repo_map import render_repo_map
+                from agents.utils.token_counter import count_tokens
+
+                repo_dir_for_map = os.path.join(workspace_path, "repo")
+                if os.path.isdir(repo_dir_for_map):
+                    # Use shared per-project index directory
+                    shared_index_dir = os.path.join(workspace_path, "..", ".agent_index")
+                    indexer = RepoIndexer()
+                    graph = indexer.index(repo_dir_for_map, cache_dir=shared_index_dir)
+                    if graph.symbol_count > 0:
+                        repo_map_budget = settings.repo_map_token_budget
+                        repo_map = render_repo_map(
+                            graph,
+                            token_budget=repo_map_budget,
+                            count_tokens_fn=lambda t: count_tokens(t, "default"),
+                        )
+                        system += f"\n\n## Repository Symbol Map\n{repo_map}\n"
+                        logger.info(
+                            "[%s] Injected repo map: %d symbols, %d files",
+                            self.todo_id[:8], graph.symbol_count, graph.file_count,
+                        )
+            except ImportError:
+                logger.debug("[%s] tree-sitter indexing not available", self.todo_id[:8])
+            except Exception:
+                logger.debug("[%s] Repo map generation failed", self.todo_id[:8], exc_info=True)
+
+        # ── Project Memories ──
+        try:
+            memories_rows = await self.db.fetch(
+                """
+                SELECT content, category, confidence FROM project_memories
+                WHERE project_id = $1
+                ORDER BY confidence DESC
+                LIMIT 10
+                """,
+                str(todo["project_id"]),
+            )
+            if memories_rows:
+                memories_block = "\n\n## Project Memories (learnings from past tasks)\n"
+                for m in memories_rows:
+                    memories_block += f"- [{m['category']}] {m['content']}\n"
+                system += memories_block
+                logger.info("[%s] Injected %d project memories", self.todo_id[:8], len(memories_rows))
+        except Exception:
+            logger.debug("[%s] Failed to load project memories", self.todo_id[:8], exc_info=True)
+
+        # ── Iteration Learnings (with LLM compaction for old entries) ──
         if iteration_log:
-            recent = iteration_log[-5:]
-            learnings_block = "\n\n## Previous Iteration Learnings\n"
-            for entry in recent:
-                status = "PASSED" if entry["outcome"] == "passed" else f"FAILED ({entry['outcome']})"
-                learnings_block += f"- Iteration {entry['iteration']}: {status}"
-                if entry.get("learnings"):
-                    learnings_block += " — " + "; ".join(entry["learnings"])
-                learnings_block += "\n"
-                if entry.get("error_output"):
-                    # Truncate error output
-                    err = entry["error_output"][:500]
-                    learnings_block += f"  Error: {err}\n"
-            system += learnings_block
+            try:
+                from agents.utils.context_compaction import compact_iteration_log, format_compacted_entry
+                provider = await self._get_provider()
+                compacted_log = await compact_iteration_log(
+                    iteration_log, provider,
+                    keep_recent=settings.context_compaction_keep_recent,
+                )
+                learnings_block = "\n\n## Previous Iteration Learnings\n"
+                for entry in compacted_log:
+                    if "_compacted" in entry:
+                        learnings_block += format_compacted_entry(entry) + "\n"
+                    else:
+                        status = "PASSED" if entry.get("outcome") == "passed" else f"FAILED ({entry.get('outcome', '?')})"
+                        learnings_block += f"- Iteration {entry.get('iteration', '?')}: {status}"
+                        if entry.get("learnings"):
+                            learnings_block += " — " + "; ".join(entry["learnings"])
+                        learnings_block += "\n"
+                        if entry.get("error_output"):
+                            err = entry["error_output"][:500]
+                            learnings_block += f"  Error: {err}\n"
+                system += learnings_block
+            except ImportError:
+                # Fallback: original behavior without compaction
+                recent = iteration_log[-5:]
+                learnings_block = "\n\n## Previous Iteration Learnings\n"
+                for entry in recent:
+                    status = "PASSED" if entry["outcome"] == "passed" else f"FAILED ({entry['outcome']})"
+                    learnings_block += f"- Iteration {entry['iteration']}: {status}"
+                    if entry.get("learnings"):
+                        learnings_block += " — " + "; ".join(entry["learnings"])
+                    learnings_block += "\n"
+                    if entry.get("error_output"):
+                        err = entry["error_output"][:500]
+                        learnings_block += f"  Error: {err}\n"
+                system += learnings_block
+            except Exception:
+                logger.debug("[%s] Context compaction failed, using raw log", self.todo_id[:8], exc_info=True)
+                recent = iteration_log[-5:]
+                learnings_block = "\n\n## Previous Iteration Learnings\n"
+                for entry in recent:
+                    status = "PASSED" if entry.get("outcome") == "passed" else f"FAILED ({entry.get('outcome', '?')})"
+                    learnings_block += f"- Iteration {entry.get('iteration', '?')}: {status}"
+                    if entry.get("learnings"):
+                        learnings_block += " — " + "; ".join(entry["learnings"])
+                    learnings_block += "\n"
+                    if entry.get("error_output"):
+                        err = entry["error_output"][:500]
+                        learnings_block += f"  Error: {err}\n"
+                system += learnings_block
 
         # Unstuck advice injection
         if unstuck_advice:
@@ -2998,6 +3673,11 @@ class AgentCoordinator:
         # Ensure agents always have workspace tools (built-in fallback)
         if workspace_path:
             builtin_tools = self._get_builtin_tools(workspace_path, sub_task["agent_role"])
+            # Inject shared per-project index directory for semantic_search
+            _exec_idx = os.path.normpath(os.path.join(workspace_path, "..", ".agent_index"))
+            for _bt in builtin_tools:
+                if _bt["name"] == "semantic_search":
+                    _bt["_index_dir"] = _exec_idx
             if mcp_tools:
                 existing_names = {t["name"] for t in mcp_tools}
                 mcp_tools.extend(t for t in builtin_tools if t["name"] not in existing_names)
@@ -3265,6 +3945,53 @@ class AgentCoordinator:
                     "detail": f"Completed with issues: {review.get('summary', '')}",
                 },
             )
+
+        # Extract and store persistent memories from completed task
+        try:
+            from agents.indexing.memory_extractor import extract_memories, deduplicate_memories
+            # Gather iteration logs from all subtasks
+            all_iter_logs = []
+            for r in results:
+                if r.get("iteration_log"):
+                    log = r["iteration_log"]
+                    if isinstance(log, str):
+                        import json as _json
+                        log = _json.loads(log)
+                    all_iter_logs.extend(log)
+
+            if all_iter_logs:
+                memories = await extract_memories(
+                    all_iter_logs,
+                    task_title=todo["title"],
+                    task_summary=summary,
+                    provider=provider,
+                )
+                if memories:
+                    # Fetch existing memories for dedup
+                    existing = await self.db.fetch(
+                        "SELECT content FROM project_memories WHERE project_id = $1",
+                        todo["project_id"],
+                    )
+                    existing_contents = [row["content"] for row in existing]
+                    unique_memories = await deduplicate_memories(memories, existing_contents)
+
+                    for mem in unique_memories:
+                        await self.db.execute(
+                            """INSERT INTO project_memories
+                               (project_id, category, content, source_todo_id, confidence)
+                               VALUES ($1, $2, $3, $4, $5)""",
+                            todo["project_id"], mem.category, mem.content,
+                            self.todo_id, mem.confidence,
+                        )
+                    logger.info(
+                        "[%s] Stored %d new project memories (extracted %d, %d deduplicated)",
+                        self.todo_id, len(unique_memories), len(memories),
+                        len(memories) - len(unique_memories),
+                    )
+        except ImportError:
+            logger.debug("[%s] memory_extractor not available, skipping memory extraction", self.todo_id)
+        except Exception as e:
+            logger.warning("[%s] Failed to extract project memories: %s", self.todo_id, e)
 
     # ---- WORKSPACE FINALIZATION ----
 

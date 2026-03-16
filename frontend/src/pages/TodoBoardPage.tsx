@@ -10,11 +10,12 @@ const COLUMNS: { state: TodoState; label: string; accent: string }[] = [
   { state: 'planning', label: 'Planning', accent: 'border-l-blue-500' },
   { state: 'plan_ready', label: 'Plan Review', accent: 'border-l-cyan-500' },
   { state: 'in_progress', label: 'In Progress', accent: 'border-l-amber-500' },
+  { state: 'testing', label: 'Testing', accent: 'border-l-teal-500' },
   { state: 'review', label: 'Review', accent: 'border-l-orange-500' },
   { state: 'completed', label: 'Done', accent: 'border-l-emerald-500' },
 ]
 
-const ACTIVE_STATES: TodoState[] = ['scheduled', 'intake', 'planning', 'plan_ready', 'in_progress', 'review']
+const ACTIVE_STATES: TodoState[] = ['scheduled', 'intake', 'planning', 'plan_ready', 'in_progress', 'testing', 'review']
 
 const PRIORITY_CONFIG: Record<string, { color: string; dot: string; label: string }> = {
   critical: { color: 'text-red-400', dot: 'bg-red-400', label: 'Critical' },
@@ -29,6 +30,7 @@ const STATE_DOT_COLORS: Record<string, string> = {
   planning: 'bg-blue-500',
   plan_ready: 'bg-cyan-500',
   in_progress: 'bg-amber-500',
+  testing: 'bg-teal-500',
   review: 'bg-orange-500',
   completed: 'bg-emerald-500',
   failed: 'bg-red-500',

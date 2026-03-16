@@ -109,7 +109,7 @@ class EventDrivenOrchestrator:
                 WHERE status IN ('assigned', 'running')
                   AND todo_id IN (
                       SELECT id FROM todo_items
-                      WHERE state = 'in_progress'
+                      WHERE state IN ('in_progress', 'testing')
                         AND id NOT IN (
                             SELECT todo_id FROM orchestrator_locks
                             WHERE expires_at > NOW()
@@ -169,7 +169,7 @@ class EventDrivenOrchestrator:
 
         # Verify the task is still actionable (DB is source of truth)
         todo = await self.db.fetchrow("SELECT * FROM todo_items WHERE id = $1", todo_id)
-        if not todo or todo["state"] not in ("intake", "planning", "in_progress"):
+        if not todo or todo["state"] not in ("intake", "planning", "in_progress", "testing"):
             logger.info("Task %s not actionable (state=%s), releasing lock",
                         todo_id[:8], todo["state"] if todo else "NOT_FOUND")
             await self.locks.release(todo_id)
@@ -274,9 +274,9 @@ class EventDrivenOrchestrator:
                 SELECT t.* FROM todo_items t
                 LEFT JOIN orchestrator_locks l ON t.id = l.todo_id
                     AND l.expires_at > NOW()
-                WHERE t.state IN ('intake', 'planning', 'in_progress')
+                WHERE t.state IN ('intake', 'planning', 'in_progress', 'testing')
                   AND l.todo_id IS NULL
-                  AND (t.sub_state IS NULL OR t.sub_state NOT IN ('awaiting_response', 'awaiting_merge_approval'))
+                  AND (t.sub_state IS NULL OR t.sub_state NOT IN ('awaiting_response', 'awaiting_merge_approval', 'workspace_edited'))
                 ORDER BY
                     CASE t.priority
                         WHEN 'critical' THEN 0
@@ -374,7 +374,7 @@ class EventDrivenOrchestrator:
             """
             SELECT t.id, t.title, t.creator_id, t.sub_state, t.updated_at
             FROM todo_items t
-            WHERE t.state = 'in_progress'
+            WHERE t.state IN ('in_progress', 'testing')
               AND t.updated_at < NOW() - INTERVAL '30 minutes'
               AND (t.stuck_notified_at IS NULL
                    OR t.stuck_notified_at < NOW() - INTERVAL '2 hours')

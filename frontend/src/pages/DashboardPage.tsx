@@ -9,6 +9,7 @@ const STATE_DOT_COLORS: Record<string, string> = {
   planning: 'bg-blue-500',
   plan_ready: 'bg-cyan-500',
   in_progress: 'bg-amber-500',
+  testing: 'bg-teal-500',
   review: 'bg-orange-500',
   completed: 'bg-emerald-500',
   failed: 'bg-red-500',

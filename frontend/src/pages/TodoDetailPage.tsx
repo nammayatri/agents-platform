@@ -5,6 +5,7 @@ import { useTodoStore } from '../stores/todoStore'
 import { useTaskWebSocket } from '../hooks/useTaskWebSocket'
 import DiffViewer from '../components/DiffViewer'
 import WorkspaceView from '../components/workspace/WorkspaceView'
+import ExecutionLog from '../components/workspace/ExecutionLog'
 import type { SubTask, ChatMessage, Deliverable, AgentRun, PlanSubTask, IterationLogEntry, ProgressLogEntry } from '../types'
 
 const STATE_COLORS: Record<string, string> = {
@@ -12,6 +13,7 @@ const STATE_COLORS: Record<string, string> = {
   planning: 'bg-blue-600',
   plan_ready: 'bg-cyan-600',
   in_progress: 'bg-amber-600',
+  testing: 'bg-teal-600',
   review: 'bg-orange-600',
   completed: 'bg-emerald-600',
   failed: 'bg-red-600',
@@ -64,6 +66,7 @@ export default function TodoDetailPage() {
   const appendActivity = useTodoStore((s) => s.appendActivity)
   const resumeTodo = useTodoStore((s) => s.resumeTodo)
   const llmResponses = useTodoStore((s) => s.llmResponses)
+  const allExecutionEvents = useTodoStore((s) => s.executionEvents)
   const agentRunsByTodo = useTodoStore((s) => s.agentRunsByTodo)
   const fetchAgentRuns = useTodoStore((s) => s.fetchAgentRuns)
 
@@ -105,6 +108,7 @@ export default function TodoDetailPage() {
   const messages = todoId ? chatMessages[todoId] || [] : []
   const taskDeliverables = todoId ? deliverablesByTodo[todoId] || []  : []
   const agentRuns = todoId ? agentRunsByTodo[todoId] || [] : []
+  const executionEvents = todoId ? allExecutionEvents[todoId] || [] : []
 
   // Previous-run detection: when a todo is retried, items from before the last
   // state change are considered "previous run" and greyed out.
@@ -480,7 +484,7 @@ export default function TodoDetailPage() {
               </div>
             </>
           )}
-          {['intake', 'planning', 'plan_ready', 'in_progress', 'review'].includes(todo.state) && (
+          {['intake', 'planning', 'plan_ready', 'in_progress', 'testing', 'review'].includes(todo.state) && (
             <button
               onClick={() => todoId && cancelTodo(todoId)}
               className="px-3 py-1.5 bg-gray-800 hover:bg-gray-700 rounded-lg text-sm text-gray-400 transition-colors"
@@ -690,6 +694,35 @@ export default function TodoDetailPage() {
                             if (!logs || logs.length === 0) return null
                             const isOpen = expandedActivity.has(st.id)
                             const latest = logs[logs.length - 1]
+
+                            // Parse [iter N] prefix and color-code activity entries
+                            const renderEntry = (entry: string) => {
+                              const iterMatch = entry.match(/^\[iter (\d+)\]\s*(.*)$/)
+                              const iterTag = iterMatch ? iterMatch[1] : null
+                              const body = iterMatch ? iterMatch[2] : entry
+                              // Determine color based on content
+                              let textColor = 'text-gray-500'
+                              if (/^(Reading|Writing|Editing|Listing|Searching|Running:)/.test(body) || /^\[(Architect|Editor)\]/.test(body)) {
+                                textColor = 'text-cyan-600'
+                              } else if (/^Thinking/.test(body)) {
+                                textColor = 'text-indigo-500/70'
+                              } else if (/^Quality check passed/.test(body)) {
+                                textColor = 'text-emerald-600'
+                              } else if (/^Quality check failed/.test(body) || /^Stuck detected/.test(body)) {
+                                textColor = 'text-red-500/70'
+                              } else if (/^Agent will:/.test(body)) {
+                                textColor = 'text-gray-400'
+                              } else if (/^Done \(/.test(body)) {
+                                textColor = 'text-gray-400'
+                              }
+                              return (
+                                <>
+                                  {iterTag && <span className="text-gray-700 mr-1 select-none">[{iterTag}]</span>}
+                                  <span className={textColor}>{body}</span>
+                                </>
+                              )
+                            }
+
                             return (
                               <div className="mt-2">
                                 <button
@@ -705,14 +738,14 @@ export default function TodoDetailPage() {
                                   }}
                                 >
                                   <span className="w-3">{isOpen ? '\u25BC' : '\u25B6'}</span>
-                                  <span className="font-mono truncate max-w-xs">{latest}</span>
+                                  <span className="font-mono truncate max-w-md">{renderEntry(latest)}</span>
                                   <span className="text-gray-700 shrink-0">({logs.length})</span>
                                 </button>
                                 {isOpen && (
                                   <div className="mt-1.5 max-h-40 overflow-y-auto bg-gray-950 border border-gray-800/50 rounded px-2.5 py-1.5 space-y-0.5">
                                     {logs.map((entry, i) => (
-                                      <div key={i} className="text-[11px] font-mono text-gray-600 leading-relaxed">
-                                        <span className="text-gray-700 mr-1.5 select-none">{'\u203A'}</span>{entry}
+                                      <div key={i} className="text-[11px] font-mono leading-relaxed">
+                                        <span className="text-gray-700 mr-1.5 select-none">{'\u203A'}</span>{renderEntry(entry)}
                                       </div>
                                     ))}
                                     <div ref={(el) => { activityEndRefs.current[st.id] = el }} />
@@ -1073,6 +1106,16 @@ export default function TodoDetailPage() {
           </div>
           )
         })()}
+
+        {/* Execution Log (streaming tool events) */}
+        {todoId && executionEvents.length > 0 && (
+          <div className="mb-6">
+            <h2 className="text-sm font-medium text-gray-300 mb-3 uppercase tracking-wider">Execution Log</h2>
+            <div className="bg-gray-900 rounded-lg border border-gray-800/50 overflow-hidden">
+              <ExecutionLog events={executionEvents} maxHeight="400px" />
+            </div>
+          </div>
+        )}
 
         {/* Progress Log (RALPH learnings) */}
         {todo.progress_log && todo.progress_log.length > 0 && (() => {

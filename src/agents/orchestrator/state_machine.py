@@ -20,7 +20,8 @@ VALID_TRANSITIONS: dict[str, set[str]] = {
     "intake": {"planning", "failed", "cancelled"},
     "planning": {"plan_ready", "in_progress", "failed", "cancelled"},
     "plan_ready": {"in_progress", "planning", "failed", "cancelled"},
-    "in_progress": {"review", "failed", "planning", "cancelled"},
+    "in_progress": {"testing", "review", "failed", "planning", "cancelled"},
+    "testing": {"review", "in_progress", "failed", "cancelled"},
     "review": {"completed", "in_progress", "failed", "cancelled"},
     "failed": {"intake", "in_progress"},  # in_progress for subtask-level retry (e.g. PR creation)
     "cancelled": {"intake"},
@@ -31,7 +32,7 @@ VALID_TRANSITIONS: dict[str, set[str]] = {
 VALID_SUBTASK_TRANSITIONS: dict[str, set[str]] = {
     "pending": {"assigned", "cancelled", "failed"},
     "assigned": {"running", "cancelled"},
-    "running": {"completed", "failed", "cancelled"},
+    "running": {"completed", "failed", "cancelled", "pending"},  # pending = pause for retry (CI wait, merge approval)
     "failed": {"pending"},  # retry
 }
 
