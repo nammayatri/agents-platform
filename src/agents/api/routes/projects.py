@@ -4,7 +4,7 @@ import json
 from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel
 
-from agents.api.deps import DB, CurrentUser, check_project_access, check_project_owner
+from agents.api.deps import DB, CurrentUser, Redis, check_project_access, check_project_owner
 
 router = APIRouter()
 
@@ -63,7 +63,7 @@ async def list_projects(user: CurrentUser, db: DB):
 
 
 @router.post("", status_code=status.HTTP_201_CREATED)
-async def create_project(body: CreateProjectInput, user: CurrentUser, db: DB):
+async def create_project(body: CreateProjectInput, user: CurrentUser, db: DB, redis: Redis):
     context_docs_json = json.dumps(
         [d.model_dump(exclude_none=True) for d in body.context_docs]
     ) if body.context_docs else "[]"
@@ -90,7 +90,7 @@ async def create_project(body: CreateProjectInput, user: CurrentUser, db: DB):
 
     # Kick off async project analysis if repo_url is provided
     if body.repo_url:
-        asyncio.create_task(_analyze_project(str(row["id"]), db))
+        asyncio.create_task(_analyze_project(str(row["id"]), db, redis))
 
     return result
 
@@ -107,7 +107,7 @@ async def get_project(project_id: str, user: CurrentUser, db: DB):
 
 
 @router.put("/{project_id}")
-async def update_project(project_id: str, body: UpdateProjectInput, user: CurrentUser, db: DB):
+async def update_project(project_id: str, body: UpdateProjectInput, user: CurrentUser, db: DB, redis: Redis):
     await check_project_owner(db, project_id, user)
     row = await db.fetchrow("SELECT * FROM projects WHERE id = $1", project_id)
     if not row:
@@ -159,20 +159,20 @@ async def update_project(project_id: str, body: UpdateProjectInput, user: Curren
         should_reanalyze = True
 
     if should_reanalyze and result.get("repo_url"):
-        asyncio.create_task(_analyze_project(project_id, db))
+        asyncio.create_task(_analyze_project(project_id, db, redis))
 
     return result
 
 
 @router.post("/{project_id}/analyze")
-async def analyze_project(project_id: str, user: CurrentUser, db: DB):
+async def analyze_project(project_id: str, user: CurrentUser, db: DB, redis: Redis):
     """Manually trigger project analysis."""
     await check_project_access(db, project_id, user)
     row = await db.fetchrow("SELECT * FROM projects WHERE id = $1", project_id)
     if not row["repo_url"]:
         raise HTTPException(status_code=400, detail="Project has no repository URL")
 
-    asyncio.create_task(_analyze_project(project_id, db))
+    asyncio.create_task(_analyze_project(project_id, db, redis))
     return {"status": "analyzing"}
 
 
@@ -380,12 +380,65 @@ async def update_debug_context(
     return settings["debug_context"]
 
 
-async def _analyze_project(project_id: str, db) -> None:
+class BuildSettingsInput(BaseModel):
+    build_commands: list[str] | None = None
+    merge_method: str | None = None
+    require_merge_approval: bool | None = None
+
+
+@router.get("/{project_id}/build-settings")
+async def get_build_settings(project_id: str, user: CurrentUser, db: DB):
+    """Get project build & merge settings."""
+    await check_project_access(db, project_id, user)
+    row = await db.fetchrow("SELECT settings_json FROM projects WHERE id = $1", project_id)
+    settings = row["settings_json"] or {}
+    if isinstance(settings, str):
+        settings = json.loads(settings)
+    return {
+        "build_commands": settings.get("build_commands", []),
+        "merge_method": settings.get("merge_method", "squash"),
+        "require_merge_approval": settings.get("require_merge_approval", False),
+    }
+
+
+@router.put("/{project_id}/build-settings")
+async def update_build_settings(
+    project_id: str, body: BuildSettingsInput, user: CurrentUser, db: DB,
+):
+    """Update project build & merge settings. Owner-only."""
+    await check_project_owner(db, project_id, user)
+    row = await db.fetchrow("SELECT settings_json FROM projects WHERE id = $1", project_id)
+    if not row:
+        raise HTTPException(status_code=404)
+    settings = row["settings_json"] or {}
+    if isinstance(settings, str):
+        settings = json.loads(settings)
+
+    if body.build_commands is not None:
+        settings["build_commands"] = body.build_commands
+    if body.merge_method is not None:
+        settings["merge_method"] = body.merge_method
+    if body.require_merge_approval is not None:
+        settings["require_merge_approval"] = body.require_merge_approval
+
+    await db.execute(
+        "UPDATE projects SET settings_json = $2, updated_at = NOW() WHERE id = $1",
+        project_id,
+        settings,
+    )
+    return {
+        "build_commands": settings.get("build_commands", []),
+        "merge_method": settings.get("merge_method", "squash"),
+        "require_merge_approval": settings.get("require_merge_approval", False),
+    }
+
+
+async def _analyze_project(project_id: str, db, redis=None) -> None:
     """Background task to analyze a project's repo and store understanding."""
     from agents.orchestrator.project_analyzer import ProjectAnalyzer
 
     try:
-        analyzer = ProjectAnalyzer(db)
+        analyzer = ProjectAnalyzer(db, redis=redis)
         await analyzer.analyze(project_id)
     except Exception:
         import logging

@@ -5,7 +5,7 @@ import type { WSEvent, ChatMessage } from '../types'
 export function useTaskWebSocket(todoId: string | null) {
   const ws = useRef<WebSocket | null>(null)
   const [reconnectCount, setReconnectCount] = useState(0)
-  const { updateTodoState, appendChatMessage, updateSubTaskProgress, batchAppendActivity, setLlmResponse, fetchTodo } = useTodoStore()
+  const { updateTodoState, appendChatMessage, updateSubTaskProgress, batchAppendActivity, setLlmResponse, fetchTodo, fetchAgentRuns } = useTodoStore()
   const fetchDebounce = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   // Batch activity events: collect them and flush via rAF to avoid per-event re-renders
@@ -56,9 +56,13 @@ export function useTaskWebSocket(todoId: string | null) {
         switch (data.type) {
           case 'state_change':
             if (data.state) {
-              updateTodoState(todoId, data.state, data.error_message)
+              updateTodoState(todoId, data.state, data.error_message, data.sub_state)
               // Refetch full todo to get updated sub-tasks
               fetchTodo(todoId)
+              // On terminal states, refetch agent runs for detailed error info
+              if (data.state === 'failed' || data.state === 'completed') {
+                fetchAgentRuns(todoId)
+              }
             }
             break
 
@@ -127,5 +131,5 @@ export function useTaskWebSocket(todoId: string | null) {
       ws.current = null
       if (fetchDebounce.current) clearTimeout(fetchDebounce.current)
     }
-  }, [todoId, reconnectCount, updateTodoState, appendChatMessage, updateSubTaskProgress, setLlmResponse, fetchTodo, debouncedFetchTodo, queueActivity])
+  }, [todoId, reconnectCount, updateTodoState, appendChatMessage, updateSubTaskProgress, setLlmResponse, fetchTodo, fetchAgentRuns, debouncedFetchTodo, queueActivity])
 }

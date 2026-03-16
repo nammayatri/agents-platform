@@ -90,6 +90,17 @@ export const projects = {
         body: JSON.stringify(data),
       }),
   },
+  buildSettings: {
+    get: (projectId: string) =>
+      request<{ build_commands: string[]; merge_method: string; require_merge_approval: boolean }>(
+        `/projects/${projectId}/build-settings`,
+      ),
+    update: (projectId: string, data: { build_commands?: string[]; merge_method?: string; require_merge_approval?: boolean }) =>
+      request<{ build_commands: string[]; merge_method: string; require_merge_approval: boolean }>(
+        `/projects/${projectId}/build-settings`,
+        { method: 'PUT', body: JSON.stringify(data) },
+      ),
+  },
   members: {
     list: (projectId: string) =>
       request<{ owner: ProjectMember; members: ProjectMember[] }>(
@@ -141,6 +152,13 @@ export const todos = {
     request<TodoItem>(`/todos/${id}/approve-plan`, { method: 'POST' }),
   rejectPlan: (id: string, feedback: string) =>
     request<TodoItem>(`/todos/${id}/reject-plan`, {
+      method: 'POST',
+      body: JSON.stringify({ feedback }),
+    }),
+  approveMerge: (id: string) =>
+    request<{ status: string }>(`/todos/${id}/approve-merge`, { method: 'POST' }),
+  rejectMerge: (id: string, feedback: string) =>
+    request<{ status: string }>(`/todos/${id}/reject-merge`, {
       method: 'POST',
       body: JSON.stringify({ feedback }),
     }),
@@ -321,6 +339,8 @@ export const agents = {
     }),
   chatClear: () =>
     request<{ status: string }>('/config/agents/chat', { method: 'DELETE' }),
+  chatUndo: () =>
+    request<{ status: string; action: string; agent_id: string }>('/config/agents/chat/undo', { method: 'DELETE' }),
 }
 
 // Notifications

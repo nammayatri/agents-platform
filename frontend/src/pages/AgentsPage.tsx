@@ -126,6 +126,68 @@ export default function AgentsPage() {
     }
   }
 
+  async function handleUndo() {
+    try {
+      await agentsApi.chatUndo()
+      await Promise.all([loadAgents(), loadChat()])
+    } catch {
+      // ignore
+    }
+  }
+
+  function handleProposalAction(action: 'create' | 'edit') {
+    const msg = action === 'create'
+      ? 'Create the agent as proposed.'
+      : 'I want to make changes to the proposed agent.'
+    setChatInput(msg)
+    // Auto-send
+    setTimeout(() => {
+      const content = msg.trim()
+      if (!content || sending) return
+      setChatInput('')
+      setSending(true)
+
+      const tempMsg: AgentChatMessage = {
+        id: `temp-${Date.now()}`,
+        user_id: '',
+        role: 'user',
+        content,
+        created_at: new Date().toISOString(),
+      }
+      setChatMessages((prev) => [...prev, tempMsg])
+
+      agentsApi.chatSend(content).then((resp) => {
+        const userMsg = resp.user_message as AgentChatMessage
+        const assistantMsg = resp.assistant_message as AgentChatMessage
+        setChatMessages((prev) => {
+          const without = prev.filter((m) => m.id !== tempMsg.id)
+          return [...without, userMsg, assistantMsg]
+        })
+        if (assistantMsg.metadata_json?.action?.startsWith('agent_')) {
+          loadAgents()
+        }
+      }).catch((err) => {
+        setChatMessages((prev) => {
+          const without = prev.filter((m) => m.id !== tempMsg.id)
+          return [
+            ...without,
+            tempMsg,
+            {
+              id: `err-${Date.now()}`,
+              user_id: '',
+              role: 'system' as const,
+              content: `Error: ${err instanceof Error ? err.message : 'Failed to send'}`,
+              created_at: new Date().toISOString(),
+            },
+          ]
+        })
+      }).finally(() => {
+        setSending(false)
+        inputRef.current?.focus()
+      })
+    }, 0)
+  }
+
   async function handleDeleteAgent(id: string) {
     try {
       await agentsApi.delete(id)
@@ -272,6 +334,8 @@ export default function AgentsPage() {
             sending={sending}
             onSend={handleSend}
             onClear={handleClearChat}
+            onUndo={handleUndo}
+            onProposalAction={handleProposalAction}
             onKeyDown={handleKeyDown}
             chatEndRef={chatEndRef}
             inputRef={inputRef}
@@ -776,6 +840,8 @@ function BuilderTab({
   sending,
   onSend,
   onClear,
+  onUndo,
+  onProposalAction,
   onKeyDown,
   chatEndRef,
   inputRef,
@@ -786,6 +852,8 @@ function BuilderTab({
   sending: boolean
   onSend: () => void
   onClear: () => void
+  onUndo: () => void
+  onProposalAction: (action: 'create' | 'edit') => void
   onKeyDown: (e: React.KeyboardEvent) => void
   chatEndRef: React.RefObject<HTMLDivElement | null>
   inputRef: React.RefObject<HTMLTextAreaElement | null>
@@ -840,7 +908,13 @@ function BuilderTab({
         ) : (
           <div className="max-w-2xl mx-auto px-6 py-4 space-y-4">
             {chatMessages.map((msg) => (
-              <ChatBubble key={msg.id} message={msg} />
+              <ChatBubble
+                key={msg.id}
+                message={msg}
+                onUndo={onUndo}
+                onProposalAction={onProposalAction}
+                sending={sending}
+              />
             ))}
             {sending && (
               <div className="flex gap-3">
@@ -933,9 +1007,109 @@ function BuilderTab({
   )
 }
 
+/* ─── Agent Proposal Card ────────────────────────────────────────── */
+
+function AgentProposalCard({
+  config,
+  onAction,
+  sending,
+}: {
+  config: NonNullable<AgentChatMessage['metadata_json']>['proposed_config']
+  onAction: (action: 'create' | 'edit') => void
+  sending: boolean
+}) {
+  const [expanded, setExpanded] = useState(false)
+
+  if (!config) return null
+
+  const promptPreview = config.system_prompt.length > 200
+    ? config.system_prompt.slice(0, 200) + '...'
+    : config.system_prompt
+
+  return (
+    <div className="border border-indigo-500/30 bg-indigo-500/5 rounded-lg overflow-hidden">
+      <div className="px-4 py-3 space-y-3">
+        <div className="flex items-center gap-2">
+          <div className="w-7 h-7 rounded-full bg-indigo-500/10 flex items-center justify-center text-xs font-semibold text-indigo-400 shrink-0">
+            {config.name.charAt(0)}
+          </div>
+          <div className="flex-1 min-w-0">
+            <p className="text-sm font-medium text-white">{config.name}</p>
+            <p className="text-[11px] text-gray-500">{config.description || 'No description'}</p>
+          </div>
+          <span className="px-2 py-0.5 rounded text-[10px] font-mono bg-indigo-500/10 text-indigo-400">
+            {config.role}
+          </span>
+        </div>
+
+        <div>
+          <span className="text-[10px] text-gray-600 uppercase tracking-wider">System Prompt</span>
+          <pre
+            className="mt-1 text-xs text-gray-400 bg-gray-950 rounded p-2.5 whitespace-pre-wrap font-mono cursor-pointer max-h-40 overflow-y-auto"
+            onClick={() => setExpanded(!expanded)}
+          >
+            {expanded ? config.system_prompt : promptPreview}
+          </pre>
+          {config.system_prompt.length > 200 && (
+            <button
+              onClick={() => setExpanded(!expanded)}
+              className="text-[10px] text-indigo-400 hover:text-indigo-300 mt-1 transition-colors"
+            >
+              {expanded ? 'Show less' : 'Show full prompt'}
+            </button>
+          )}
+        </div>
+
+        {config.tools_enabled.length > 0 && (
+          <div>
+            <span className="text-[10px] text-gray-600 uppercase tracking-wider">Tools</span>
+            <div className="flex flex-wrap gap-1.5 mt-1">
+              {config.tools_enabled.map((t) => (
+                <span
+                  key={t}
+                  className="px-2 py-0.5 rounded text-[10px] bg-indigo-500/10 text-indigo-400"
+                >
+                  {t}
+                </span>
+              ))}
+            </div>
+          </div>
+        )}
+
+        <div className="flex items-center gap-2 pt-1">
+          <button
+            onClick={() => onAction('create')}
+            disabled={sending}
+            className="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 text-white text-xs rounded-lg transition-colors"
+          >
+            Create this agent
+          </button>
+          <button
+            onClick={() => onAction('edit')}
+            disabled={sending}
+            className="px-3 py-1.5 bg-gray-800 hover:bg-gray-700 disabled:opacity-40 text-gray-300 text-xs rounded-lg transition-colors"
+          >
+            I want changes
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
 /* ─── Chat Bubble ────────────────────────────────────────────────── */
 
-function ChatBubble({ message }: { message: AgentChatMessage }) {
+function ChatBubble({
+  message,
+  onUndo,
+  onProposalAction,
+  sending,
+}: {
+  message: AgentChatMessage
+  onUndo: () => void
+  onProposalAction: (action: 'create' | 'edit') => void
+  sending: boolean
+}) {
   if (message.role === 'user') {
     return (
       <div className="flex gap-3 justify-end">
@@ -947,9 +1121,15 @@ function ChatBubble({ message }: { message: AgentChatMessage }) {
   }
 
   if (message.role === 'system') {
+    const meta = message.metadata_json
+    const isUndone = meta?.action === 'agent_undone'
     return (
       <div className="flex justify-center">
-        <p className="text-xs text-red-400/70 bg-red-500/5 rounded px-3 py-1.5">
+        <p className={`text-xs rounded px-3 py-1.5 ${
+          isUndone
+            ? 'text-amber-400/70 bg-amber-500/5'
+            : 'text-red-400/70 bg-red-500/5'
+        }`}>
           {message.content}
         </p>
       </div>
@@ -976,6 +1156,16 @@ function ChatBubble({ message }: { message: AgentChatMessage }) {
         </svg>
       </div>
       <div className="flex-1 min-w-0 space-y-2">
+        {/* Agent proposed — show preview card */}
+        {meta?.action === 'agent_proposed' && meta.proposed_config && (
+          <AgentProposalCard
+            config={meta.proposed_config}
+            onAction={onProposalAction}
+            sending={sending}
+          />
+        )}
+
+        {/* Agent created — success badge with undo */}
         {meta?.action === 'agent_created' && (
           <div className="flex items-center gap-2 px-3 py-1.5 bg-emerald-500/5 border border-emerald-500/20 rounded-lg">
             <svg
@@ -987,11 +1177,24 @@ function ChatBubble({ message }: { message: AgentChatMessage }) {
             >
               <path strokeLinecap="round" strokeLinejoin="round" d="M4.5 12.75l6 6 9-13.5" />
             </svg>
-            <span className="text-xs text-emerald-400">
+            <span className="text-xs text-emerald-400 flex-1">
               Agent created: {meta.agent_name}
             </span>
+            {!meta.undone && (
+              <button
+                onClick={onUndo}
+                className="text-[10px] text-gray-500 hover:text-red-400 transition-colors"
+              >
+                Undo
+              </button>
+            )}
+            {meta.undone && (
+              <span className="text-[10px] text-gray-600 italic">undone</span>
+            )}
           </div>
         )}
+
+        {/* Agent updated — badge with undo */}
         {meta?.action === 'agent_updated' && (
           <div className="flex items-center gap-2 px-3 py-1.5 bg-amber-500/5 border border-amber-500/20 rounded-lg">
             <svg
@@ -1007,9 +1210,21 @@ function ChatBubble({ message }: { message: AgentChatMessage }) {
                 d="M16.023 9.348h4.992v-.001M2.985 19.644v-4.992m0 0h4.992m-4.993 0l3.181 3.183a8.25 8.25 0 0013.803-3.7M4.031 9.865a8.25 8.25 0 0113.803-3.7l3.181 3.182"
               />
             </svg>
-            <span className="text-xs text-amber-400">Agent updated</span>
+            <span className="text-xs text-amber-400 flex-1">Agent updated</span>
+            {!meta.undone && (
+              <button
+                onClick={onUndo}
+                className="text-[10px] text-gray-500 hover:text-red-400 transition-colors"
+              >
+                Undo
+              </button>
+            )}
+            {meta.undone && (
+              <span className="text-[10px] text-gray-600 italic">undone</span>
+            )}
           </div>
         )}
+
         <div className="bg-gray-900 border border-gray-800 rounded-lg px-3 py-2">
           <p className="text-sm text-gray-300 whitespace-pre-wrap">{message.content}</p>
         </div>

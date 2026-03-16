@@ -131,19 +131,17 @@ class WorkspaceManager:
         if isinstance(context_docs, str):
             context_docs = json.loads(context_docs)
 
-        for dep in context_docs:
+        async def _clone_dep(dep: dict) -> None:
             dep_url = dep.get("repo_url")
             if not dep_url:
-                continue
+                return
             dep_name = dep.get("name", "").replace("/", "_").replace(" ", "_") or "dep"
             dep_dir = os.path.join(deps_dir, dep_name)
             try:
-                # Each dependency can have its own git provider
                 dep_git_provider_id = dep.get("git_provider_id")
                 dep_token, dep_provider_type, _ = await self._resolve_git_credentials(
                     dep_git_provider_id, dep_url,
                 )
-                # If no token resolved and project has one for the same host, reuse it
                 if not dep_token and token:
                     dep_detected = detect_provider_type(dep_url)
                     if dep_detected == provider_type:
@@ -158,6 +156,11 @@ class WorkspaceManager:
                 )
             except Exception:
                 logger.warning("Failed to clone dependency %s from %s", dep_name, dep_url)
+
+        # Clone all dependencies in parallel
+        dep_tasks = [_clone_dep(dep) for dep in context_docs]
+        if dep_tasks:
+            await asyncio.gather(*dep_tasks, return_exceptions=True)
 
         # Store workspace path in DB
         await self.db.execute(

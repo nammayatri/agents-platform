@@ -29,6 +29,8 @@ interface TodoState {
   requestChanges: (todoId: string, feedback: string) => Promise<void>
   approvePlan: (todoId: string) => Promise<void>
   rejectPlan: (todoId: string, feedback: string) => Promise<void>
+  approveMerge: (todoId: string) => Promise<void>
+  rejectMerge: (todoId: string, feedback: string) => Promise<void>
 
   fetchChat: (todoId: string) => Promise<void>
   sendChat: (todoId: string, content: string) => Promise<void>
@@ -37,7 +39,7 @@ interface TodoState {
   fetchAgentRuns: (todoId: string) => Promise<void>
   fetchDeliverables: (todoId: string) => Promise<void>
 
-  updateTodoState: (todoId: string, state: string, errorMessage?: string) => void
+  updateTodoState: (todoId: string, state: string, errorMessage?: string, subState?: string) => void
   updateSubTaskProgress: (todoId: string, subTaskId: string, pct: number, message: string) => void
   appendActivity: (subTaskId: string, activity: string) => void
   batchAppendActivity: (entries: [string, string[]][]) => void
@@ -155,6 +157,22 @@ export const useTodoStore = create<TodoState>((set, get) => ({
     }
   },
 
+  approveMerge: async (todoId) => {
+    await todosApi.approveMerge(todoId)
+    const { todos } = get()
+    if (todos[todoId]) {
+      set({ todos: { ...todos, [todoId]: { ...todos[todoId], sub_state: 'merge_approved' } } })
+    }
+  },
+
+  rejectMerge: async (todoId, feedback) => {
+    await todosApi.rejectMerge(todoId, feedback)
+    const { todos } = get()
+    if (todos[todoId]) {
+      set({ todos: { ...todos, [todoId]: { ...todos[todoId], sub_state: 'executing' } } })
+    }
+  },
+
   fetchChat: async (todoId) => {
     const messages = await chatApi.history(todoId) as ChatMessage[]
     set({ chatMessages: { ...get().chatMessages, [todoId]: messages } })
@@ -183,12 +201,15 @@ export const useTodoStore = create<TodoState>((set, get) => ({
     set({ deliverablesByTodo: { ...get().deliverablesByTodo, [todoId]: items } })
   },
 
-  updateTodoState: (todoId, state, errorMessage) => {
+  updateTodoState: (todoId, state, errorMessage, subState) => {
     const { todos } = get()
     if (todos[todoId]) {
       const updated = { ...todos[todoId], state: state as TodoItem['state'] }
       if (errorMessage) {
         updated.error_message = errorMessage
+      }
+      if (subState !== undefined) {
+        updated.sub_state = subState
       }
       set({ todos: { ...todos, [todoId]: updated } })
     }

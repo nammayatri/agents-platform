@@ -9,7 +9,7 @@ from pydantic import BaseModel
 from agents.api.deps import DB, CurrentUser, EventBusDep, Redis, check_project_access
 from agents.config.settings import settings
 from agents.orchestrator.events import TaskEvent
-from agents.orchestrator.state_machine import transition_todo
+from agents.orchestrator.state_machine import transition_todo, transition_subtask
 from agents.schemas.todo import (
     CreateTodoInput,
     RejectPlanInput,
@@ -703,6 +703,85 @@ async def reject_plan(
         state="planning",
     ))
     return result
+
+
+@router.post("/todos/{todo_id}/approve-merge")
+async def approve_merge(todo_id: str, user: CurrentUser, db: DB, redis: Redis, event_bus: EventBusDep):
+    """Approve a pending merge. Wakes the coordinator to proceed with merge."""
+    todo = await db.fetchrow("SELECT * FROM todo_items WHERE id = $1", todo_id)
+    if not todo:
+        raise HTTPException(status_code=404)
+    await check_project_access(db, str(todo["project_id"]), user)
+    if todo.get("sub_state") != "awaiting_merge_approval":
+        raise HTTPException(status_code=400, detail="Task is not awaiting merge approval")
+
+    # Set sub_state to merge_approved so coordinator can proceed
+    await db.execute(
+        "UPDATE todo_items SET sub_state = 'merge_approved', updated_at = NOW() WHERE id = $1",
+        todo_id,
+    )
+    await db.execute(
+        "INSERT INTO chat_messages (todo_id, role, content) VALUES ($1, 'system', $2)",
+        todo_id,
+        "Merge approved by user. Proceeding with merge.",
+    )
+    await redis.publish(
+        f"task:{todo_id}:events",
+        json.dumps({"type": "state_change", "state": "in_progress", "sub_state": "merge_approved"}),
+    )
+    await event_bus.publish(TaskEvent(
+        event_type="merge_approved",
+        todo_id=todo_id,
+        state="in_progress",
+    ))
+    return {"status": "approved"}
+
+
+@router.post("/todos/{todo_id}/reject-merge")
+async def reject_merge(
+    todo_id: str, body: RequestChangesInput, user: CurrentUser, db: DB, redis: Redis, event_bus: EventBusDep,
+):
+    """Reject a pending merge. Fails the merge subtask and posts feedback."""
+    todo = await db.fetchrow("SELECT * FROM todo_items WHERE id = $1", todo_id)
+    if not todo:
+        raise HTTPException(status_code=404)
+    await check_project_access(db, str(todo["project_id"]), user)
+    if todo.get("sub_state") != "awaiting_merge_approval":
+        raise HTTPException(status_code=400, detail="Task is not awaiting merge approval")
+
+    # Fail the pending merge subtask
+    merge_st = await db.fetchrow(
+        "SELECT id FROM sub_tasks WHERE todo_id = $1 AND agent_role = 'merge_agent' AND status = 'pending' LIMIT 1",
+        todo_id,
+    )
+    if merge_st:
+        await transition_subtask(
+            db, str(merge_st["id"]), "failed",
+            error_message=f"Merge rejected by user: {body.feedback}",
+        )
+
+    # Clear sub_state
+    await db.execute(
+        "UPDATE todo_items SET sub_state = 'executing', updated_at = NOW() WHERE id = $1",
+        todo_id,
+    )
+    # Post feedback as chat message
+    await db.execute(
+        "INSERT INTO chat_messages (todo_id, role, content) VALUES ($1, 'user', $2)",
+        todo_id,
+        f"[Merge Rejected]: {body.feedback}",
+    )
+    await redis.rpush(f"task:{todo_id}:chat_input", body.feedback)
+    await redis.publish(
+        f"task:{todo_id}:events",
+        json.dumps({"type": "state_change", "state": "in_progress"}),
+    )
+    await event_bus.publish(TaskEvent(
+        event_type="task_activated",
+        todo_id=todo_id,
+        state="in_progress",
+    ))
+    return {"status": "rejected"}
 
 
 class TriggerSubTaskInput(BaseModel):

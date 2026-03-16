@@ -8,11 +8,14 @@ interface ProjectBuildMergeTabProps {
   setBuildCommands: (cmds: string[]) => void
   mergeMethod: 'merge' | 'squash' | 'rebase'
   setMergeMethod: (method: 'merge' | 'squash' | 'rebase') => void
+  requireMergeApproval: boolean
+  setRequireMergeApproval: (v: boolean) => void
   setError: (err: string) => void
 }
 
 export default function ProjectBuildMergeTab({
-  projectId, buildCommands, setBuildCommands, mergeMethod, setMergeMethod, setError,
+  projectId, buildCommands, setBuildCommands, mergeMethod, setMergeMethod,
+  requireMergeApproval, setRequireMergeApproval, setError,
 }: ProjectBuildMergeTabProps) {
   const [saving, setSaving] = useState(false)
 
@@ -23,6 +26,29 @@ export default function ProjectBuildMergeTab({
         <p className="text-[11px] text-gray-600 mt-0.5">
           Configure how PRs are merged and what build commands run after merge.
         </p>
+      </div>
+
+      <div>
+        <label className="flex items-center gap-3 cursor-pointer group">
+          <div className="relative">
+            <input
+              type="checkbox"
+              checked={requireMergeApproval}
+              onChange={(e) => setRequireMergeApproval(e.target.checked)}
+              className="sr-only peer"
+            />
+            <div className="w-9 h-5 bg-gray-800 border border-gray-700 rounded-full peer-checked:bg-indigo-600 peer-checked:border-indigo-500 transition-colors" />
+            <div className="absolute top-0.5 left-0.5 w-4 h-4 bg-gray-500 rounded-full peer-checked:translate-x-4 peer-checked:bg-white transition-all" />
+          </div>
+          <div>
+            <span className="text-sm text-gray-300 group-hover:text-white transition-colors">
+              Require approval before merge
+            </span>
+            <p className="text-[11px] text-gray-600">
+              When enabled, the merge agent will pause and wait for your approval before merging PRs.
+            </p>
+          </div>
+        </label>
       </div>
 
       <div>
@@ -90,11 +116,10 @@ export default function ProjectBuildMergeTab({
             setError('')
             try {
               const cleanedCmds = buildCommands.filter((c) => c.trim())
-              await projectsApi.update(projectId, {
-                settings_json: {
-                  build_commands: cleanedCmds,
-                  merge_method: mergeMethod,
-                },
+              await projectsApi.buildSettings.update(projectId, {
+                build_commands: cleanedCmds,
+                merge_method: mergeMethod,
+                require_merge_approval: requireMergeApproval,
               })
               setBuildCommands(cleanedCmds)
             } catch (e) {

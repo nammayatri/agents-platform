@@ -62,6 +62,7 @@ export interface Project {
     work_rules?: WorkRules
     build_commands?: string[]
     merge_method?: 'merge' | 'squash' | 'rebase'
+    require_merge_approval?: boolean
     debug_context?: DebugContext
     project_understanding?: {
       summary?: string
@@ -384,6 +385,15 @@ export interface AgentChatMessage {
     action?: string
     agent_id?: string
     agent_name?: string
+    proposed_config?: {
+      name: string
+      role: string
+      description?: string
+      system_prompt: string
+      tools_enabled: string[]
+    }
+    previous_state?: Record<string, unknown>
+    undone?: boolean
   }
   created_at: string
 }
@@ -453,6 +463,7 @@ export interface WSEvent {
   preview?: string
   iteration?: number
   error_message?: string
+  sub_state?: string
 }
 
 // ── API Payload Types ──────────────────────────────────────────────

@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback, useRef } from 'react'
+import { useEffect, useState, useCallback } from 'react'
 import { useParams, useNavigate, useSearchParams } from 'react-router-dom'
 import { projects as projectsApi, providers as providersApi, gitProviders as gitProvidersApi, skills as skillsApi, mcpServers as mcpApi, projectConfig as projectConfigApi } from '../services/api'
 import type { Project, ProjectDependency, ProjectMember, ProviderConfig, GitProviderConfig, Skill, McpServer, WorkRules } from '../types'
@@ -53,13 +53,13 @@ export default function ProjectSettingsPage() {
   const [projectUnderstanding, setProjectUnderstanding] = useState<ProjectUnderstanding | null>(null)
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState('')
-  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const [userRole, setUserRole] = useState<'owner' | 'member'>('owner')
   const [members, setMembers] = useState<ProjectMember[]>([])
   const [memberOwner, setMemberOwner] = useState<ProjectMember | null>(null)
   const [workRules, setWorkRules] = useState<WorkRules>({})
   const [buildCommands, setBuildCommands] = useState<string[]>([])
   const [mergeMethod, setMergeMethod] = useState<'merge' | 'squash' | 'rebase'>('squash')
+  const [requireMergeApproval, setRequireMergeApproval] = useState(false)
 
   const editTabs = ['General', 'Repository', 'Dependencies', 'Rules', 'Build & Merge', 'Debug', 'Capabilities', 'Members', 'Understanding', 'Agents']
   const activeTab = searchParams.get('tab') || editTabs[0]
@@ -85,6 +85,7 @@ export default function ProjectSettingsPage() {
       setWorkRules((settings?.work_rules as WorkRules) || {})
       setBuildCommands((settings?.build_commands as string[]) || [])
       setMergeMethod((settings?.merge_method as 'merge' | 'squash' | 'rebase') || 'squash')
+      setRequireMergeApproval(!!settings?.require_merge_approval)
       try {
         const m = await projectsApi.members.list(projectId!)
         setMemberOwner(m.owner as ProjectMember)
@@ -111,24 +112,6 @@ export default function ProjectSettingsPage() {
       }).catch(() => {})
     }
   }, [loadProject, projectId])
-
-  useEffect(() => {
-    if (analysisStatus === 'analyzing' && projectId) {
-      pollRef.current = setInterval(async () => {
-        try {
-          const p = (await projectsApi.get(projectId)) as Project
-          const settings = typeof p.settings_json === 'string' ? JSON.parse(p.settings_json) : p.settings_json
-          const status = settings?.analysis_status || null
-          setAnalysisStatus(status)
-          if (status === 'complete' || status === 'failed' || status === 'no_docs') {
-            setProjectUnderstanding((settings?.project_understanding as ProjectUnderstanding) || null)
-            if (pollRef.current) clearInterval(pollRef.current)
-          }
-        } catch { /* ignore */ }
-      }, 3000)
-    }
-    return () => { if (pollRef.current) clearInterval(pollRef.current) }
-  }, [analysisStatus, projectId])
 
   const handleSave = async () => {
     if (!name.trim()) { setError('Project name is required'); return }
@@ -249,6 +232,7 @@ export default function ProjectSettingsPage() {
             projectId={projectId!}
             buildCommands={buildCommands} setBuildCommands={setBuildCommands}
             mergeMethod={mergeMethod} setMergeMethod={setMergeMethod}
+            requireMergeApproval={requireMergeApproval} setRequireMergeApproval={setRequireMergeApproval}
             setError={setError}
           />
         )}
@@ -286,6 +270,7 @@ export default function ProjectSettingsPage() {
             analysisStatus={analysisStatus}
             projectUnderstanding={projectUnderstanding}
             setAnalysisStatus={setAnalysisStatus}
+            setProjectUnderstanding={setProjectUnderstanding}
             setError={setError}
           />
         )}

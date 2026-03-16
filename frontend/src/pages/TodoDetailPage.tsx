@@ -57,6 +57,8 @@ export default function TodoDetailPage() {
   const requestChanges = useTodoStore((s) => s.requestChanges)
   const approvePlan = useTodoStore((s) => s.approvePlan)
   const rejectPlan = useTodoStore((s) => s.rejectPlan)
+  const approveMerge = useTodoStore((s) => s.approveMerge)
+  const rejectMerge = useTodoStore((s) => s.rejectMerge)
   const appendActivity = useTodoStore((s) => s.appendActivity)
   const llmResponses = useTodoStore((s) => s.llmResponses)
   const agentRunsByTodo = useTodoStore((s) => s.agentRunsByTodo)
@@ -68,6 +70,8 @@ export default function TodoDetailPage() {
   const [changesFeedback, setChangesFeedback] = useState('')
   const [rejectFeedback, setRejectFeedback] = useState('')
   const [showRejectForm, setShowRejectForm] = useState(false)
+  const [rejectMergeFeedback, setRejectMergeFeedback] = useState('')
+  const [showRejectMergeForm, setShowRejectMergeForm] = useState(false)
   const [expandedSubTasks, setExpandedSubTasks] = useState<Set<string>>(new Set())
   const [expandedActivity, setExpandedActivity] = useState<Set<string>>(new Set())
   const [expandedLlmResponse, setExpandedLlmResponse] = useState<Set<string>>(new Set())
@@ -222,6 +226,82 @@ export default function TodoDetailPage() {
             })()}
           </div>
         )}
+
+        {/* Merge Approval Panel */}
+        {todo.sub_state === 'awaiting_merge_approval' && (() => {
+          const prDeliverable = taskDeliverables.find((d: Deliverable) => d.type === 'pull_request' && d.pr_url)
+          return (
+            <div className="mb-5 bg-gray-900 border border-indigo-500/20 rounded-lg overflow-hidden">
+              <div className="px-4 py-3 border-b border-gray-800 flex items-center gap-2">
+                <span className="w-2 h-2 rounded-full bg-indigo-400 animate-pulse" />
+                <h2 className="text-sm font-medium text-white">Merge Approval Required</h2>
+              </div>
+              <div className="px-4 py-3">
+                <p className="text-sm text-gray-400 mb-2">
+                  CI has passed. This PR is ready to merge.
+                </p>
+                {prDeliverable && prDeliverable.pr_url && (
+                  <a href={prDeliverable.pr_url} target="_blank" rel="noreferrer"
+                    className="text-sm text-indigo-400 hover:underline">
+                    PR #{prDeliverable.pr_number}: {prDeliverable.title}
+                  </a>
+                )}
+              </div>
+              <div className="px-4 py-3 border-t border-gray-800 flex items-center gap-2">
+                <button
+                  onClick={() => todoId && approveMerge(todoId)}
+                  className="px-4 py-1.5 bg-emerald-600 hover:bg-emerald-500 rounded-lg text-sm font-medium text-white transition-colors"
+                >
+                  Approve & Merge
+                </button>
+                {showRejectMergeForm ? (
+                  <div className="flex-1 flex items-center gap-2">
+                    <input
+                      className="flex-1 px-3 py-1.5 bg-gray-950 border border-gray-800 rounded-lg text-sm text-white placeholder-gray-600 focus:outline-none focus:border-indigo-500 transition-colors"
+                      placeholder="Why reject this merge?"
+                      value={rejectMergeFeedback}
+                      onChange={(e) => setRejectMergeFeedback(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter' && rejectMergeFeedback.trim() && todoId) {
+                          rejectMerge(todoId, rejectMergeFeedback.trim())
+                          setRejectMergeFeedback('')
+                          setShowRejectMergeForm(false)
+                        }
+                      }}
+                      autoFocus
+                    />
+                    <button
+                      onClick={() => {
+                        if (rejectMergeFeedback.trim() && todoId) {
+                          rejectMerge(todoId, rejectMergeFeedback.trim())
+                          setRejectMergeFeedback('')
+                          setShowRejectMergeForm(false)
+                        }
+                      }}
+                      disabled={!rejectMergeFeedback.trim()}
+                      className="px-3 py-1.5 bg-gray-800 hover:bg-gray-700 disabled:opacity-40 rounded-lg text-sm text-gray-300 transition-colors"
+                    >
+                      Send
+                    </button>
+                    <button
+                      onClick={() => setShowRejectMergeForm(false)}
+                      className="text-xs text-gray-600 hover:text-gray-400 transition-colors"
+                    >
+                      Cancel
+                    </button>
+                  </div>
+                ) : (
+                  <button
+                    onClick={() => setShowRejectMergeForm(true)}
+                    className="px-4 py-1.5 bg-gray-800 hover:bg-gray-700 rounded-lg text-sm text-gray-400 transition-colors"
+                  >
+                    Reject Merge
+                  </button>
+                )}
+              </div>
+            </div>
+          )
+        })()}
 
         {/* Plan Review Panel */}
         {todo.state === 'plan_ready' && todo.plan_json && (
@@ -609,7 +689,13 @@ export default function TodoDetailPage() {
                         )
                       })()}
                       {st.error_message && (
-                        <div className="text-[11px] text-red-400/60 mt-1 font-mono">{st.error_message}</div>
+                        <div className="mt-2 px-2.5 py-2 bg-red-500/5 border border-red-500/10 rounded">
+                          <div className="flex items-center gap-1.5 mb-0.5">
+                            <span className="w-1.5 h-1.5 rounded-full bg-red-400/70 shrink-0" />
+                            <span className="text-[11px] text-red-400/70 font-medium">Error</span>
+                          </div>
+                          <pre className="text-[11px] text-red-300/50 font-mono whitespace-pre-wrap max-h-24 overflow-y-auto leading-relaxed">{st.error_message}</pre>
+                        </div>
                       )}
                       {lastStuck && (
                         <div className="mt-1.5 px-2 py-1 bg-amber-500/5 border border-amber-500/10 rounded text-[11px] text-amber-300/70">

@@ -31,7 +31,7 @@ from agents.providers.mcp_executor import McpToolExecutor
 from agents.providers.registry import ProviderRegistry
 from agents.providers.tools_registry import ToolsRegistry
 from agents.schemas.agent import LLMMessage, LLMResponse
-from agents.utils.json_helpers import extract_json, fix_trailing_commas, parse_llm_json, safe_json
+from agents.utils.json_helpers import parse_llm_json, safe_json
 
 logger = logging.getLogger(__name__)
 
@@ -40,7 +40,6 @@ from agents.agents.registry import (
     get_agent_definition,
     get_builtin_tool_schemas,
     get_default_system_prompt,
-    get_default_tools,
 )
 
 MAX_REVIEW_ROUNDS = 10
@@ -2604,11 +2603,45 @@ class AgentCoordinator:
                 )
                 return
 
-            # 4. Merge the PR
-            await self._report_progress(st_id, 70, f"Merging PR #{pr_number}")
+            # 4. Check if human approval is required before merge
             project_settings = project.get("settings_json") or {}
             if isinstance(project_settings, str):
                 project_settings = json.loads(project_settings)
+
+            require_approval = project_settings.get("require_merge_approval", False)
+            already_approved = todo.get("sub_state") == "merge_approved"
+
+            if require_approval and not already_approved:
+                await self.db.execute(
+                    "UPDATE todo_items SET sub_state = 'awaiting_merge_approval', updated_at = NOW() WHERE id = $1",
+                    self.todo_id,
+                )
+                await self._post_system_message(
+                    f"**PR #{pr_number} is ready to merge.** CI passed. Awaiting your approval to merge."
+                )
+                await self._transition_subtask(
+                    st_id, "pending",
+                    progress_message="Awaiting merge approval",
+                )
+                await self.redis.publish(
+                    f"task:{self.todo_id}:events",
+                    json.dumps({
+                        "type": "state_change",
+                        "state": "in_progress",
+                        "sub_state": "awaiting_merge_approval",
+                    }),
+                )
+                return
+
+            # If approval was granted, clear the sub_state
+            if already_approved:
+                await self.db.execute(
+                    "UPDATE todo_items SET sub_state = 'merging', updated_at = NOW() WHERE id = $1",
+                    self.todo_id,
+                )
+
+            # 5. Merge the PR
+            await self._report_progress(st_id, 70, f"Merging PR #{pr_number}")
             merge_method = project_settings.get("merge_method", "squash")
 
             merge_result = await git.merge_pull_request(

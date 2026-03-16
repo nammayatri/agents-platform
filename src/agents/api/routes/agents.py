@@ -169,19 +169,41 @@ async def create_default_override(role: str, body: AgentUpdate, user: CurrentUse
 
 AGENT_BUILDER_TOOLS = [
     {
-        "name": "create_agent",
-        "description": "Create a new custom agent with a specific role, name, and system prompt.",
+        "name": "propose_agent",
+        "description": (
+            "Show a preview of an agent configuration for user review before creating it. "
+            "ALWAYS use this before create_agent so the user can review and confirm."
+        ),
         "input_schema": {
             "type": "object",
             "properties": {
                 "name": {"type": "string", "description": "Display name for the agent (e.g. 'Frontend Developer')"},
                 "role": {"type": "string", "description": "Unique role identifier, snake_case (e.g. 'frontend_dev')"},
                 "description": {"type": "string", "description": "Short description of what this agent does"},
-                "system_prompt": {"type": "string", "description": "The full system prompt / instructions for this agent. Be thorough and specific about the agent's expertise, coding style, and responsibilities."},
+                "system_prompt": {"type": "string", "description": "The full system prompt / instructions for this agent. Be thorough and specific."},
                 "tools_enabled": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "List of tool names: read_file, write_file, list_directory, search_files, run_command (builtin), plus any MCP tool names",
+                    "description": "List of tool names: read_file, write_file, edit_file, list_directory, search_files, run_command, task_complete, create_subtask",
+                },
+            },
+            "required": ["name", "role", "system_prompt"],
+        },
+    },
+    {
+        "name": "create_agent",
+        "description": "Create a new custom agent. Only call this AFTER the user has reviewed a propose_agent preview and confirmed.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Display name for the agent"},
+                "role": {"type": "string", "description": "Unique role identifier, snake_case"},
+                "description": {"type": "string", "description": "Short description of what this agent does"},
+                "system_prompt": {"type": "string", "description": "The full system prompt / instructions for this agent."},
+                "tools_enabled": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "List of tool names",
                 },
             },
             "required": ["name", "role", "system_prompt"],
@@ -217,18 +239,23 @@ AGENT_BUILDER_SYSTEM = """\
 You are an AI Agent Builder assistant. You help users create and configure custom AI agents \
 for their agent orchestration platform.
 
-When a user describes what kind of agent they want, use the `create_agent` tool to build it. \
-Write thorough, specific system prompts that define the agent's:
+CRITICAL WORKFLOW — always follow this order:
+1. When a user describes an agent they want, use `propose_agent` to show a preview FIRST.
+2. WAIT for the user to confirm ("create it", "looks good", "yes") or request changes.
+3. Only call `create_agent` AFTER the user explicitly confirms the proposal.
+4. If the user wants changes, call `propose_agent` again with the updated configuration.
+5. NEVER call `create_agent` without first showing a proposal via `propose_agent`.
+
+When writing system prompts, be thorough and specific about:
 - Expertise and domain knowledge
-- Coding style and conventions
+- Coding style and conventions to follow
 - Specific responsibilities and boundaries
 - How it should interact with other agents in the team
 
-Available builtin tools agents can use: read_file, write_file, list_directory, search_files, run_command.
+Available builtin tools agents can use: read_file, write_file, edit_file, list_directory, \
+search_files, run_command, task_complete, create_subtask.
 
-Available tools: create_agent, update_agent, list_agents.
-
-Keep responses concise. When creating an agent, explain what you built and why.
+Keep responses concise. After proposing, briefly explain the key design decisions.
 """
 
 
@@ -247,6 +274,82 @@ async def clear_agent_chat(user: CurrentUser, db: DB):
     """Clear agent builder chat history."""
     await db.execute("DELETE FROM agent_chat_messages WHERE user_id = $1", user["id"])
     return {"status": "cleared"}
+
+
+@router.delete("/agents/chat/undo")
+async def undo_last_agent_action(user: CurrentUser, db: DB):
+    """Undo the last agent_created or agent_updated action."""
+    row = await db.fetchrow(
+        "SELECT * FROM agent_chat_messages WHERE user_id = $1 "
+        "AND metadata_json IS NOT NULL "
+        "AND metadata_json->>'action' IN ('agent_created', 'agent_updated') "
+        "AND (metadata_json->>'undone' IS NULL OR metadata_json->>'undone' != 'true') "
+        "ORDER BY created_at DESC LIMIT 1",
+        user["id"],
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail="No agent action to undo")
+
+    meta = row["metadata_json"]
+    if isinstance(meta, str):
+        meta = json.loads(meta)
+
+    action = meta.get("action")
+    agent_id = meta.get("agent_id")
+    if not agent_id:
+        raise HTTPException(status_code=400, detail="Action missing agent_id")
+
+    if action == "agent_created":
+        await db.execute(
+            "DELETE FROM agent_configs WHERE id = $1 AND owner_id = $2",
+            agent_id, str(user["id"]),
+        )
+        await db.execute(
+            "UPDATE agent_chat_messages SET metadata_json = metadata_json || '{\"undone\": true}'::jsonb "
+            "WHERE id = $1",
+            row["id"],
+        )
+        await db.execute(
+            "INSERT INTO agent_chat_messages (user_id, role, content, metadata_json) "
+            "VALUES ($1, 'system', $2, $3::jsonb)",
+            user["id"],
+            f"Undone: Agent '{meta.get('agent_name', '')}' deleted.",
+            json.dumps({"action": "agent_undone"}),
+        )
+        return {"status": "undone", "action": "deleted", "agent_id": agent_id}
+
+    elif action == "agent_updated":
+        prev = meta.get("previous_state")
+        if not prev:
+            raise HTTPException(
+                status_code=400,
+                detail="No previous state stored — cannot undo this update",
+            )
+        await db.execute(
+            "UPDATE agent_configs SET name=$2, description=$3, system_prompt=$4, "
+            "model_preference=$5, tools_enabled=$6, updated_at=NOW() WHERE id=$1",
+            agent_id,
+            prev.get("name"),
+            prev.get("description"),
+            prev.get("system_prompt"),
+            prev.get("model_preference"),
+            prev.get("tools_enabled", []),
+        )
+        await db.execute(
+            "UPDATE agent_chat_messages SET metadata_json = metadata_json || '{\"undone\": true}'::jsonb "
+            "WHERE id = $1",
+            row["id"],
+        )
+        await db.execute(
+            "INSERT INTO agent_chat_messages (user_id, role, content, metadata_json) "
+            "VALUES ($1, 'system', $2, $3::jsonb)",
+            user["id"],
+            "Undone: Agent restored to previous state.",
+            json.dumps({"action": "agent_undone"}),
+        )
+        return {"status": "undone", "action": "reverted", "agent_id": agent_id}
+
+    raise HTTPException(status_code=400, detail=f"Unknown action: {action}")
 
 
 @router.post("/agents/chat")
@@ -359,6 +462,26 @@ async def _execute_agent_tool(
     db,
 ) -> dict:
     """Execute an agent builder tool and return the result."""
+    if tool_name == "propose_agent":
+        config = {
+            "name": tool_input["name"],
+            "role": tool_input["role"],
+            "description": tool_input.get("description", ""),
+            "system_prompt": tool_input["system_prompt"],
+            "tools_enabled": tool_input.get("tools_enabled", []),
+        }
+        return {
+            "text": json.dumps({
+                "status": "proposed",
+                "message": "Agent configuration preview shown to user. Wait for their confirmation before creating.",
+                "config": config,
+            }),
+            "metadata": {
+                "action": "agent_proposed",
+                "proposed_config": config,
+            },
+        }
+
     if tool_name == "create_agent":
         row = await db.fetchrow(
             """
@@ -397,6 +520,15 @@ async def _execute_agent_tool(
         if str(existing["owner_id"]) != str(user_id):
             return {"text": json.dumps({"error": "Access denied"})}
 
+        # Snapshot previous state for undo support
+        previous_state = {
+            "name": existing["name"],
+            "description": existing.get("description"),
+            "system_prompt": existing["system_prompt"],
+            "model_preference": existing.get("model_preference"),
+            "tools_enabled": list(existing.get("tools_enabled") or []),
+        }
+
         ALLOWED_AGENT_UPDATE_COLS = {"name", "description", "system_prompt", "model_preference", "tools_enabled", "is_active"}
         updates = {k: v for k, v in tool_input.items() if v is not None and k in ALLOWED_AGENT_UPDATE_COLS}
         if updates:
@@ -413,7 +545,11 @@ async def _execute_agent_tool(
 
         return {
             "text": json.dumps({"status": "updated", "agent_id": agent_id}),
-            "metadata": {"action": "agent_updated", "agent_id": agent_id},
+            "metadata": {
+                "action": "agent_updated",
+                "agent_id": agent_id,
+                "previous_state": previous_state,
+            },
         }
 
     elif tool_name == "list_agents":

@@ -1,5 +1,6 @@
-import { useState } from 'react'
+import { useState, useCallback } from 'react'
 import { projects as projectsApi } from '../../services/api'
+import { useAnalysisWebSocket } from '../../hooks/useAnalysisWebSocket'
 
 interface ProjectUnderstanding {
   summary?: string
@@ -19,13 +20,47 @@ interface ProjectUnderstandingTabProps {
   analysisStatus: string | null
   projectUnderstanding: ProjectUnderstanding | null
   setAnalysisStatus: (status: string | null) => void
+  setProjectUnderstanding: (u: ProjectUnderstanding | null) => void
   setError: (err: string) => void
 }
 
+const STEP_LABELS: Record<string, string> = {
+  cloning: 'Clone repository',
+  scanning: 'Scan codebase',
+  sampling: 'Sample files',
+  dependencies: 'Read dependencies',
+  analyzing: 'LLM analysis',
+}
+
+const STEP_ORDER = ['cloning', 'scanning', 'sampling', 'dependencies', 'analyzing']
+
 export default function ProjectUnderstandingTab({
-  projectId, repoUrl, analysisStatus, projectUnderstanding, setAnalysisStatus, setError,
+  projectId, repoUrl, analysisStatus, projectUnderstanding,
+  setAnalysisStatus, setProjectUnderstanding, setError,
 }: ProjectUnderstandingTabProps) {
-  const [analyzing, setAnalyzing] = useState(false)
+  const [starting, setStarting] = useState(false)
+  const isAnalyzing = analysisStatus === 'analyzing'
+
+  const handleComplete = useCallback(async () => {
+    // Fetch the final project data to get the understanding
+    try {
+      const p = await projectsApi.get(projectId)
+      const settings = typeof p.settings_json === 'string' ? JSON.parse(p.settings_json) : p.settings_json
+      setAnalysisStatus(settings?.analysis_status || 'complete')
+      setProjectUnderstanding(settings?.project_understanding || null)
+    } catch {
+      setAnalysisStatus('complete')
+    }
+  }, [projectId, setAnalysisStatus, setProjectUnderstanding])
+
+  const handleFailed = useCallback((detail: string) => {
+    setAnalysisStatus('failed')
+    setError(detail || 'Analysis failed')
+  }, [setAnalysisStatus, setError])
+
+  const { currentStep, detail, completedSteps, reset } = useAnalysisWebSocket(
+    projectId, isAnalyzing, handleComplete, handleFailed,
+  )
 
   return (
     <>
@@ -35,15 +70,18 @@ export default function ProjectUnderstandingTab({
           <button
             onClick={async () => {
               if (!projectId) return
-              setAnalyzing(true)
-              try { await projectsApi.analyze(projectId); setAnalysisStatus('analyzing') }
-              catch (e) { setError(e instanceof Error ? e.message : 'Analysis failed') }
-              finally { setAnalyzing(false) }
+              setStarting(true)
+              try {
+                await projectsApi.analyze(projectId)
+                setAnalysisStatus('analyzing')
+                reset()
+              } catch (e) { setError(e instanceof Error ? e.message : 'Analysis failed') }
+              finally { setStarting(false) }
             }}
-            disabled={analyzing || analysisStatus === 'analyzing'}
+            disabled={starting || isAnalyzing}
             className="text-xs text-indigo-400 hover:text-indigo-300 disabled:opacity-40 transition-colors shrink-0"
           >
-            {analyzing ? 'Starting...' : analysisStatus === 'complete' ? 'Re-analyze' : 'Analyze'}
+            {starting ? 'Starting...' : analysisStatus === 'complete' ? 'Re-analyze' : 'Analyze'}
           </button>
         )}
       </div>
@@ -60,15 +98,40 @@ export default function ProjectUnderstandingTab({
         </div>
       )}
 
-      {analysisStatus === 'analyzing' && (
-        <div className="px-4 py-3 bg-indigo-500/5 border border-indigo-500/10 rounded-lg">
-          <div className="flex items-center gap-2">
-            <svg className="w-3 h-3 animate-spin text-indigo-400" viewBox="0 0 24 24" fill="none">
-              <circle className="opacity-20" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="3" />
-              <path className="opacity-80" d="M4 12a8 8 0 018-8" stroke="currentColor" strokeWidth="3" strokeLinecap="round" />
-            </svg>
-            <span className="text-sm text-indigo-300/80">Analyzing repository...</span>
-          </div>
+      {isAnalyzing && (
+        <div className="px-4 py-3 bg-indigo-500/5 border border-indigo-500/10 rounded-lg space-y-2">
+          {STEP_ORDER.map((step) => {
+            const isCompleted = completedSteps.includes(step)
+            const isCurrent = currentStep === step
+            const isPending = !isCompleted && !isCurrent
+
+            return (
+              <div key={step} className="flex items-center gap-2.5">
+                {isCompleted && (
+                  <svg className="w-3.5 h-3.5 text-emerald-400 shrink-0" viewBox="0 0 16 16" fill="currentColor">
+                    <path fillRule="evenodd" d="M8 16A8 8 0 108 0a8 8 0 000 16zm3.78-9.72a.75.75 0 00-1.06-1.06L6.75 9.19 5.28 7.72a.75.75 0 00-1.06 1.06l2 2a.75.75 0 001.06 0l4.5-4.5z" />
+                  </svg>
+                )}
+                {isCurrent && (
+                  <svg className="w-3.5 h-3.5 animate-spin text-indigo-400 shrink-0" viewBox="0 0 24 24" fill="none">
+                    <circle className="opacity-20" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="3" />
+                    <path className="opacity-80" d="M4 12a8 8 0 018-8" stroke="currentColor" strokeWidth="3" strokeLinecap="round" />
+                  </svg>
+                )}
+                {isPending && (
+                  <div className="w-3.5 h-3.5 flex items-center justify-center shrink-0">
+                    <div className="w-1.5 h-1.5 rounded-full bg-gray-700" />
+                  </div>
+                )}
+                <span className={`text-xs ${isCurrent ? 'text-indigo-300' : isCompleted ? 'text-gray-500' : 'text-gray-700'}`}>
+                  {STEP_LABELS[step]}
+                </span>
+                {isCurrent && detail && (
+                  <span className="text-[11px] text-gray-600 ml-auto">{detail}</span>
+                )}
+              </div>
+            )
+          })}
         </div>
       )}
 

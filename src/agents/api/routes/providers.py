@@ -2,10 +2,7 @@ from fastapi import APIRouter, HTTPException, status
 
 from agents.api.deps import DB, CurrentUser
 from agents.infra.crypto import encrypt
-from agents.schemas.provider import (
-    NotificationChannelInput,
-    ProviderConfigInput,
-)
+from agents.schemas.provider import ProviderConfigInput
 
 router = APIRouter()
 
@@ -145,45 +142,3 @@ async def list_provider_models(provider_id: str, user: CurrentUser, db: DB):
         return {"provider_id": provider_id, "models": models}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to list models: {e}")
-
-
-# --- Notification Channels ---
-
-
-@router.get("/notifications")
-async def list_notification_channels(user: CurrentUser, db: DB):
-    rows = await db.fetch(
-        "SELECT * FROM notification_channels WHERE user_id = $1 ORDER BY created_at DESC",
-        user["id"],
-    )
-    return [dict(r) for r in rows]
-
-
-@router.post("/notifications", status_code=status.HTTP_201_CREATED)
-async def create_notification_channel(body: NotificationChannelInput, user: CurrentUser, db: DB):
-    import json
-
-    row = await db.fetchrow(
-        """
-        INSERT INTO notification_channels
-            (user_id, channel_type, display_name, config_json, notify_on)
-        VALUES ($1, $2, $3, $4::jsonb, $5)
-        RETURNING *
-        """,
-        user["id"],
-        body.channel_type,
-        body.display_name,
-        json.dumps(body.config_json),
-        body.notify_on,
-    )
-    return dict(row)
-
-
-@router.delete("/notifications/{channel_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_notification_channel(channel_id: str, user: CurrentUser, db: DB):
-    existing = await db.fetchrow(
-        "SELECT user_id FROM notification_channels WHERE id = $1", channel_id
-    )
-    if not existing or str(existing["user_id"]) != str(user["id"]):
-        raise HTTPException(status_code=404)
-    await db.execute("DELETE FROM notification_channels WHERE id = $1", channel_id)

@@ -7,6 +7,7 @@ When a project is created or updated with a repo_url, this module:
 4. Stores the understanding in settings_json["project_understanding"]
 """
 
+import asyncio
 import json
 import logging
 import os
@@ -97,10 +98,23 @@ Output a JSON object with these keys:
 
 
 class ProjectAnalyzer:
-    def __init__(self, db: asyncpg.Pool):
+    def __init__(self, db: asyncpg.Pool, redis=None):
         self.db = db
+        self.redis = redis
         self.registry = ProviderRegistry(db)
         self.workspace_mgr = WorkspaceManager(db, settings.workspace_root)
+
+    async def _publish_progress(self, project_id: str, step: str, detail: str) -> None:
+        """Publish an analysis progress event via Redis pub/sub."""
+        if not self.redis:
+            return
+        try:
+            await self.redis.publish(
+                f"project:{project_id}:analysis",
+                json.dumps({"step": step, "detail": detail}),
+            )
+        except Exception:
+            logger.debug("Failed to publish analysis progress for %s", project_id)
 
     async def analyze(self, project_id: str) -> dict | None:
         """Analyze a project's codebase and store the understanding."""
@@ -116,34 +130,61 @@ class ProjectAnalyzer:
 
         # Mark as analyzing
         await self._update_settings(project_id, {"analysis_status": "analyzing"})
+        await self._publish_progress(project_id, "cloning", "Cloning repository...")
 
         try:
-            # Clone/pull the repo into workspace
+            # Clone/pull the repo into workspace (deps cloned in parallel internally)
             workspace_path = await self.workspace_mgr.setup_project_workspace(project_id)
             repo_dir = os.path.join(workspace_path, "repo")
 
             if not os.path.isdir(repo_dir):
+                await self._publish_progress(project_id, "failed", "Repository clone failed")
                 await self._update_settings(project_id, {"analysis_status": "failed"})
                 return None
 
-            # Smart sample the codebase
+            await self._publish_progress(project_id, "scanning", "Scanning codebase...")
+
+            # Run sampling and provider resolution in parallel.
+            # _smart_sample and _sample_dependencies are sync (local file I/O),
+            # so we run them in a thread while provider resolution does async DB queries.
+            context_docs = project.get("context_docs") or []
+            if isinstance(context_docs, str):
+                context_docs = json.loads(context_docs)
+            deps_dir = os.path.join(workspace_path, "deps")
+
+            provider_task = asyncio.create_task(self._resolve_provider(project_id))
+
             sampled = self._smart_sample(repo_dir)
+            dep_summaries = self._sample_dependencies(deps_dir, context_docs)
+
+            provider = await provider_task
 
             if not sampled["files"]:
+                await self._publish_progress(project_id, "failed", "No readable files found")
                 await self._update_settings(project_id, {
                     "analysis_status": "no_docs",
                     "project_understanding": None,
                 })
                 return None
 
-            # Build dependencies context
-            context_docs = project.get("context_docs") or []
-            if isinstance(context_docs, str):
-                context_docs = json.loads(context_docs)
+            total_kb = sum(len(f["content"]) for f in sampled["files"]) // 1024
+            await self._publish_progress(
+                project_id, "sampling",
+                f"Sampled {len(sampled['files'])} files ({total_kb} KB)",
+            )
 
-            # Include dep README/configs from cloned deps
-            deps_dir = os.path.join(workspace_path, "deps")
-            dep_summaries = self._sample_dependencies(deps_dir, context_docs)
+            if dep_summaries:
+                await self._publish_progress(
+                    project_id, "dependencies",
+                    f"Read docs for {len(dep_summaries)} dependencies",
+                )
+
+            if not provider:
+                await self._publish_progress(project_id, "failed", "No AI provider configured")
+                await self._update_settings(project_id, {"analysis_status": "failed"})
+                return None
+
+            await self._publish_progress(project_id, "analyzing", "Running LLM analysis...")
 
             # Run LLM analysis
             analysis = await self._run_analysis(
@@ -153,7 +194,7 @@ class ProjectAnalyzer:
                 files=sampled["files"],
                 dependencies=context_docs,
                 dep_summaries=dep_summaries,
-                project_id=project_id,
+                provider=provider,
             )
 
             if analysis:
@@ -170,15 +211,46 @@ class ProjectAnalyzer:
                     "Project %s analyzed: %d files sampled from workspace",
                     project_id, len(sampled["files"]),
                 )
+                await self._publish_progress(project_id, "complete", "Analysis complete")
                 return analysis
             else:
+                await self._publish_progress(project_id, "failed", "LLM analysis returned no result")
                 await self._update_settings(project_id, {"analysis_status": "failed"})
                 return None
 
         except Exception:
             logger.exception("Failed to analyze project %s", project_id)
+            await self._publish_progress(project_id, "failed", "Analysis failed unexpectedly")
             await self._update_settings(project_id, {"analysis_status": "failed"})
             return None
+
+    async def _resolve_provider(self, project_id: str):
+        """Resolve the LLM provider for a project (extracted for parallelism)."""
+        project = await self.db.fetchrow(
+            "SELECT ai_provider_id, owner_id FROM projects WHERE id = $1",
+            project_id,
+        )
+        provider = None
+        if project and project.get("ai_provider_id"):
+            provider = await self.registry.instantiate(str(project["ai_provider_id"]))
+        if not provider and project:
+            row = await self.db.fetchrow(
+                "SELECT id FROM ai_provider_configs WHERE owner_id = $1 AND is_active = TRUE "
+                "ORDER BY created_at ASC LIMIT 1",
+                project["owner_id"],
+            )
+            if row:
+                provider = await self.registry.instantiate(str(row["id"]))
+        if not provider:
+            row = await self.db.fetchrow(
+                "SELECT id FROM ai_provider_configs WHERE is_active = TRUE "
+                "ORDER BY created_at ASC LIMIT 1"
+            )
+            if row:
+                provider = await self.registry.instantiate(str(row["id"]))
+        if not provider:
+            logger.warning("No AI provider available for project analysis")
+        return provider
 
     def _smart_sample(self, repo_dir: str) -> dict:
         """Walk the repo and smart-sample files for analysis.
@@ -332,7 +404,7 @@ class ProjectAnalyzer:
         files: list[dict],
         dependencies: list[dict],
         dep_summaries: list[dict],
-        project_id: str,
+        provider,
     ) -> dict | None:
         """Send sampled codebase to LLM for structured analysis."""
         # Build file contents section
@@ -361,33 +433,6 @@ class ProjectAnalyzer:
                     deps_text += ds["readme"] + "\n"
                 if "manifest" in ds:
                     deps_text += f"\nManifest:\n{ds['manifest']}\n"
-
-        # Resolve provider
-        project = await self.db.fetchrow(
-            "SELECT ai_provider_id, owner_id FROM projects WHERE id = $1",
-            project_id,
-        )
-        provider = None
-        if project and project.get("ai_provider_id"):
-            provider = await self.registry.instantiate(str(project["ai_provider_id"]))
-        if not provider and project:
-            row = await self.db.fetchrow(
-                "SELECT id FROM ai_provider_configs WHERE owner_id = $1 AND is_active = TRUE "
-                "ORDER BY created_at ASC LIMIT 1",
-                project["owner_id"],
-            )
-            if row:
-                provider = await self.registry.instantiate(str(row["id"]))
-        if not provider:
-            row = await self.db.fetchrow(
-                "SELECT id FROM ai_provider_configs WHERE is_active = TRUE "
-                "ORDER BY created_at ASC LIMIT 1"
-            )
-            if row:
-                provider = await self.registry.instantiate(str(row["id"]))
-        if not provider:
-            logger.warning("No AI provider available for project analysis")
-            return None
 
         messages = [
             LLMMessage(role="system", content=ANALYZER_SYSTEM_PROMPT),

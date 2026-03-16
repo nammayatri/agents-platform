@@ -109,3 +109,52 @@ async def chat_session_websocket(websocket: WebSocket, session_id: str):
                 pass
         await pubsub.unsubscribe()
         await pubsub.aclose()
+
+
+@router.websocket("/ws/projects/{project_id}/analysis")
+async def project_analysis_websocket(websocket: WebSocket, project_id: str):
+    """WebSocket endpoint for real-time project analysis progress.
+
+    Subscribes to Redis pub/sub for:
+    - project:{project_id}:analysis (step-by-step analysis progress)
+    """
+    await websocket.accept()
+
+    redis = websocket.app.state.redis
+    pubsub = redis.pubsub()
+    reader_task = None
+
+    try:
+        await pubsub.subscribe(f"project:{project_id}:analysis")
+
+        async def reader():
+            try:
+                async for message in pubsub.listen():
+                    if message["type"] == "message":
+                        await websocket.send_text(message["data"])
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.debug("WebSocket reader stopped for project analysis %s", project_id)
+
+        reader_task = asyncio.create_task(reader())
+
+        while True:
+            try:
+                await asyncio.wait_for(websocket.receive_text(), timeout=30)
+            except asyncio.TimeoutError:
+                await websocket.send_text(json.dumps({"type": "ping"}))
+            except WebSocketDisconnect:
+                break
+
+    except WebSocketDisconnect:
+        pass
+    finally:
+        if reader_task is not None:
+            reader_task.cancel()
+            try:
+                await reader_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        await pubsub.unsubscribe()
+        await pubsub.aclose()
