@@ -303,6 +303,36 @@ async def delete_session_message(
     return {"status": "deleted"}
 
 
+class InjectInput(BaseModel):
+    content: str
+
+
+@router.post("/projects/{project_id}/chat/sessions/{session_id}/inject")
+async def inject_session_message(
+    project_id: str, session_id: str, body: InjectInput,
+    user: CurrentUser, db: DB, redis: Redis,
+):
+    """Inject a user guidance message into a running chat session's tool loop."""
+    await check_project_access(db, project_id, user)
+
+    session = await db.fetchrow(
+        "SELECT id FROM project_chat_sessions WHERE id = $1 AND project_id = $2 AND user_id = $3",
+        session_id, project_id, user["id"],
+    )
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    await redis.rpush(f"chat:session:{session_id}:inject", body.content)
+    await redis.expire(f"chat:session:{session_id}:inject", 3600)
+
+    await redis.publish(
+        f"chat:session:{session_id}:activity",
+        json.dumps({"type": "user_inject", "content": body.content}),
+    )
+
+    return {"status": "queued"}
+
+
 # ── Legacy endpoints (backward compat, use default session) ───────
 
 

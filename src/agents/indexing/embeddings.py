@@ -172,6 +172,10 @@ class EmbeddingIndex:
         self._save_mtimes(current_mtimes)
         self._save_chunks()
 
+        # Persist FAISS index to disk for cross-process cache reuse
+        if self._cache_dir:
+            self.save(self._cache_dir)
+
         self._initialized = True
         logger.info(
             "embeddings: indexed %d chunks from %d files (%d changed)",

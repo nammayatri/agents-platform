@@ -508,9 +508,16 @@ class McpToolExecutor:
                     from agents.indexing.search_tool import execute_semantic_search
                     # Use shared project-level index directory if available
                     index_dir = tool_meta.get("_index_dir")
-                    result = execute_semantic_search(repo_dir, query, top_k=top_k, cache_dir=index_dir)
-                    logger.info("builtin[semantic_search]: query=%s top_k=%d cache=%s", query[:100], top_k, index_dir or "per-repo")
-                    return result
+                    result_text, meta = execute_semantic_search(repo_dir, query, top_k=top_k, cache_dir=index_dir)
+                    logger.info(
+                        "builtin[semantic_search]: query=%s top_k=%d results=%d top_score=%.3f latency=%dms source=%s",
+                        query[:100], top_k,
+                        meta.get("results_count", 0),
+                        meta.get("top_score", 0),
+                        meta.get("latency_ms", 0),
+                        meta.get("source", "?"),
+                    )
+                    return result_text
                 except ImportError:
                     logger.info("builtin[semantic_search]: module not available, falling back to search_files hint")
                     return json.dumps({

@@ -1,8 +1,8 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
-import { ChevronDown, ChevronRight, Terminal, Wrench, Brain, CheckCircle, XCircle, Play, Pause } from 'lucide-react'
+import { ChevronDown, ChevronRight, Terminal, Wrench, Brain, CheckCircle, XCircle, Play, Pause, Search, Database } from 'lucide-react'
 
 export interface ExecutionEvent {
-  type: 'iteration_start' | 'tool_start' | 'tool_result' | 'llm_thinking' | 'iteration_end' | 'activity'
+  type: 'iteration_start' | 'tool_start' | 'tool_result' | 'llm_thinking' | 'iteration_end' | 'activity' | 'index_search' | 'index_build'
   timestamp: number
   iteration?: number
   subtask?: string
@@ -17,6 +17,15 @@ export interface ExecutionEvent {
   tool_index?: number
   total_tools?: number
   message?: string
+  // Index event fields
+  query?: string
+  results_count?: number
+  top_score?: number
+  latency_ms?: number
+  source?: string
+  has_repo_map?: boolean
+  repo_map_chars?: number
+  from_base?: boolean
 }
 
 interface Props {
@@ -218,6 +227,33 @@ function EventRow({
         <span>LLM response</span>
         <span className="text-gray-600">
           (round {event.round}, {event.tokens_in?.toLocaleString()}→{event.tokens_out?.toLocaleString()} tokens)
+        </span>
+      </div>
+    )
+  }
+
+  if (event.type === 'index_search') {
+    const scorePct = event.top_score ? Math.round(event.top_score * 100) : 0
+    const sourceLabel = event.source === 'cache' ? 'cached' : event.source === 'disk' ? 'from disk' : event.source === 'cold_build' ? 'cold build' : event.source || ''
+    return (
+      <div className="flex items-center gap-2 px-3 py-1 text-cyan-400/80 border-b border-gray-900/50">
+        <Search className="w-3 h-3 flex-shrink-0" />
+        <span className="truncate">Semantic search: &quot;{event.query}&quot;</span>
+        <span className="text-gray-600 flex-shrink-0">
+          {event.results_count} results, {scorePct}% top, {event.latency_ms}ms ({sourceLabel})
+        </span>
+      </div>
+    )
+  }
+
+  if (event.type === 'index_build') {
+    return (
+      <div className="flex items-center gap-2 px-3 py-1 text-emerald-400/70 border-b border-gray-900/50">
+        <Database className="w-3 h-3 flex-shrink-0" />
+        <span>Code index built</span>
+        <span className="text-gray-600">
+          {event.latency_ms}ms{event.from_base ? ' (incremental)' : ' (fresh)'}
+          {event.has_repo_map && `, repo map ${event.repo_map_chars?.toLocaleString()} chars`}
         </span>
       </div>
     )

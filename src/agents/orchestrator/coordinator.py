@@ -452,14 +452,75 @@ class AgentCoordinator:
         except Exception:
             logger.warning("[%s] Could not set up planner workspace", self.todo_id, exc_info=True)
 
+        # ── Pre-build code indexes (structural + embedding) ──
+        # Project-level index lives at {project_workspace}/.agent_index
+        # Task gets a local copy at {task_workspace}/.agent_index
+        repo_map_text: str | None = None
+        if workspace_path:
+            repo_dir = os.path.join(workspace_path, "repo")
+            if os.path.isdir(repo_dir):
+                project_index_dir = os.path.normpath(
+                    os.path.join(workspace_path, "..", "..", ".agent_index")
+                )
+                task_index_dir = os.path.join(workspace_path, ".agent_index")
+                try:
+                    from agents.indexing import (
+                        build_indexes_and_repo_map,
+                        copy_project_index_to_task,
+                    )
+
+                    # Copy project-level base index if available
+                    _had_base = await asyncio.to_thread(
+                        copy_project_index_to_task, project_index_dir, task_index_dir,
+                    )
+
+                    await self._post_system_message("Indexing codebase for planning...")
+                    _idx_t0 = time.monotonic()
+                    # Incremental update on the copied base (fast if project index was recent)
+                    repo_map_text = await asyncio.to_thread(
+                        build_indexes_and_repo_map,
+                        repo_dir,
+                        cache_dir=task_index_dir,
+                        repo_map_budget=settings.repo_map_token_budget,
+                    )
+                    _idx_ms = int((time.monotonic() - _idx_t0) * 1000)
+                    logger.info(
+                        "[%s] Pre-indexing complete: repo_map=%s took=%dms",
+                        self.todo_id,
+                        f"{len(repo_map_text)} chars" if repo_map_text else "None",
+                        _idx_ms,
+                    )
+                    # Publish index_build event for frontend visibility
+                    try:
+                        await self.redis.publish(
+                            f"task:{self.todo_id}:events",
+                            json.dumps({
+                                "type": "index_build",
+                                "latency_ms": _idx_ms,
+                                "has_repo_map": repo_map_text is not None,
+                                "repo_map_chars": len(repo_map_text) if repo_map_text else 0,
+                                "from_base": _had_base,
+                            }),
+                        )
+                    except Exception:
+                        pass
+                except Exception:
+                    logger.warning(
+                        "[%s] Pre-indexing failed, planner will proceed without repo map",
+                        self.todo_id, exc_info=True,
+                    )
+
         # Add workspace context and tool instructions to system prompt
         if workspace_path:
             file_tree = self.workspace_mgr.get_file_tree(workspace_path, max_depth=3)
-            planner_prompt += (
-                f"\n\nProject file structure:\n{file_tree}\n\n"
-                "You MUST explore the codebase using the tools before outputting your plan. "
+            workspace_block = f"\n\nProject file structure:\n{file_tree}\n"
+            if repo_map_text:
+                workspace_block += f"\n## Repository Symbol Map\n{repo_map_text}\n"
+            workspace_block += (
+                "\nYou MUST explore the codebase using the tools before outputting your plan. "
                 "Read relevant files, search for patterns, and understand the existing code."
             )
+            planner_prompt += workspace_block
 
             # Inject dependency info so planner knows about available deps
             dep_dirs = context.get("dependency_dirs", {})
@@ -555,8 +616,8 @@ class AgentCoordinator:
         planner_tools = None
         if workspace_path:
             planner_tools = self._get_builtin_tools(workspace_path, "planner")
-            # Inject shared per-project index directory for semantic_search
-            _plan_idx = os.path.normpath(os.path.join(workspace_path, "..", ".agent_index"))
+            # Inject task-local index directory for semantic_search
+            _plan_idx = os.path.join(workspace_path, ".agent_index")
             for _bt in planner_tools:
                 if _bt["name"] == "semantic_search":
                     _bt["_index_dir"] = _plan_idx
@@ -944,7 +1005,9 @@ class AgentCoordinator:
                         error_message=f"Sub-tasks failed: {err_detail}",
                     )
                 else:
-                    # All done — run testing then review
+                    # All done — sync indexes back to project, then run testing/review
+                    if workspace_path:
+                        await self._sync_task_index_to_project(workspace_path)
                     await self._enter_testing_or_review(todo, provider)
             # else: some tasks still running, will be picked up next cycle
             return
@@ -1177,6 +1240,7 @@ class AgentCoordinator:
                         )
                         if merge_st:
                             await self._execute_merge_subtask(dict(merge_st), provider, workspace_path)
+                    await self._sync_task_index_to_project(workspace_path)
                     await self._enter_testing_or_review(todo, provider)
                 elif all_done and any_failed:
                     failed_tasks = await self.db.fetch(
@@ -1204,6 +1268,7 @@ class AgentCoordinator:
                     )
                     if merge_st:
                         await self._execute_merge_subtask(dict(merge_st), provider, workspace_path)
+                await self._sync_task_index_to_project(workspace_path)
                 await self._enter_testing_or_review(todo, provider)
         elif all_done and any_failed:
             # Check if we should retry
@@ -1289,6 +1354,21 @@ class AgentCoordinator:
     )
 
     _MAX_TEST_RETRIES = 2  # Max times to loop back for test fixes
+
+    async def _sync_task_index_to_project(self, workspace_path: str) -> None:
+        """Sync task-level code indexes back to the project-level base."""
+        try:
+            from agents.indexing import sync_task_index_to_project
+
+            task_index_dir = os.path.join(workspace_path, ".agent_index")
+            project_index_dir = os.path.normpath(
+                os.path.join(workspace_path, "..", "..", ".agent_index")
+            )
+            await asyncio.to_thread(
+                sync_task_index_to_project, task_index_dir, project_index_dir,
+            )
+        except Exception:
+            logger.debug("[%s] Index sync to project failed (non-fatal)", self.todo_id[:8], exc_info=True)
 
     async def _enter_testing_or_review(self, todo: dict, provider: AIProvider) -> None:
         """Route to testing phase if code work was done, otherwise skip to review."""
@@ -2014,11 +2094,11 @@ class AgentCoordinator:
                 # Ensure agents always have workspace tools (built-in fallback)
                 if workspace_path:
                     builtin_tools = self._get_builtin_tools(workspace_path, role)
-                    # Inject shared per-project index directory for semantic_search
-                    shared_index_dir = os.path.normpath(os.path.join(workspace_path, "..", ".agent_index"))
+                    # Inject task-local index directory for semantic_search
+                    _task_idx = os.path.join(workspace_path, ".agent_index")
                     for bt in builtin_tools:
                         if bt["name"] == "semantic_search":
-                            bt["_index_dir"] = shared_index_dir
+                            bt["_index_dir"] = _task_idx
                     if mcp_tools:
                         existing_names = {t["name"] for t in mcp_tools}
                         mcp_tools.extend(t for t in builtin_tools if t["name"] not in existing_names)
@@ -2078,8 +2158,33 @@ class AgentCoordinator:
                             f"task:{self.todo_id}:events",
                             json.dumps(event),
                         )
+                        # Publish extra index_search event when semantic_search completes
+                        if event.get("type") == "tool_result" and event.get("name") == "semantic_search":
+                            try:
+                                from agents.indexing.search_tool import pop_last_search_meta
+                                _idx_dir = os.path.join(workspace_path, ".agent_index")
+                                search_meta = pop_last_search_meta(_idx_dir)
+                                if search_meta:
+                                    await self.redis.publish(
+                                        f"task:{self.todo_id}:events",
+                                        json.dumps({
+                                            "type": "index_search",
+                                            "sub_task_id": st_id,
+                                            **search_meta,
+                                        }),
+                                    )
+                            except Exception:
+                                pass
                     except Exception:
                         pass  # Don't let event publishing break execution
+
+                # Allow users to inject guidance into this subtask's tool loop
+                _inject_key_iter = f"subtask:{st_id}:inject"
+
+                async def _check_inject_iter() -> str | None:
+                    if self.redis:
+                        return await self.redis.lpop(_inject_key_iter)
+                    return None
 
                 # Architect/Editor dual-model execution
                 if architect_editor_enabled and architect_model and editor_model:
@@ -2100,6 +2205,7 @@ class AgentCoordinator:
                         max_rounds=10,
                         on_activity=lambda msg, _i=iteration: self._report_activity(st_id, f"[iter {_i}] [Architect] {msg}"),
                         on_tool_event=_on_tool_event,
+                        on_inject_check=_check_inject_iter,
                         **architect_kwargs,
                     )
 
@@ -2127,6 +2233,7 @@ class AgentCoordinator:
                         max_rounds=10,
                         on_activity=lambda msg, _i=iteration: self._report_activity(st_id, f"[iter {_i}] [Editor] {msg}"),
                         on_tool_event=_on_tool_event,
+                        on_inject_check=_check_inject_iter,
                         **editor_kwargs,
                     )
 
@@ -2144,6 +2251,7 @@ class AgentCoordinator:
                         max_rounds=10,
                         on_activity=lambda msg, _i=iteration: self._report_activity(st_id, f"[iter {_i}] {msg}"),
                         on_tool_event=_on_tool_event,
+                        on_inject_check=_check_inject_iter,
                         **send_kwargs,
                     )
 
@@ -2574,10 +2682,10 @@ class AgentCoordinator:
 
                 repo_dir_for_map = os.path.join(workspace_path, "repo")
                 if os.path.isdir(repo_dir_for_map):
-                    # Use shared per-project index directory
-                    shared_index_dir = os.path.join(workspace_path, "..", ".agent_index")
+                    # Use task-local index directory
+                    _subtask_idx = os.path.join(workspace_path, ".agent_index")
                     indexer = RepoIndexer()
-                    graph = indexer.index(repo_dir_for_map, cache_dir=shared_index_dir)
+                    graph = indexer.index(repo_dir_for_map, cache_dir=_subtask_idx)
                     if graph.symbol_count > 0:
                         repo_map_budget = settings.repo_map_token_budget
                         repo_map = render_repo_map(
@@ -4068,8 +4176,8 @@ class AgentCoordinator:
         # Ensure agents always have workspace tools (built-in fallback)
         if workspace_path:
             builtin_tools = self._get_builtin_tools(workspace_path, sub_task["agent_role"])
-            # Inject shared per-project index directory for semantic_search
-            _exec_idx = os.path.normpath(os.path.join(workspace_path, "..", ".agent_index"))
+            # Inject task-local index directory for semantic_search
+            _exec_idx = os.path.join(workspace_path, ".agent_index")
             for _bt in builtin_tools:
                 if _bt["name"] == "semantic_search":
                     _bt["_index_dir"] = _exec_idx
@@ -4098,6 +4206,7 @@ class AgentCoordinator:
             tools_arg = mcp_tools if mcp_tools else None
 
             from agents.providers.base import run_tool_loop
+            from agents.orchestrator.structured_output import build_submit_tool_for_role
 
             logger.info("[%s] st=%s Sending LLM request (tools=%d, model_override=%s)",
                         self.todo_id, st_id, len(tools_arg) if tools_arg else 0, model_override)
@@ -4105,6 +4214,13 @@ class AgentCoordinator:
             # Roles that write code need more output tokens for write_file calls
             role = sub_task["agent_role"]
             role_max_tokens = 16384 if role in ("coder", "tester") else 8192
+
+            # Structured output via submit_result tool
+            _submit_tool = build_submit_tool_for_role(role)
+            _submit_result_data: dict | None = None
+            if _submit_tool and tools_arg:
+                tools_arg = [t for t in tools_arg if t["name"] != "task_complete"]
+                tools_arg.append(_submit_tool)
 
             send_kwargs: dict = {"temperature": 0.1, "max_tokens": role_max_tokens}
             if model_override:
@@ -4117,11 +4233,23 @@ class AgentCoordinator:
                 )
 
             async def _tool_exec(name: str, args: dict) -> str:
+                nonlocal _submit_result_data
+                if name == "submit_result":
+                    _submit_result_data = args
+                    return "Structured output received. Task complete."
                 if name == "create_subtask":
                     return await self._handle_create_subtask_tool(
                         sub_task, args, workspace_path,
                     )
                 return await self.mcp_executor.execute_tool(name, args, mcp_tools)
+
+            # Allow users to inject guidance into this subtask's tool loop
+            _inject_key = f"subtask:{st_id}:inject"
+
+            async def _check_inject() -> str | None:
+                if self.redis:
+                    return await self.redis.lpop(_inject_key)
+                return None
 
             content, response = await run_tool_loop(
                 provider, messages,
@@ -4130,10 +4258,16 @@ class AgentCoordinator:
                 max_rounds=10,
                 on_tool_round=_on_tool_round,
                 on_activity=lambda msg: self._report_activity(st_id, msg),
+                on_inject_check=_check_inject,
                 **send_kwargs,
             )
             logger.info("[%s] st=%s Tool loop done: content_len=%d stop=%s",
                         self.todo_id, st_id, len(content) if content else 0, response.stop_reason)
+
+            # Drain any unconsumed inject messages
+            if self.redis:
+                while await self.redis.lpop(_inject_key):
+                    pass
 
             await self._report_progress(st_id, 80, f"Processing output: {sub_task['title']}")
 

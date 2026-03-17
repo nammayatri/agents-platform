@@ -299,6 +299,14 @@ class SelfHostedProvider(AIProvider):
             stop_reason = "tool_use"
         if fallback_parsed:
             stop_reason = "tool_use"
+        # Many self-hosted models return finish_reason="stop" even when
+        # tool_calls are present.  Normalize so the tool loop executes them.
+        if tool_calls and stop_reason != "tool_use":
+            logger.info(
+                "self_hosted: normalizing stop_reason '%s' → 'tool_use' (tool_calls=%d)",
+                stop_reason, len(tool_calls),
+            )
+            stop_reason = "tool_use"
 
         logger.info(
             "self_hosted: final stop_reason=%s tool_calls=%d tokens_in=%d tokens_out=%d fallback=%s",

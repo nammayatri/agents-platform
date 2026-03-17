@@ -3,7 +3,7 @@ import { useParams, useNavigate } from 'react-router-dom'
 import { projectChat, projects as projectsApi, providers as providersApi } from '../services/api'
 import PlanReviewCard from '../components/chat/PlanReviewCard'
 import { useChatSessionWebSocket } from '../hooks/useChatSessionWebSocket'
-import type { Project, ChatSession, ProjectChatMessage, ModelInfo, ChatMode } from '../types'
+import type { Project, ChatSession, ProjectChatMessage, ModelInfo, ChatMode, ChatExecutionInfo } from '../types'
 
 const chatModes: { key: ChatMode; label: string; hint: string }[] = [
   { key: 'chat', label: 'General Chat', hint: 'Ask questions, discuss the project' },
@@ -31,6 +31,64 @@ const sessionDotColors: Record<ChatMode, string> = {
   plan: 'bg-amber-500',
   debug: 'bg-red-500',
   create_task: 'bg-indigo-500',
+}
+
+/** Ensure metadata_json is always a parsed object (handles double-encoded JSONB strings). */
+function parseMeta(msg: ProjectChatMessage): ProjectChatMessage['metadata_json'] {
+  const m = msg.metadata_json
+  if (!m) return undefined
+  if (typeof m === 'string') {
+    try { return JSON.parse(m) } catch { return undefined }
+  }
+  return m
+}
+
+function ExecutionDetails({ execution }: { execution: ChatExecutionInfo }) {
+  const [expanded, setExpanded] = useState(false)
+  const toolCalls = execution.tool_calls || []
+  const rounds = execution.rounds || 0
+  const uniqueTools = [...new Set(toolCalls.map((t) => t.name))]
+
+  // Collapsed summary line
+  const summary = toolCalls.length > 0
+    ? `Used ${toolCalls.length} tool${toolCalls.length !== 1 ? 's' : ''} in ${rounds} round${rounds !== 1 ? 's' : ''} (${uniqueTools.slice(0, 4).join(', ')}${uniqueTools.length > 4 ? '...' : ''})`
+    : `No tools used`
+  const modelLabel = execution.model ? ` \u00b7 ${execution.model}` : ''
+  const stopLabel = !toolCalls.length && execution.stop_reason ? ` \u00b7 ${execution.stop_reason}` : ''
+
+  return (
+    <div className="mt-1.5 border-t border-gray-800/50 pt-1.5">
+      <button
+        onClick={() => setExpanded(!expanded)}
+        className="flex items-center gap-1 text-[11px] text-gray-600 hover:text-gray-400 transition-colors"
+      >
+        <svg
+          className={`w-3 h-3 transition-transform ${expanded ? 'rotate-90' : ''}`}
+          fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}
+        >
+          <path strokeLinecap="round" strokeLinejoin="round" d="M9 5l7 7-7 7" />
+        </svg>
+        <span>{summary}{modelLabel}{stopLabel}</span>
+      </button>
+      {expanded && toolCalls.length > 0 && (
+        <div className="mt-1.5 space-y-1 pl-4">
+          {toolCalls.map((tc, i) => (
+            <div key={i} className="flex items-start gap-2 text-[11px]">
+              <span className="text-indigo-400/70 font-mono shrink-0">{tc.name}</span>
+              {tc.result_preview && (
+                <span className="text-gray-600 truncate max-w-[300px]">{tc.result_preview}</span>
+              )}
+            </div>
+          ))}
+          <div className="text-[10px] text-gray-700 mt-1">
+            {execution.total_tokens_in != null && execution.total_tokens_out != null && (
+              <span>Tokens: {execution.total_tokens_in.toLocaleString()} in / {execution.total_tokens_out.toLocaleString()} out</span>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  )
 }
 
 export default function ProjectChatPage() {
@@ -208,7 +266,10 @@ export default function ProjectChatPage() {
       )
 
       // Optimistic plan_mode update when plan is accepted
-      if (result.assistant_message.metadata_json?.action === 'plan_accepted') {
+      const resMeta = typeof result.assistant_message.metadata_json === 'string'
+        ? (() => { try { return JSON.parse(result.assistant_message.metadata_json) } catch { return undefined } })()
+        : result.assistant_message.metadata_json
+      if (resMeta?.action === 'plan_accepted') {
         setSessions((prev) =>
           prev.map((s) => (s.id === sessionId ? { ...s, plan_mode: false } : s))
         )
@@ -242,10 +303,35 @@ export default function ProjectChatPage() {
     }
   }
 
+  const handleInject = async () => {
+    if (!input.trim() || !projectId || !activeSessionId) return
+    const content = input.trim()
+    setInput('')
+    try {
+      await projectChat.injectInSession(projectId, activeSessionId, content)
+      // Show injected message in the chat as a visual indicator
+      const injectMsg: ProjectChatMessage = {
+        id: `inject-${Date.now()}`,
+        project_id: projectId,
+        user_id: '',
+        role: 'user',
+        content: `[Injected] ${content}`,
+        created_at: new Date().toISOString(),
+      }
+      setMessages((prev) => [...prev, injectMsg])
+    } catch {
+      // ignore
+    }
+  }
+
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault()
-      handleSend()
+      if (sending) {
+        handleInject()
+      } else {
+        handleSend()
+      }
     }
   }
 
@@ -469,7 +555,9 @@ export default function ProjectChatPage() {
             </div>
           ) : (
             <div className="px-6 py-4 space-y-4 max-w-3xl mx-auto">
-              {messages.map((msg) => (
+              {messages.map((msg) => {
+                const meta = parseMeta(msg)
+                return (
                 <div
                   key={msg.id}
                   className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}
@@ -487,10 +575,10 @@ export default function ProjectChatPage() {
                       <div className="space-y-2">
                         <RenderMarkdown content={msg.content} />
                         {/* Task created badge */}
-                        {msg.metadata_json?.action === 'task_created' && msg.metadata_json.task_id && (
+                        {meta?.action === 'task_created' && meta.task_id && (
                           <div className="flex items-center gap-2 mt-1">
                             <button
-                              onClick={() => navigate(`/todos/${msg.metadata_json!.task_id}`)}
+                              onClick={() => navigate(`/todos/${meta!.task_id}`)}
                               className="inline-flex items-center gap-1.5 px-2.5 py-1 bg-indigo-900/30 text-indigo-400 rounded-lg text-xs hover:bg-indigo-900/50 transition-colors"
                             >
                               <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
@@ -510,12 +598,12 @@ export default function ProjectChatPage() {
                           </div>
                         )}
                         {/* Plan review card */}
-                        {msg.metadata_json?.action === 'plan_proposed' && msg.metadata_json.plan_data && (
+                        {meta?.action === 'plan_proposed' && meta.plan_data && (
                           <PlanReviewCard
-                            planData={msg.metadata_json.plan_data}
+                            planData={meta.plan_data}
                             isAccepted={messages.some(
                               (m) =>
-                                m.metadata_json?.action === 'plan_accepted' &&
+                                parseMeta(m)?.action === 'plan_accepted' &&
                                 m.created_at > msg.created_at
                             )}
                             onAccept={() => handleSend('approve')}
@@ -524,7 +612,7 @@ export default function ProjectChatPage() {
                           />
                         )}
                         {/* Fallback: plan_proposed without plan_data (legacy) */}
-                        {msg.metadata_json?.action === 'plan_proposed' && !msg.metadata_json.plan_data && (
+                        {meta?.action === 'plan_proposed' && !meta.plan_data && (
                           <div className="flex items-center gap-2 px-3 py-1.5 bg-amber-500/5 border border-amber-500/20 rounded-lg mt-1">
                             <svg className="w-3.5 h-3.5 text-amber-400 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
                               <path strokeLinecap="round" strokeLinejoin="round" d="M9 12h3.75M9 15h3.75M9 18h3.75m3 .75H18a2.25 2.25 0 002.25-2.25V6.108c0-1.135-.845-2.098-1.976-2.192a48.424 48.424 0 00-1.123-.08m-5.801 0c-.065.21-.1.433-.1.664 0 .414.336.75.75.75h4.5a.75.75 0 00.75-.75 2.25 2.25 0 00-.1-.664m-5.8 0A2.251 2.251 0 0113.5 2.25H15c1.012 0 1.867.668 2.15 1.586m-5.8 0c-.376.023-.75.05-1.124.08C9.095 4.01 8.25 4.973 8.25 6.108V8.25m0 0H4.875c-.621 0-1.125.504-1.125 1.125v11.25c0 .621.504 1.125 1.125 1.125h9.75c.621 0 1.125-.504 1.125-1.125V9.375c0-.621-.504-1.125-1.125-1.125H8.25z" />
@@ -535,22 +623,22 @@ export default function ProjectChatPage() {
                           </div>
                         )}
                         {/* Plan accepted badge */}
-                        {msg.metadata_json?.action === 'plan_accepted' && (
+                        {meta?.action === 'plan_accepted' && (
                           <div className="flex items-center gap-2 px-3 py-1.5 bg-emerald-500/5 border border-emerald-500/20 rounded-lg mt-1">
                             <svg className="w-3.5 h-3.5 text-emerald-400 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
                               <path strokeLinecap="round" strokeLinejoin="round" d="M4.5 12.75l6 6 9-13.5" />
                             </svg>
                             <span className="text-xs text-emerald-400">
-                              Plan accepted — {String(msg.metadata_json?.tasks_created ?? 0)} tasks created
+                              Plan accepted — {String(meta?.tasks_created ?? 0)} tasks created
                             </span>
                           </div>
                         )}
                         {/* Quick-action buttons: only show when there's a pending plan_proposed that hasn't been accepted */}
                         {msg.id === messages.filter((m) => m.role === 'assistant').slice(-1)[0]?.id &&
-                          !msg.metadata_json?.action &&
+                          !meta?.action &&
                           !sending &&
-                          messages.some((m) => m.metadata_json?.action === 'plan_proposed') &&
-                          !messages.some((m) => m.metadata_json?.action === 'plan_accepted') && (
+                          messages.some((m) => parseMeta(m)?.action === 'plan_proposed') &&
+                          !messages.some((m) => parseMeta(m)?.action === 'plan_accepted') && (
                           <div className="mt-2 pt-2 border-t border-gray-800">
                             {showFeedbackFor === msg.id ? (
                               <div className="flex items-center gap-2">
@@ -614,13 +702,17 @@ export default function ProjectChatPage() {
                             )}
                           </div>
                         )}
+                        {/* Execution details (tool usage, model, rounds) */}
+                        {meta?.execution && (
+                          <ExecutionDetails execution={meta.execution} />
+                        )}
                       </div>
                     ) : (
                       <div className="whitespace-pre-wrap">{msg.content}</div>
                     )}
                   </div>
                 </div>
-              ))}
+              )})}
               {sending && (
                 <div className="flex justify-start">
                   <div className="bg-gray-900 border border-gray-800 rounded-xl px-4 py-2.5 text-sm text-gray-500">
@@ -699,7 +791,8 @@ export default function ProjectChatPage() {
                 onChange={(e) => setInput(e.target.value)}
                 onKeyDown={handleKeyDown}
                 placeholder={
-                  chatMode === 'plan' ? 'Describe what you want to plan...'
+                  sending ? 'Inject guidance into the running agent...'
+                  : chatMode === 'plan' ? 'Describe what you want to plan...'
                   : chatMode === 'debug' ? 'Describe the bug or issue...'
                   : chatMode === 'create_task' ? 'Describe the task to create...'
                   : 'Type a message...'
@@ -714,19 +807,32 @@ export default function ProjectChatPage() {
                 }}
               />
             </div>
-            <button
-              onClick={() => handleSend()}
-              disabled={!input.trim() || sending}
-              className={`shrink-0 px-3 py-2.5 rounded-xl text-sm text-white transition-colors ${sendButtonStyles[chatMode]}`}
-            >
-              <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                <path
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                  d="M6 12L3.269 3.126A59.768 59.768 0 0121.485 12 59.77 59.77 0 013.27 20.876L5.999 12zm0 0h7.5"
-                />
-              </svg>
-            </button>
+            {sending ? (
+              <button
+                onClick={handleInject}
+                disabled={!input.trim()}
+                className="shrink-0 px-3 py-2.5 rounded-xl text-sm text-white transition-colors bg-cyan-600 hover:bg-cyan-500 disabled:bg-gray-800 disabled:text-gray-600"
+                title="Inject guidance into the running agent"
+              >
+                <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M12 4.5v15m7.5-7.5h-15" />
+                </svg>
+              </button>
+            ) : (
+              <button
+                onClick={() => handleSend()}
+                disabled={!input.trim() || sending}
+                className={`shrink-0 px-3 py-2.5 rounded-xl text-sm text-white transition-colors ${sendButtonStyles[chatMode]}`}
+              >
+                <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                  <path
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    d="M6 12L3.269 3.126A59.768 59.768 0 0121.485 12 59.77 59.77 0 013.27 20.876L5.999 12zm0 0h7.5"
+                  />
+                </svg>
+              </button>
+            )}
           </div>
         </div>
       </div>

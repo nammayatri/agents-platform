@@ -225,6 +225,22 @@ class ProjectAnalyzer:
                     "Project %s analyzed: %d files sampled from workspace",
                     project_id, len(sampled["files"]),
                 )
+
+                # Build code indexes (structural + embedding) at project level
+                await self._publish_progress(project_id, "indexing", "Building code search indexes...")
+                try:
+                    from agents.indexing import build_indexes_and_repo_map
+
+                    project_index_dir = os.path.join(workspace_path, ".agent_index")
+                    await asyncio.to_thread(
+                        build_indexes_and_repo_map,
+                        repo_dir,
+                        cache_dir=project_index_dir,
+                    )
+                    logger.info("Project %s: code indexes built at %s", project_id, project_index_dir)
+                except Exception:
+                    logger.warning("Project %s: code indexing failed (non-fatal)", project_id, exc_info=True)
+
                 await self._publish_progress(project_id, "complete", "Analysis complete")
                 return analysis
             else:

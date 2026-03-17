@@ -40,6 +40,8 @@ class LLMResponse:
     stop_reason: str = ""  # 'end_turn' | 'tool_use' | 'max_tokens'
     cost_usd: float = 0.0
     cached_tokens: int = 0
+    # Populated by run_tool_loop after execution
+    tool_summary: dict | None = None
 
     def __post_init__(self):
         if self.content:

@@ -109,6 +109,12 @@ export function useTaskWebSocket(todoId: string | null) {
             fetchTodo(todoId)
             break
 
+          case 'user_inject':
+            if (data.sub_task_id && data.content) {
+              queueActivity(data.sub_task_id, `You: ${(data.content as string).slice(0, 100)}`)
+            }
+            break
+
           case 'testing_step':
             // Testing phase progress — show in activity feed
             if (data.command) {
@@ -138,6 +144,23 @@ export function useTaskWebSocket(todoId: string | null) {
               status: data.status,
               tool_index: data.tool_index as number | undefined,
               total_tools: data.total_tools as number | undefined,
+            } as ExecutionEvent)
+            break
+
+          case 'index_search':
+          case 'index_build':
+            // Code index events — push to execution log
+            appendExecutionEvent(todoId, {
+              type: data.type,
+              timestamp: Date.now(),
+              query: data.query as string | undefined,
+              results_count: data.results_count as number | undefined,
+              top_score: data.top_score as number | undefined,
+              latency_ms: data.latency_ms as number | undefined,
+              source: data.source as string | undefined,
+              has_repo_map: data.has_repo_map as boolean | undefined,
+              repo_map_chars: data.repo_map_chars as number | undefined,
+              from_base: data.from_base as boolean | undefined,
             } as ExecutionEvent)
             break
 

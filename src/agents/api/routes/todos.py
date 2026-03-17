@@ -32,6 +32,10 @@ class TriggerSubTaskInput(BaseModel):
     force: bool = False
 
 
+class InjectInput(BaseModel):
+    content: str
+
+
 router = APIRouter()
 
 
@@ -323,6 +327,44 @@ async def retry_subtask(
     ))
 
     return {"status": "retrying", "subtask_id": subtask_id, "agent_role": sub_task["agent_role"]}
+
+
+@router.post("/todos/{todo_id}/subtasks/{subtask_id}/inject")
+async def inject_subtask_message(
+    todo_id: str, subtask_id: str, body: InjectInput,
+    user: CurrentUser, db: DB, redis: Redis,
+):
+    """Inject a user guidance message into a running subtask's tool loop."""
+    todo = await db.fetchrow("SELECT project_id FROM todo_items WHERE id = $1", todo_id)
+    if not todo:
+        raise HTTPException(status_code=404)
+    await check_project_access(db, str(todo["project_id"]), user)
+
+    sub_task = await db.fetchrow(
+        "SELECT status FROM sub_tasks WHERE id = $1 AND todo_id = $2",
+        subtask_id, todo_id,
+    )
+    if not sub_task:
+        raise HTTPException(status_code=404, detail="Sub-task not found")
+    if sub_task["status"] != "running":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Can only inject into running subtasks (current: {sub_task['status']})",
+        )
+
+    await redis.rpush(f"subtask:{subtask_id}:inject", body.content)
+    await redis.expire(f"subtask:{subtask_id}:inject", 3600)
+
+    await redis.publish(
+        f"task:{todo_id}:events",
+        json.dumps({
+            "type": "user_inject",
+            "sub_task_id": subtask_id,
+            "content": body.content,
+        }),
+    )
+
+    return {"status": "queued", "subtask_id": subtask_id}
 
 
 @router.post("/todos/{todo_id}/accept-deliverables")

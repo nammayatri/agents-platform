@@ -3,6 +3,7 @@ import { useParams } from 'react-router-dom'
 import { Code2 } from 'lucide-react'
 import { useTodoStore } from '../stores/todoStore'
 import { useTaskWebSocket } from '../hooks/useTaskWebSocket'
+import { todos as todosApi } from '../services/api'
 import DiffViewer from '../components/DiffViewer'
 import WorkspaceView from '../components/workspace/WorkspaceView'
 import ExecutionLog from '../components/workspace/ExecutionLog'
@@ -754,6 +755,8 @@ export default function TodoDetailPage() {
                               </div>
                             )
                           })()}
+                          {/* Inject input for running subtasks */}
+                          <SubtaskInjectInput todoId={todoId!} subtaskId={st.id} />
                         </div>
                       )}
                       {/* LLM Response */}
@@ -1320,6 +1323,45 @@ export default function TodoDetailPage() {
           </div>
         </div>
       </div>
+    </div>
+  )
+}
+
+/** Inline input to inject guidance into a running subtask */
+function SubtaskInjectInput({ todoId, subtaskId }: { todoId: string; subtaskId: string }) {
+  const [value, setValue] = useState('')
+  const [injecting, setInjecting] = useState(false)
+
+  const handleInject = async () => {
+    if (!value.trim() || injecting) return
+    setInjecting(true)
+    try {
+      await todosApi.injectSubtask(todoId, subtaskId, value.trim())
+      setValue('')
+    } catch {
+      // ignore
+    } finally {
+      setInjecting(false)
+    }
+  }
+
+  return (
+    <div className="mt-2 flex items-center gap-1.5">
+      <input
+        type="text"
+        value={value}
+        onChange={(e) => setValue(e.target.value)}
+        onKeyDown={(e) => e.key === 'Enter' && handleInject()}
+        placeholder="Guide this agent..."
+        className="flex-1 px-2.5 py-1 bg-gray-950 border border-gray-800 rounded-lg text-[11px] text-white placeholder-gray-600 focus:outline-none focus:border-indigo-500 transition-colors"
+      />
+      <button
+        onClick={handleInject}
+        disabled={!value.trim() || injecting}
+        className="px-2.5 py-1 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 rounded-lg text-[11px] text-white transition-colors shrink-0"
+      >
+        {injecting ? '...' : 'Inject'}
+      </button>
     </div>
   )
 }

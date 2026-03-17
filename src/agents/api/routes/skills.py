@@ -1020,3 +1020,171 @@ async def delete_git_provider(gp_id: str, user: CurrentUser, db: DB):
     if str(existing["owner_id"]) != str(user["id"]):
         raise HTTPException(status_code=403, detail="Access denied")
     await db.execute("DELETE FROM git_provider_configs WHERE id = $1", gp_id)
+
+
+# ── Git Provider: List Repositories ────────────────────────────────
+
+
+@router.get("/git-providers/repos")
+async def list_all_repos(user: CurrentUser, db: DB):
+    """Fetch repositories from all active git providers concurrently."""
+    import httpx
+
+    rows = await db.fetch(
+        "SELECT * FROM git_provider_configs WHERE owner_id = $1 AND is_active = TRUE ORDER BY created_at",
+        user["id"],
+    )
+
+    async def _fetch_for_provider(row):
+        provider_type = row["provider_type"]
+        token = decrypt(row["token_enc"]) if row.get("token_enc") else None
+        if not token:
+            return {
+                "provider_id": str(row["id"]),
+                "provider_name": row["display_name"],
+                "provider_type": provider_type,
+                "repos": [],
+                "error": "No token configured",
+            }
+        if provider_type == "custom":
+            return {
+                "provider_id": str(row["id"]),
+                "provider_name": row["display_name"],
+                "provider_type": provider_type,
+                "repos": [],
+                "error": "Repository listing not supported for custom providers",
+            }
+        try:
+            base_url = row.get("api_base_url") or ""
+            if provider_type == "github":
+                repos = await _fetch_github_repos(base_url or "https://api.github.com", token)
+            elif provider_type == "gitlab":
+                repos = await _fetch_gitlab_repos(base_url or "https://gitlab.com", token)
+            elif provider_type == "bitbucket":
+                repos = await _fetch_bitbucket_repos(base_url or "https://api.bitbucket.org", token)
+            else:
+                repos = []
+            return {
+                "provider_id": str(row["id"]),
+                "provider_name": row["display_name"],
+                "provider_type": provider_type,
+                "repos": repos,
+            }
+        except Exception as e:
+            logger.warning("Failed to fetch repos for provider %s: %s", row["id"], e)
+            return {
+                "provider_id": str(row["id"]),
+                "provider_name": row["display_name"],
+                "provider_type": provider_type,
+                "repos": [],
+                "error": str(e),
+            }
+
+    results = await asyncio.gather(*[_fetch_for_provider(r) for r in rows])
+    return list(results)
+
+
+async def _fetch_github_repos(base_url: str, token: str) -> list[dict]:
+    import httpx
+
+    repos = []
+    page = 1
+    async with httpx.AsyncClient(timeout=30) as client:
+        while True:
+            resp = await client.get(
+                f"{base_url.rstrip('/')}/user/repos",
+                params={"per_page": 100, "page": page, "sort": "updated", "direction": "desc"},
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Accept": "application/vnd.github.v3+json",
+                },
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            if not data:
+                break
+            for r in data:
+                repos.append({
+                    "name": r["name"],
+                    "full_name": r["full_name"],
+                    "clone_url": r["clone_url"],
+                    "html_url": r["html_url"],
+                    "default_branch": r.get("default_branch", "main"),
+                    "private": r.get("private", False),
+                    "description": r.get("description"),
+                })
+            if len(data) < 100 or len(repos) >= 200:
+                break
+            page += 1
+    return repos[:200]
+
+
+async def _fetch_gitlab_repos(base_url: str, token: str) -> list[dict]:
+    import httpx
+
+    repos = []
+    page = 1
+    async with httpx.AsyncClient(timeout=30) as client:
+        while True:
+            resp = await client.get(
+                f"{base_url.rstrip('/')}/api/v4/projects",
+                params={"membership": "true", "per_page": 100, "page": page, "order_by": "last_activity_at"},
+                headers={"PRIVATE-TOKEN": token},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            if not data:
+                break
+            for r in data:
+                repos.append({
+                    "name": r["name"],
+                    "full_name": r["path_with_namespace"],
+                    "clone_url": r.get("http_url_to_repo", ""),
+                    "html_url": r.get("web_url", ""),
+                    "default_branch": r.get("default_branch", "main"),
+                    "private": r.get("visibility", "private") != "public",
+                    "description": r.get("description"),
+                })
+            if len(data) < 100 or len(repos) >= 200:
+                break
+            page += 1
+    return repos[:200]
+
+
+async def _fetch_bitbucket_repos(base_url: str, token: str) -> list[dict]:
+    import httpx
+
+    repos = []
+    async with httpx.AsyncClient(timeout=30) as client:
+        user_resp = await client.get(
+            f"{base_url.rstrip('/')}/2.0/user",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        user_resp.raise_for_status()
+        username = user_resp.json().get("username", "")
+
+        url = f"{base_url.rstrip('/')}/2.0/repositories/{username}"
+        params: dict = {"pagelen": 100, "sort": "-updated_on"}
+        while url and len(repos) < 200:
+            resp = await client.get(url, params=params, headers={"Authorization": f"Bearer {token}"})
+            resp.raise_for_status()
+            data = resp.json()
+            for r in data.get("values", []):
+                clone_url = ""
+                for link in r.get("links", {}).get("clone", []):
+                    if link.get("name") == "https":
+                        clone_url = link["href"]
+                        break
+                html_url = r.get("links", {}).get("html", {}).get("href", "")
+                repos.append({
+                    "name": r["name"],
+                    "full_name": r["full_name"],
+                    "clone_url": clone_url,
+                    "html_url": html_url,
+                    "default_branch": r.get("mainbranch", {}).get("name", "main"),
+                    "private": r.get("is_private", True),
+                    "description": r.get("description"),
+                })
+            url = data.get("next")
+            params = {}  # next URL includes params
+    return repos[:200]

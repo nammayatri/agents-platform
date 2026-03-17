@@ -95,6 +95,9 @@ ActivityCallback = Callable[[str], Awaitable[None]]
 # Structured tool event callback for streaming execution visibility
 ToolEventCallback = Callable[[dict], Awaitable[None]]
 
+# Callback to check for injected user messages between tool rounds
+InjectCheckCallback = Callable[[], Awaitable[str | None]]
+
 
 async def run_tool_loop(
     provider: AIProvider,
@@ -106,6 +109,7 @@ async def run_tool_loop(
     on_tool_round: Callable[[int, LLMResponse], Awaitable[None]] | None = None,
     on_activity: ActivityCallback | None = None,
     on_tool_event: ToolEventCallback | None = None,
+    on_inject_check: InjectCheckCallback | None = None,
     **send_kwargs: Any,
 ) -> tuple[str, LLMResponse]:
     """Standard tool-call loop with content accumulation.
@@ -123,6 +127,9 @@ async def run_tool_loop(
         on_activity: Optional callback for granular activity events (UI live log).
         on_tool_event: Optional structured event callback for streaming execution
             visibility. Receives dicts like ``{"type": "tool_start", "name": ...}``.
+        on_inject_check: Optional callback to poll for user-injected messages
+            between tool rounds. Called after tools execute, before the next LLM
+            call.  Return a string to inject or ``None`` for no pending message.
         **send_kwargs: Forwarded to ``provider.send_message`` (temperature, model…).
 
     Returns:
@@ -173,12 +180,54 @@ async def run_tool_loop(
         })
 
     content_parts: list[str] = []
+    tools_called: list[str] = []      # track tool names across rounds
+    total_tool_calls = 0
     loop_count = 0
+    nudged = False
 
-    while response.stop_reason == "tool_use" and response.tool_calls and loop_count < max_rounds:
+    # Nudge: if tools were provided but the model wrote text instead of calling
+    # them, inject a correction and retry once.  This catches models (e.g.
+    # kimi-latest) that describe what they *would* do instead of acting.
+    if tools and not response.tool_calls and response.content:
+        logger.info("tool_loop: model produced text without tool calls, nudging")
+        if on_activity:
+            await on_activity("Nudging agent to use tools...")
+        messages.append(LLMMessage(
+            role="assistant", content=response.content,
+        ))
+        tool_names_hint = ", ".join(sorted({t["name"] for t in tools}))
+        messages.append(LLMMessage(
+            role="user",
+            content=(
+                "You have tools available and MUST use them to answer. "
+                "Do NOT describe what you would do — actually call the tools now. "
+                f"Available tools: {tool_names_hint}"
+            ),
+        ))
+        if response.content:
+            content_parts.append(response.content)
+        response = await provider.send_message(messages, **send_kwargs)
+        nudged = True
+        logger.info(
+            "tool_loop: nudge response stop_reason=%s tool_calls=%d",
+            response.stop_reason,
+            len(response.tool_calls) if response.tool_calls else 0,
+        )
+        if on_tool_event:
+            await on_tool_event({
+                "type": "llm_thinking",
+                "tokens_in": response.tokens_input,
+                "tokens_out": response.tokens_output,
+                "round": 0,
+                "nudged": True,
+            })
+
+    while response.tool_calls and loop_count < max_rounds:
         loop_count += 1
 
         tool_names = [tc["name"] for tc in response.tool_calls]
+        tools_called.extend(tool_names)
+        total_tool_calls += len(tool_names)
         logger.info("tool_loop: round %d/%d — calling tools: %s", loop_count, max_rounds, tool_names)
 
         if on_tool_round:
@@ -253,6 +302,26 @@ async def run_tool_loop(
 
         messages.append(LLMMessage(role="user", content="", tool_results=tool_results))
 
+        # Check for injected user messages between tool rounds
+        if on_inject_check:
+            injected_parts: list[str] = []
+            while True:
+                injected = await on_inject_check()
+                if injected is None:
+                    break
+                injected_parts.append(injected)
+            if injected_parts:
+                combined = "\n\n".join(injected_parts)
+                messages.append(LLMMessage(
+                    role="user",
+                    content=f"[USER GUIDANCE]: {combined}",
+                ))
+                if on_activity:
+                    preview = combined[:80] + ("..." if len(combined) > 80 else "")
+                    await on_activity(f"User guidance received: {preview}")
+                logger.info("tool_loop: injected %d user message(s) before round %d",
+                            len(injected_parts), loop_count + 1)
+
         if on_activity:
             await on_activity(f"Thinking... (round {loop_count + 1})")
 
@@ -281,7 +350,7 @@ async def run_tool_loop(
                 "round": loop_count,
             })
 
-    truncated = loop_count >= max_rounds and response.stop_reason == "tool_use"
+    truncated = loop_count >= max_rounds and bool(response.tool_calls)
     if truncated:
         logger.warning("tool_loop: hit max_rounds=%d, stopping with pending tool calls", max_rounds)
         response.stop_reason = "max_tool_rounds"
@@ -297,6 +366,24 @@ async def run_tool_loop(
         content = "\n\n".join(p for p in content_parts if p)
     else:
         content = response.content
+
+    # If the loop hit the round limit, append a visible note so the user
+    # knows the agent was cut off mid-exploration and can say "continue".
+    if truncated:
+        content = (content or "") + (
+            f"\n\n---\n*Agent reached the tool round limit ({max_rounds} rounds, "
+            f"{total_tool_calls} tool calls). Say **continue** to keep going.*"
+        )
+
+    # Attach execution summary to the response for callers that want visibility
+    # into what happened during the tool loop.
+    unique_tools = list(dict.fromkeys(tools_called))  # preserves order, dedupes
+    response.tool_summary = {
+        "rounds": loop_count,
+        "tools_called": unique_tools,
+        "total_tool_calls": total_tool_calls,
+        "nudged": nudged,
+    }
 
     return content, response
 

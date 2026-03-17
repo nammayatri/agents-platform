@@ -436,6 +436,15 @@ export interface ChatPlanData {
   tasks: PlanTask[]
 }
 
+export interface ChatExecutionInfo {
+  tool_calls?: { name: string; result_preview?: string }[]
+  rounds?: number
+  total_tokens_in?: number
+  total_tokens_out?: number
+  model?: string
+  stop_reason?: string
+}
+
 export interface ProjectChatMessage {
   id: string
   project_id: string
@@ -452,12 +461,13 @@ export interface ProjectChatMessage {
     task_count?: number
     tasks_created?: number
     task_ids?: string[]
+    execution?: ChatExecutionInfo
   }
   created_at: string
 }
 
 export interface WSEvent {
-  type: 'state_change' | 'subtask_update' | 'chat_message' | 'progress' | 'activity' | 'deliverable_created' | 'task_cancelled' | 'llm_response' | 'workspace_commit' | 'workspace_push' | 'tool_start' | 'tool_result' | 'llm_thinking' | 'iteration_start' | 'iteration_end' | 'testing_step' | 'ping'
+  type: 'state_change' | 'subtask_update' | 'chat_message' | 'progress' | 'activity' | 'deliverable_created' | 'task_cancelled' | 'llm_response' | 'workspace_commit' | 'workspace_push' | 'tool_start' | 'tool_result' | 'llm_thinking' | 'iteration_start' | 'iteration_end' | 'testing_step' | 'user_inject' | 'index_search' | 'index_build' | 'ping'
   state?: TodoState
   status?: string
   message?: string | { role: string; content: string; id?: string }
@@ -482,6 +492,15 @@ export interface WSEvent {
   subtask?: string
   // Testing phase event fields
   command?: string
+  // Index event fields
+  query?: string
+  results_count?: number
+  top_score?: number
+  latency_ms?: number
+  source?: string       // 'cache' | 'disk' | 'cold_build' | 'error'
+  has_repo_map?: boolean
+  repo_map_chars?: number
+  from_base?: boolean
 }
 
 // ── API Payload Types ──────────────────────────────────────────────
@@ -628,7 +647,7 @@ export interface ProjectMemory {
 // ── Execution Events ──────────────────────────────────────────────
 
 export interface ExecutionEvent {
-  type: 'iteration_start' | 'tool_start' | 'tool_result' | 'llm_thinking' | 'iteration_end' | 'activity'
+  type: 'iteration_start' | 'tool_start' | 'tool_result' | 'llm_thinking' | 'iteration_end' | 'activity' | 'index_search' | 'index_build'
   timestamp: number
   iteration?: number
   subtask?: string
@@ -643,6 +662,33 @@ export interface ExecutionEvent {
   tool_index?: number
   total_tools?: number
   message?: string
+  // Index event fields
+  query?: string
+  results_count?: number
+  top_score?: number
+  latency_ms?: number
+  source?: string
+  has_repo_map?: boolean
+  repo_map_chars?: number
+  from_base?: boolean
+}
+
+export interface RepoInfo {
+  name: string
+  full_name: string
+  clone_url: string
+  html_url: string
+  default_branch: string
+  private: boolean
+  description?: string
+}
+
+export interface ProviderRepos {
+  provider_id: string
+  provider_name: string
+  provider_type: string
+  repos: RepoInfo[]
+  error?: string
 }
 
 export interface AgentCreatePayload {

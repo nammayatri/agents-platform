@@ -112,6 +112,35 @@ async def _build_on_activity(redis, session_id: str | None):
     return on_activity
 
 
+def _build_execution_metadata(tool_events: list[dict], response) -> dict:
+    """Build a compact execution summary from tool loop events for the UI."""
+    tool_calls = []
+    for e in tool_events:
+        if e.get("type") == "tool_result" and not e.get("error"):
+            tool_calls.append({
+                "name": e.get("name", ""),
+                "result_preview": (e.get("result_preview", "") or "")[:200],
+            })
+    rounds = max(
+        (e.get("round", 0) for e in tool_events if e.get("type") == "llm_thinking"),
+        default=0,
+    )
+    total_tokens_in = sum(
+        e.get("tokens_in", 0) for e in tool_events if e.get("type") == "llm_thinking"
+    )
+    total_tokens_out = sum(
+        e.get("tokens_out", 0) for e in tool_events if e.get("type") == "llm_thinking"
+    )
+    return {
+        "tool_calls": tool_calls,
+        "rounds": rounds,
+        "total_tokens_in": total_tokens_in,
+        "total_tokens_out": total_tokens_out,
+        "model": getattr(response, "model", ""),
+        "stop_reason": getattr(response, "stop_reason", ""),
+    }
+
+
 # ── Chat Mode (default) ─────────────────────────────────────────────
 
 
@@ -306,6 +335,20 @@ Project: "{project['name']}"
 
     on_activity = await _build_on_activity(redis, session_id)
 
+    # Allow users to inject guidance while the chat agent explores
+    _inject_key = f"chat:session:{session_id}:inject" if session_id else None
+
+    async def _check_inject() -> str | None:
+        if redis and _inject_key:
+            return await redis.lpop(_inject_key)
+        return None
+
+    # Collect tool execution events for UI visibility
+    tool_events: list[dict] = []
+
+    async def _on_tool_event(event: dict) -> None:
+        tool_events.append(event)
+
     send_kwargs: dict = {}
     if model_override:
         send_kwargs["model"] = model_override
@@ -316,10 +359,22 @@ Project: "{project['name']}"
         provider, messages,
         tools=tools_arg,
         tool_executor=_execute_tool,
-        max_rounds=5,
+        max_rounds=10,
         on_activity=on_activity,
+        on_tool_event=_on_tool_event,
+        on_inject_check=_check_inject,
         **send_kwargs,
     )
+
+    if redis and _inject_key:
+        while await redis.lpop(_inject_key):
+            pass
+
+    # Merge execution metadata into message metadata
+    execution_meta = _build_execution_metadata(tool_events, response)
+    if metadata is None:
+        metadata = {}
+    metadata["execution"] = execution_meta
 
     msg_row = await db.fetchrow(
         """
@@ -329,7 +384,7 @@ Project: "{project['name']}"
         project_id,
         user_id,
         content,
-        json.dumps(metadata) if metadata else None,
+        json.dumps(metadata),
         session_id,
     )
     return dict(msg_row)
@@ -627,15 +682,41 @@ async def generate_plan_response(
 
     on_activity = await _build_on_activity(redis, session_id)
 
+    # Allow users to inject guidance while the planner explores
+    _inject_key = f"chat:session:{session_id}:inject"
+
+    async def _check_inject() -> str | None:
+        if redis:
+            return await redis.lpop(_inject_key)
+        return None
+
+    # ── Collect tool execution events for UI visibility ────────────
+    tool_events: list[dict] = []
+
+    async def _on_tool_event(event: dict) -> None:
+        tool_events.append(event)
+
     # ── Run tool loop ────────────────────────────────────────────────
+    # Plan mode needs more rounds — the agent explores extensively before
+    # proposing a plan (reading files, searching patterns, listing dirs).
     content, response = await run_tool_loop(
         provider, messages,
         tools=tools_arg,
         tool_executor=_execute_tool,
-        max_rounds=5,
+        max_rounds=15,
         on_activity=on_activity,
+        on_tool_event=_on_tool_event,
+        on_inject_check=_check_inject,
         **plan_send_kwargs,
     )
+
+    # Drain unconsumed inject messages
+    if redis:
+        while await redis.lpop(_inject_key):
+            pass
+
+    # ── Build execution metadata for UI ──────────────────────────────
+    execution_meta = _build_execution_metadata(tool_events, response)
 
     # ── Plan extraction & acceptance (unchanged) ─────────────────────
     metadata = None
@@ -693,6 +774,11 @@ async def generate_plan_response(
             f"**Plan accepted!** Created {len(created_tasks)} tasks:\n{task_summary}"
         )
 
+    # Merge execution metadata into the message metadata
+    if metadata is None:
+        metadata = {}
+    metadata["execution"] = execution_meta
+
     msg_row = await db.fetchrow(
         """
         INSERT INTO project_chat_messages (project_id, user_id, role, content, metadata_json, session_id)
@@ -701,7 +787,7 @@ async def generate_plan_response(
         project_id,
         user_id,
         content,
-        json.dumps(metadata) if metadata else None,
+        json.dumps(metadata),
         session_id,
     )
     return dict(msg_row)
@@ -1008,6 +1094,20 @@ async def generate_debug_response(
 
     on_activity = await _build_on_activity(redis, session_id)
 
+    # Allow users to inject guidance while the debugger investigates
+    _inject_key = f"chat:session:{session_id}:inject"
+
+    async def _check_inject() -> str | None:
+        if redis:
+            return await redis.lpop(_inject_key)
+        return None
+
+    # Collect tool execution events for UI visibility
+    tool_events: list[dict] = []
+
+    async def _on_tool_event(event: dict) -> None:
+        tool_events.append(event)
+
     send_kwargs: dict = {}
     if model_override:
         send_kwargs["model"] = model_override
@@ -1018,17 +1118,27 @@ async def generate_debug_response(
         tool_executor=_execute_tool,
         max_rounds=8,
         on_activity=on_activity,
+        on_tool_event=_on_tool_event,
+        on_inject_check=_check_inject,
         **send_kwargs,
     )
 
+    if redis:
+        while await redis.lpop(_inject_key):
+            pass
+
+    execution_meta = _build_execution_metadata(tool_events, response)
+    metadata = {"execution": execution_meta}
+
     msg_row = await db.fetchrow(
         """
-        INSERT INTO project_chat_messages (project_id, user_id, role, content, session_id)
-        VALUES ($1, $2, 'assistant', $3, $4) RETURNING *
+        INSERT INTO project_chat_messages (project_id, user_id, role, content, metadata_json, session_id)
+        VALUES ($1, $2, 'assistant', $3, $4::jsonb, $5) RETURNING *
         """,
         project_id,
         user_id,
         content,
+        json.dumps(metadata),
         session_id,
     )
     return dict(msg_row)
@@ -1157,6 +1267,11 @@ async def generate_create_task_response(
 
     on_activity = await _build_on_activity(redis, session_id)
 
+    tool_events: list[dict] = []
+
+    async def _on_tool_event(event: dict) -> None:
+        tool_events.append(event)
+
     send_kwargs: dict = {}
     if model_override:
         send_kwargs["model"] = model_override
@@ -1167,8 +1282,14 @@ async def generate_create_task_response(
         tool_executor=_execute_tool,
         max_rounds=3,
         on_activity=on_activity,
+        on_tool_event=_on_tool_event,
         **send_kwargs,
     )
+
+    execution_meta = _build_execution_metadata(tool_events, response)
+    if metadata is None:
+        metadata = {}
+    metadata["execution"] = execution_meta
 
     msg_row = await db.fetchrow(
         """
@@ -1178,7 +1299,7 @@ async def generate_create_task_response(
         project_id,
         user_id,
         content,
-        json.dumps(metadata) if metadata else None,
+        json.dumps(metadata),
         session_id,
     )
     return dict(msg_row)

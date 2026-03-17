@@ -10,6 +10,7 @@ import type {
   NotificationChannelPayload, AgentCreatePayload, AgentUpdatePayload,
   ProjectMember, DebugContext, ProjectMemory,
   FileTreeNode, FileContent, GitStatus,
+  ProviderRepos,
 } from '../types'
 
 const API_BASE = '/api'
@@ -154,6 +155,11 @@ export const todos = {
       `/todos/${todoId}/sub-tasks/${subTaskId}/trigger`,
       { method: 'POST', body: JSON.stringify({ force }) },
     ),
+  injectSubtask: (todoId: string, subtaskId: string, content: string) =>
+    request<{ status: string }>(`/todos/${todoId}/subtasks/${subtaskId}/inject`, {
+      method: 'POST',
+      body: JSON.stringify({ content }),
+    }),
   acceptDeliverables: (id: string) =>
     request<TodoItem>(`/todos/${id}/accept-deliverables`, { method: 'POST' }),
   requestChanges: (id: string, feedback: string) =>
@@ -274,6 +280,11 @@ export const projectChat = {
       `/projects/${projectId}/chat/sessions/${sessionId}/messages/${messageId}`,
       { method: 'DELETE' },
     ),
+  injectInSession: (projectId: string, sessionId: string, content: string) =>
+    request<{ status: string }>(`/projects/${projectId}/chat/sessions/${sessionId}/inject`, {
+      method: 'POST',
+      body: JSON.stringify({ content }),
+    }),
 }
 
 // Deliverables
@@ -313,6 +324,7 @@ export const gitProviders = {
     request<GitProviderConfig>(`/config/git-providers/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
   delete: (id: string) => request<void>(`/config/git-providers/${id}`, { method: 'DELETE' }),
   test: (id: string) => request<{ status: string; detail?: string }>(`/config/git-providers/${id}/test`, { method: 'POST' }),
+  listRepos: () => request<ProviderRepos[]>('/config/git-providers/repos'),
 }
 
 // Skills
