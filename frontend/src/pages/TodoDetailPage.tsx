@@ -645,6 +645,20 @@ export default function TodoDetailPage() {
                           </span>
                         )}
                         {(() => {
+                          // Duration display for completed/failed subtasks
+                          if (st.started_at && st.completed_at) {
+                            const dur = new Date(st.completed_at).getTime() - new Date(st.started_at).getTime()
+                            const secs = Math.round(dur / 1000)
+                            const durStr = secs >= 60 ? `${Math.floor(secs / 60)}m ${secs % 60}s` : `${secs}s`
+                            return <span className="text-[11px] text-gray-600 font-mono shrink-0">{durStr}</span>
+                          }
+                          if (st.started_at && st.status === 'running') {
+                            const startTime = new Date(st.started_at).toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit' })
+                            return <span className="text-[11px] text-gray-600 font-mono shrink-0">started {startTime}</span>
+                          }
+                          return null
+                        })()}
+                        {(() => {
                           const canForceRun = (st.status === 'pending' || st.status === 'failed') && todoId
                           const canShowDetails = (st.status === 'completed' || st.status === 'failed') && (st.output_result || st.description || st.error_message)
                           if (!canForceRun && !canShowDetails) return null
@@ -1237,10 +1251,19 @@ export default function TodoDetailPage() {
         })()}
 
         {/* Metrics */}
-        <div className="flex gap-4 text-[11px] text-gray-600 font-mono border-t border-gray-900 pt-4">
+        <div className="flex gap-4 flex-wrap text-[11px] text-gray-600 font-mono border-t border-gray-900 pt-4">
           <span>tokens: {todo.actual_tokens.toLocaleString()}</span>
           <span>cost: ${todo.cost_usd.toFixed(4)}</span>
           <span>retries: {todo.retry_count}</span>
+          {todo.completed_at && todo.created_at && (() => {
+            const dur = new Date(todo.completed_at).getTime() - new Date(todo.created_at).getTime()
+            const secs = Math.round(dur / 1000)
+            if (secs < 60) return <span>duration: {secs}s</span>
+            if (secs < 3600) return <span>duration: {Math.floor(secs / 60)}m {secs % 60}s</span>
+            const hrs = Math.floor(secs / 3600)
+            const mins = Math.floor((secs % 3600) / 60)
+            return <span>duration: {hrs}h {mins}m</span>
+          })()}
         </div>
 
         {/* Mobile chat toggle */}
@@ -1271,7 +1294,9 @@ export default function TodoDetailPage() {
             const previousMessages = messages.filter((msg: ChatMessage) => isTimestampPreviousRun(msg.created_at))
             const currentMessages = messages.filter((msg: ChatMessage) => !isTimestampPreviousRun(msg.created_at))
 
-            const renderMessage = (msg: ChatMessage) => (
+            const renderMessage = (msg: ChatMessage) => {
+              const time = new Date(msg.created_at).toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit' })
+              return (
               <div
                 key={msg.id}
                 className={`text-sm rounded-lg p-3 ${
@@ -1282,12 +1307,13 @@ export default function TodoDetailPage() {
                     : 'mr-6 bg-gray-900 border border-gray-800/50'
                 }`}
               >
-                <div className="text-[11px] text-gray-600 mb-1">
-                  {msg.role === 'user' ? 'You' : msg.role === 'system' ? 'System' : 'Agent'}
+                <div className="flex items-center gap-2 text-[11px] text-gray-600 mb-1">
+                  <span>{msg.role === 'user' ? 'You' : msg.role === 'system' ? 'System' : 'Agent'}</span>
+                  <span className="text-gray-700 font-mono">{time}</span>
                 </div>
                 <div className="text-gray-300 whitespace-pre-wrap text-[13px] leading-relaxed">{msg.content}</div>
               </div>
-            )
+            )}
 
             return (
               <>

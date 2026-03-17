@@ -128,10 +128,14 @@ export function useTaskWebSocket(todoId: string | null) {
           case 'llm_thinking':
           case 'iteration_start':
           case 'iteration_end':
+          case 'index_search':
+          case 'index_build':
             // Streaming execution events — push to execution log
             appendExecutionEvent(todoId, {
               type: data.type,
               timestamp: Date.now(),
+              ts: data.ts as number | undefined,
+              sub_task_id: data.sub_task_id as string | undefined,
               iteration: data.iteration as number | undefined,
               subtask: data.subtask as string | undefined,
               name: data.name as string | undefined,
@@ -144,15 +148,12 @@ export function useTaskWebSocket(todoId: string | null) {
               status: data.status,
               tool_index: data.tool_index as number | undefined,
               total_tools: data.total_tools as number | undefined,
-            } as ExecutionEvent)
-            break
-
-          case 'index_search':
-          case 'index_build':
-            // Code index events — push to execution log
-            appendExecutionEvent(todoId, {
-              type: data.type,
-              timestamp: Date.now(),
+              // Rich detail fields
+              file_path: data.file_path as string | undefined,
+              pattern: data.pattern as string | undefined,
+              command: data.command as string | undefined,
+              error: data.error as boolean | undefined,
+              // Index fields
               query: data.query as string | undefined,
               results_count: data.results_count as number | undefined,
               top_score: data.top_score as number | undefined,

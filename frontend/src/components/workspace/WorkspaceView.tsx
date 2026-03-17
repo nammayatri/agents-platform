@@ -1,10 +1,11 @@
 import { useEffect, useState, useCallback, useRef } from 'react'
 import Editor from '@monaco-editor/react'
-import { X, PanelBottomClose, PanelBottomOpen, PanelLeftClose, PanelLeftOpen, Loader2 } from 'lucide-react'
+import { X, PanelBottomClose, PanelBottomOpen, PanelLeftClose, PanelLeftOpen, Loader2, Diff, FileCode } from 'lucide-react'
 import { todos } from '../../services/api'
 import type { FileTreeNode, GitStatus } from '../../types'
 import FileTree from './FileTree'
 import GitPanel from './GitPanel'
+import DiffViewer from '../DiffViewer'
 
 interface OpenTab {
   path: string
@@ -12,6 +13,13 @@ interface OpenTab {
   savedContent: string
   language: string
   dirty: boolean
+  /** When set, this tab is showing a diff instead of the editor */
+  diffMode?: boolean
+  diffContent?: string
+  diffStats?: string
+  diffStaged?: boolean
+  diffLoading?: boolean
+  diffError?: string
 }
 
 interface Props {
@@ -28,6 +36,11 @@ export default function WorkspaceView({ todoId }: Props) {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
   const editorRef = useRef<unknown>(null)
+
+  // Full diff state for "all changes" view
+  const [fullDiff, setFullDiff] = useState<{ diff: string; stats: string } | null>(null)
+  const [fullDiffLoading, setFullDiffLoading] = useState(false)
+  const [showFullDiff, setShowFullDiff] = useState(false)
 
   const loadTree = useCallback(async () => {
     try {
@@ -52,10 +65,11 @@ export default function WorkspaceView({ todoId }: Props) {
   }, [loadTree, loadGitStatus])
 
   const handleFileSelect = useCallback(async (path: string) => {
-    // Check if tab already open
-    const existing = tabs.find(t => t.path === path)
+    // Check if tab already open (in editor mode)
+    const existing = tabs.find(t => t.path === path && !t.diffMode)
     if (existing) {
       setActiveTab(path)
+      setShowFullDiff(false)
       return
     }
 
@@ -72,10 +86,56 @@ export default function WorkspaceView({ todoId }: Props) {
         language: file.language,
         dirty: false,
       }
-      setTabs(prev => [...prev, newTab])
+      // Remove any existing diff tab for this file if present
+      setTabs(prev => [...prev.filter(t => !(t.path === path && t.diffMode)), newTab])
       setActiveTab(path)
+      setShowFullDiff(false)
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Failed to open file')
+    }
+  }, [tabs, todoId])
+
+  const handleDiffClick = useCallback(async (path: string, staged: boolean) => {
+    // Create a diff tab identifier
+    const diffTabId = `diff:${path}`
+
+    // Check if diff tab already open
+    const existing = tabs.find(t => t.path === diffTabId)
+    if (existing) {
+      setActiveTab(diffTabId)
+      setShowFullDiff(false)
+      return
+    }
+
+    // Create a diff tab with loading state
+    const newTab: OpenTab = {
+      path: diffTabId,
+      content: '',
+      savedContent: '',
+      language: '',
+      dirty: false,
+      diffMode: true,
+      diffLoading: true,
+      diffStaged: staged,
+    }
+    setTabs(prev => [...prev, newTab])
+    setActiveTab(diffTabId)
+    setShowFullDiff(false)
+
+    // Fetch the diff
+    try {
+      const result = await todos.workspace.gitDiff(todoId, staged, path)
+      setTabs(prev => prev.map(t =>
+        t.path === diffTabId
+          ? { ...t, diffLoading: false, diffContent: result.diff, diffStats: result.stats }
+          : t
+      ))
+    } catch (e) {
+      setTabs(prev => prev.map(t =>
+        t.path === diffTabId
+          ? { ...t, diffLoading: false, diffError: e instanceof Error ? e.message : 'Failed to load diff' }
+          : t
+      ))
     }
   }, [tabs, todoId])
 
@@ -103,7 +163,7 @@ export default function WorkspaceView({ todoId }: Props) {
 
   const handleSave = useCallback(async () => {
     const tab = tabs.find(t => t.path === activeTab)
-    if (!tab || !tab.dirty) return
+    if (!tab || !tab.dirty || tab.diffMode) return
 
     try {
       await todos.workspace.saveFile(todoId, tab.path, tab.content)
@@ -143,9 +203,30 @@ export default function WorkspaceView({ todoId }: Props) {
     handleFileSelect(path)
   }, [handleFileSelect])
 
+  const handleLoadFullDiff = useCallback(async () => {
+    setShowFullDiff(true)
+    setActiveTab(null)
+    if (!fullDiff) {
+      setFullDiffLoading(true)
+      try {
+        const result = await todos.workspace.gitDiff(todoId)
+        setFullDiff(result)
+      } catch {
+        setFullDiff({ diff: '', stats: '' })
+      } finally {
+        setFullDiffLoading(false)
+      }
+    }
+  }, [todoId, fullDiff])
+
   const modifiedPaths = new Set(gitStatus.files.map(f => f.path))
   const currentTab = tabs.find(t => t.path === activeTab)
-  const fileName = (path: string) => path.split('/').pop() || path
+  const fileName = (path: string) => {
+    if (path.startsWith('diff:')) {
+      return path.replace('diff:', '').split('/').pop() || path
+    }
+    return path.split('/').pop() || path
+  }
 
   if (loading) {
     return (
@@ -185,7 +266,7 @@ export default function WorkspaceView({ todoId }: Props) {
         </div>
         <FileTree
           tree={tree}
-          activeFile={activeTab}
+          activeFile={activeTab && !activeTab.startsWith('diff:') ? activeTab : null}
           modifiedPaths={modifiedPaths}
           onFileSelect={handleFileSelect}
         />
@@ -206,13 +287,16 @@ export default function WorkspaceView({ todoId }: Props) {
           {tabs.map(tab => (
             <button
               key={tab.path}
-              onClick={() => setActiveTab(tab.path)}
+              onClick={() => { setActiveTab(tab.path); setShowFullDiff(false) }}
               className={`flex items-center gap-1.5 px-3 py-1.5 text-xs border-r border-gray-800 shrink-0 transition-colors ${
-                activeTab === tab.path
+                activeTab === tab.path && !showFullDiff
                   ? 'bg-gray-900 text-white border-b-2 border-b-indigo-500 -mb-px'
                   : 'text-gray-500 hover:text-gray-300'
               }`}
             >
+              {tab.diffMode ? (
+                <Diff className="w-3 h-3 text-amber-400 shrink-0" />
+              ) : null}
               <span className="truncate max-w-[120px]">
                 {tab.dirty && <span className="text-amber-400 mr-0.5">*</span>}
                 {fileName(tab.path)}
@@ -225,6 +309,21 @@ export default function WorkspaceView({ todoId }: Props) {
               </span>
             </button>
           ))}
+          {/* All Changes diff tab */}
+          {!gitStatus.clean && (
+            <button
+              onClick={handleLoadFullDiff}
+              className={`flex items-center gap-1.5 px-3 py-1.5 text-xs border-r border-gray-800 shrink-0 transition-colors ${
+                showFullDiff
+                  ? 'bg-gray-900 text-white border-b-2 border-b-indigo-500 -mb-px'
+                  : 'text-gray-500 hover:text-gray-300'
+              }`}
+              title="View all changes"
+            >
+              <Diff className="w-3 h-3 text-amber-400" />
+              <span className="truncate">All Changes</span>
+            </button>
+          )}
           <div className="flex-1" />
           <button
             onClick={() => setGitPanelCollapsed(c => !c)}
@@ -241,9 +340,84 @@ export default function WorkspaceView({ todoId }: Props) {
 
         {/* Editor + git panel */}
         <div className="flex-1 flex flex-col min-h-0">
-          {/* Editor */}
+          {/* Editor / Diff content */}
           <div className="flex-1 min-h-0">
-            {currentTab ? (
+            {showFullDiff ? (
+              /* Full diff view */
+              <div className="h-full overflow-y-auto bg-gray-950 p-4">
+                <div className="max-w-5xl mx-auto">
+                  <div className="flex items-center gap-2 mb-3">
+                    <Diff className="w-4 h-4 text-amber-400" />
+                    <h2 className="text-sm font-medium text-white">All Changes</h2>
+                    <span className="text-[11px] text-gray-500">
+                      {gitStatus.branch && `on ${gitStatus.branch}`}
+                    </span>
+                  </div>
+                  {fullDiffLoading ? (
+                    <div className="flex items-center gap-2 py-8 justify-center text-gray-600">
+                      <Loader2 className="w-4 h-4 animate-spin" />
+                      <span className="text-sm">Loading diff...</span>
+                    </div>
+                  ) : fullDiff && fullDiff.diff ? (
+                    <DiffViewer
+                      diff={fullDiff.diff}
+                      stats={fullDiff.stats}
+                      files={gitStatus.files.map(f => ({ status: f.status, path: f.path }))}
+                      maxHeight="max-h-full"
+                    />
+                  ) : (
+                    <div className="py-6 text-center text-sm text-gray-600 border border-dashed border-gray-800 rounded-lg">
+                      No diff available
+                    </div>
+                  )}
+                </div>
+              </div>
+            ) : currentTab?.diffMode ? (
+              /* Per-file diff view */
+              <div className="h-full overflow-y-auto bg-gray-950 p-4">
+                <div className="max-w-5xl mx-auto">
+                  <div className="flex items-center gap-2 mb-3">
+                    <Diff className="w-4 h-4 text-amber-400" />
+                    <h2 className="text-sm font-medium text-white">
+                      {currentTab.path.replace('diff:', '')}
+                    </h2>
+                    {currentTab.diffStaged && (
+                      <span className="px-2 py-0.5 bg-emerald-500/10 border border-emerald-500/20 rounded text-[10px] text-emerald-400 font-medium">
+                        staged
+                      </span>
+                    )}
+                    <button
+                      onClick={() => handleFileSelect(currentTab.path.replace('diff:', ''))}
+                      className="ml-auto flex items-center gap-1 text-[11px] text-gray-500 hover:text-gray-300 transition-colors"
+                      title="Open in editor"
+                    >
+                      <FileCode className="w-3 h-3" />
+                      Open in Editor
+                    </button>
+                  </div>
+                  {currentTab.diffLoading ? (
+                    <div className="flex items-center gap-2 py-8 justify-center text-gray-600">
+                      <Loader2 className="w-4 h-4 animate-spin" />
+                      <span className="text-sm">Loading diff...</span>
+                    </div>
+                  ) : currentTab.diffError ? (
+                    <div className="px-4 py-2.5 bg-red-500/10 border border-red-500/20 rounded-lg text-red-400 text-sm">
+                      {currentTab.diffError}
+                    </div>
+                  ) : currentTab.diffContent ? (
+                    <DiffViewer
+                      diff={currentTab.diffContent}
+                      stats={currentTab.diffStats}
+                      maxHeight="max-h-full"
+                    />
+                  ) : (
+                    <div className="py-6 text-center text-sm text-gray-600 border border-dashed border-gray-800 rounded-lg">
+                      No diff available for this file
+                    </div>
+                  )}
+                </div>
+              </div>
+            ) : currentTab ? (
               <Editor
                 height="100%"
                 language={currentTab.language}
@@ -282,6 +456,7 @@ export default function WorkspaceView({ todoId }: Props) {
             gitStatus={gitStatus}
             onRefresh={handleGitRefresh}
             onFileClick={handleGitFileClick}
+            onDiffClick={handleDiffClick}
             collapsed={gitPanelCollapsed}
             onToggle={() => setGitPanelCollapsed(c => !c)}
           />

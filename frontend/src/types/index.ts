@@ -141,7 +141,9 @@ export interface SubTask {
     default_branch: string
     git_provider_id?: string | null
   }
+  execution_events?: ExecutionEvent[]
   created_at: string
+  started_at?: string
   completed_at?: string
 }
 
@@ -479,6 +481,7 @@ export interface WSEvent {
   iteration?: number
   error_message?: string
   sub_state?: string
+  ts?: number
   // Streaming execution event fields
   name?: string
   args_summary?: string
@@ -490,6 +493,10 @@ export interface WSEvent {
   tool_index?: number
   total_tools?: number
   subtask?: string
+  // File/tool detail fields
+  file_path?: string
+  pattern?: string
+  error?: boolean
   // Testing phase event fields
   command?: string
   // Index event fields
@@ -649,8 +656,10 @@ export interface ProjectMemory {
 export interface ExecutionEvent {
   type: 'iteration_start' | 'tool_start' | 'tool_result' | 'llm_thinking' | 'iteration_end' | 'activity' | 'index_search' | 'index_build'
   timestamp: number
+  ts?: number          // Unix epoch from backend (seconds)
   iteration?: number
   subtask?: string
+  sub_task_id?: string
   name?: string
   args_summary?: string
   result_preview?: string
@@ -662,6 +671,11 @@ export interface ExecutionEvent {
   tool_index?: number
   total_tools?: number
   message?: string
+  // File/tool detail fields
+  file_path?: string
+  pattern?: string
+  command?: string
+  error?: boolean
   // Index event fields
   query?: string
   results_count?: number

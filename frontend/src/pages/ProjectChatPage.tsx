@@ -303,6 +303,32 @@ export default function ProjectChatPage() {
     }
   }
 
+  const handleAcceptPlan = async () => {
+    if (!projectId || !activeSessionId || sending) return
+    setSending(true)
+    try {
+      const result = await projectChat.sessions.acceptPlan(projectId, activeSessionId)
+      setMessages((prev) => [...prev, result.user_message, result.assistant_message])
+      // Update session plan_mode
+      setSessions((prev) =>
+        prev.map((s) => (s.id === activeSessionId ? { ...s, plan_mode: false } : s))
+      )
+      loadSessions()
+    } catch (err) {
+      const errorMsg: ProjectChatMessage = {
+        id: `error-${Date.now()}`,
+        project_id: projectId,
+        user_id: '',
+        role: 'system',
+        content: `Error: ${err instanceof Error ? err.message : 'Failed to accept plan'}`,
+        created_at: new Date().toISOString(),
+      }
+      setMessages((prev) => [...prev, errorMsg])
+    } finally {
+      setSending(false)
+    }
+  }
+
   const handleInject = async () => {
     if (!input.trim() || !projectId || !activeSessionId) return
     const content = input.trim()
@@ -571,6 +597,9 @@ export default function ProjectChatPage() {
                           : 'bg-gray-900 border border-gray-800 text-gray-300'
                     }`}
                   >
+                    <div className={`text-[10px] mb-1 font-mono ${msg.role === 'user' ? 'text-indigo-300/50' : 'text-gray-600'}`}>
+                      {new Date(msg.created_at).toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit' })}
+                    </div>
                     {msg.role === 'assistant' ? (
                       <div className="space-y-2">
                         <RenderMarkdown content={msg.content} />
@@ -606,7 +635,7 @@ export default function ProjectChatPage() {
                                 parseMeta(m)?.action === 'plan_accepted' &&
                                 m.created_at > msg.created_at
                             )}
-                            onAccept={() => handleSend('approve')}
+                            onAccept={handleAcceptPlan}
                             onReject={(fb) => handleSend(fb)}
                             disabled={sending}
                           />
@@ -687,7 +716,7 @@ export default function ProjectChatPage() {
                             ) : (
                               <div className="flex items-center gap-2">
                                 <button
-                                  onClick={() => handleSend('Looks good, go ahead and create the tasks.')}
+                                  onClick={handleAcceptPlan}
                                   className="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-500 rounded-lg text-xs font-medium text-white transition-colors"
                                 >
                                   Create Tasks

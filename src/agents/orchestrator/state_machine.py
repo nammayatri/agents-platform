@@ -148,7 +148,9 @@ async def transition_subtask(
     if not validate_subtask_transition(current, target_status):
         raise ValueError(f"Invalid sub-task transition: {current} -> {target_status}")
 
-    completed_at = datetime.now(timezone.utc) if target_status == "completed" else None
+    now = datetime.now(timezone.utc)
+    completed_at = now if target_status == "completed" else None
+    started_at = now if target_status == "running" else None
 
     updated = await db.fetchrow(
         """
@@ -159,8 +161,9 @@ async def transition_subtask(
             output_result = COALESCE($5::jsonb, output_result),
             error_message = COALESCE($6, error_message),
             completed_at = COALESCE($7, completed_at),
+            started_at = COALESCE($8, started_at),
             updated_at = NOW()
-        WHERE id = $1 AND status = $8
+        WHERE id = $1 AND status = $9
         RETURNING *
         """,
         subtask_id,
@@ -170,6 +173,7 @@ async def transition_subtask(
         json.dumps(output_result) if output_result else None,
         error_message,
         completed_at,
+        started_at,
         current,
     )
 

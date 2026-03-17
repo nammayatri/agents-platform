@@ -278,27 +278,43 @@ async def run_tool_loop(
 
             # Fire structured tool_start event
             if on_tool_event:
-                await on_tool_event({
+                start_event: dict = {
                     "type": "tool_start",
                     "name": tc_name,
                     "args_summary": _tool_activity_summary(tc_name, tc_args),
                     "tool_index": tool_idx + 1,
                     "total_tools": total_tools,
-                })
+                }
+                # Attach file_path for file-based tools
+                _fp = tc_args.get("path", "")
+                if _fp and tc_name in ("read_file", "write_file", "edit_file"):
+                    start_event["file_path"] = _fp
+                elif tc_name == "search_files":
+                    start_event["pattern"] = tc_args.get("pattern", "")
+                elif tc_name == "run_command":
+                    start_event["command"] = tc_args.get("command", "")[:200]
+                await on_tool_event(start_event)
 
             result_text = await tool_executor(tc_name, tc_args)
-            result_preview = (result_text[:200] + "...") if len(result_text) > 200 else result_text
-            logger.debug("tool_loop: round %d — %s result (%d chars): %s", loop_count, tc_name, len(result_text), result_preview)
+            result_preview = _smart_result_preview(tc_name, result_text)
+            logger.debug("tool_loop: round %d — %s result (%d chars): %s", loop_count, tc_name, len(result_text), result_preview[:200])
             tool_results.append({"tool_use_id": tc["id"], "content": result_text})
 
             # Fire structured tool_result event
             if on_tool_event:
-                await on_tool_event({
+                result_event: dict = {
                     "type": "tool_result",
                     "name": tc_name,
                     "result_preview": result_preview,
                     "chars": len(result_text),
-                })
+                }
+                # Carry file_path through for result events too
+                _fp = tc_args.get("path", "")
+                if _fp and tc_name in ("read_file", "write_file", "edit_file"):
+                    result_event["file_path"] = _fp
+                if tc_name == "tool_result" or (result_text and "error" in result_text[:50].lower()):
+                    result_event["error"] = True
+                await on_tool_event(result_event)
 
         messages.append(LLMMessage(role="user", content="", tool_results=tool_results))
 
@@ -386,6 +402,55 @@ async def run_tool_loop(
     }
 
     return content, response
+
+
+def _smart_result_preview(tool_name: str, result_text: str, max_len: int = 500) -> str:
+    """Generate a smarter preview of tool results based on tool type."""
+    if not result_text:
+        return ""
+
+    # For file reads, show more content (useful for review)
+    if tool_name == "read_file":
+        lines = result_text.split("\n")
+        preview = f"({len(lines)} lines) "
+        preview += result_text[:max_len]
+        if len(result_text) > max_len:
+            preview += "..."
+        return preview
+
+    # For search results, show match count + first matches
+    if tool_name == "search_files":
+        lines = result_text.strip().split("\n")
+        match_count = len([l for l in lines if l.strip() and not l.startswith("Search")])
+        preview = f"({match_count} matches) "
+        preview += result_text[:max_len]
+        if len(result_text) > max_len:
+            preview += "..."
+        return preview
+
+    # For write_file, show success/failure concisely
+    if tool_name == "write_file":
+        if "error" in result_text.lower()[:100]:
+            return result_text[:max_len]
+        return result_text[:200]
+
+    # For run_command, try to parse exit code
+    if tool_name == "run_command":
+        try:
+            data = _json.loads(result_text)
+            exit_code = data.get("exit_code", "?")
+            output = data.get("output", "")
+            preview = f"(exit {exit_code}) {output[:max_len - 20]}"
+            if len(output) > max_len - 20:
+                preview += "..."
+            return preview
+        except Exception:
+            pass
+
+    # Default: first N chars
+    if len(result_text) > max_len:
+        return result_text[:max_len] + "..."
+    return result_text
 
 
 def _tool_activity_summary(name: str, args: dict) -> str:

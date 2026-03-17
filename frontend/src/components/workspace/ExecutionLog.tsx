@@ -4,8 +4,10 @@ import { ChevronDown, ChevronRight, Terminal, Wrench, Brain, CheckCircle, XCircl
 export interface ExecutionEvent {
   type: 'iteration_start' | 'tool_start' | 'tool_result' | 'llm_thinking' | 'iteration_end' | 'activity' | 'index_search' | 'index_build'
   timestamp: number
+  ts?: number
   iteration?: number
   subtask?: string
+  sub_task_id?: string
   name?: string
   args_summary?: string
   result_preview?: string
@@ -17,7 +19,10 @@ export interface ExecutionEvent {
   tool_index?: number
   total_tools?: number
   message?: string
-  // Index event fields
+  file_path?: string
+  pattern?: string
+  command?: string
+  error?: boolean
   query?: string
   results_count?: number
   top_score?: number
@@ -119,6 +124,17 @@ export default function ExecutionLog({ events, maxHeight = '500px' }: Props) {
 }
 
 
+function fmtTime(ts?: number, timestamp?: number): string {
+  const t = ts ? ts * 1000 : timestamp
+  if (!t) return ''
+  const d = new Date(t)
+  return d.toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' })
+}
+
+function basename(path: string): string {
+  return path.split('/').pop() || path
+}
+
 function EventRow({
   event,
   index: _index,
@@ -133,10 +149,12 @@ function EventRow({
   onToggle: () => void
 }) {
   const hasDetails = event.type === 'tool_result' || event.type === 'tool_start'
+  const timeStr = fmtTime(event.ts, event.timestamp)
 
   if (event.type === 'iteration_start') {
     return (
       <div className="flex items-center gap-2 px-3 py-1.5 bg-indigo-500/5 border-b border-gray-800/50 text-indigo-400">
+        {timeStr && <span className="text-gray-700 text-[10px] font-mono shrink-0">{timeStr}</span>}
         <Play className="w-3 h-3" />
         <span>Iteration {event.iteration}</span>
         {event.subtask && <span className="text-gray-500">— {event.subtask}</span>}
@@ -148,6 +166,7 @@ function EventRow({
     const passed = event.status === 'passed'
     return (
       <div className={`flex items-center gap-2 px-3 py-1.5 border-b border-gray-800/50 ${passed ? 'text-emerald-400 bg-emerald-500/5' : 'text-red-400 bg-red-500/5'}`}>
+        {timeStr && <span className="text-gray-700 text-[10px] font-mono shrink-0">{timeStr}</span>}
         {passed ? <CheckCircle className="w-3 h-3" /> : <XCircle className="w-3 h-3" />}
         <span>Iteration {event.iteration} — {event.status}</span>
       </div>
@@ -155,11 +174,13 @@ function EventRow({
   }
 
   if (event.type === 'tool_start') {
+    const fileHint = event.file_path ? basename(event.file_path) : ''
     if (compact) {
       return (
         <div className="flex items-center gap-2 px-3 py-0.5 text-blue-400 border-b border-gray-900/50">
+          {timeStr && <span className="text-gray-700 text-[10px] font-mono shrink-0">{timeStr}</span>}
           <Wrench className="w-3 h-3 flex-shrink-0" />
-          <span className="truncate">{event.name}</span>
+          <span className="truncate">{event.name}{fileHint ? `: ${fileHint}` : ''}</span>
           {event.total_tools && event.total_tools > 1 && (
             <span className="text-gray-600">({event.tool_index}/{event.total_tools})</span>
           )}
@@ -172,19 +193,24 @@ function EventRow({
           className="flex items-center gap-2 px-3 py-1 text-blue-400 cursor-pointer hover:bg-gray-900/30"
           onClick={onToggle}
         >
+          {timeStr && <span className="text-gray-700 text-[10px] font-mono shrink-0">{timeStr}</span>}
           {hasDetails ? (
             expanded ? <ChevronDown className="w-3 h-3 flex-shrink-0" /> : <ChevronRight className="w-3 h-3 flex-shrink-0" />
           ) : (
             <Wrench className="w-3 h-3 flex-shrink-0" />
           )}
           <span>{event.name}</span>
+          {fileHint && <span className="text-gray-500 font-mono text-[11px]">{fileHint}</span>}
           {event.total_tools && event.total_tools > 1 && (
             <span className="text-gray-600">({event.tool_index}/{event.total_tools})</span>
           )}
         </div>
-        {expanded && event.args_summary && (
-          <div className="px-6 py-1 text-gray-500 whitespace-pre-wrap bg-gray-900/30">
-            {event.args_summary}
+        {expanded && (
+          <div className="px-6 py-1 text-gray-500 whitespace-pre-wrap bg-gray-900/30 text-[11px]">
+            {event.file_path && <div className="text-gray-400 font-mono mb-0.5">{event.file_path}</div>}
+            {event.command && <div className="text-gray-400 font-mono mb-0.5">$ {event.command}</div>}
+            {event.pattern && <div className="text-gray-400 mb-0.5">pattern: {event.pattern}</div>}
+            {event.args_summary && <div>{event.args_summary}</div>}
           </div>
         )}
       </div>
@@ -192,27 +218,31 @@ function EventRow({
   }
 
   if (event.type === 'tool_result') {
+    const fileHint = event.file_path ? basename(event.file_path) : ''
     if (compact) {
       return (
-        <div className="flex items-center gap-2 px-3 py-0.5 text-gray-500 border-b border-gray-900/50">
+        <div className={`flex items-center gap-2 px-3 py-0.5 border-b border-gray-900/50 ${event.error ? 'text-red-400/70' : 'text-gray-500'}`}>
+          {timeStr && <span className="text-gray-700 text-[10px] font-mono shrink-0">{timeStr}</span>}
           <span className="text-gray-600">↳</span>
-          <span className="truncate">{event.name}: {event.chars?.toLocaleString()} chars</span>
+          <span className="truncate">{event.name}{fileHint ? `: ${fileHint}` : ''} ({event.chars?.toLocaleString()} chars)</span>
         </div>
       )
     }
     return (
       <div className="border-b border-gray-900/50">
         <div
-          className="flex items-center gap-2 px-3 py-1 text-gray-400 cursor-pointer hover:bg-gray-900/30"
+          className={`flex items-center gap-2 px-3 py-1 cursor-pointer hover:bg-gray-900/30 ${event.error ? 'text-red-400/70' : 'text-gray-400'}`}
           onClick={onToggle}
         >
+          {timeStr && <span className="text-gray-700 text-[10px] font-mono shrink-0">{timeStr}</span>}
           {expanded ? <ChevronDown className="w-3 h-3 flex-shrink-0 text-gray-600" /> : <ChevronRight className="w-3 h-3 flex-shrink-0 text-gray-600" />}
           <span className="text-gray-600">↳</span>
           <span>{event.name} result</span>
+          {fileHint && <span className="text-gray-500 font-mono text-[11px]">{fileHint}</span>}
           <span className="text-gray-600">({event.chars?.toLocaleString()} chars)</span>
         </div>
         {expanded && event.result_preview && (
-          <div className="px-6 py-1 text-gray-500 whitespace-pre-wrap bg-gray-900/30 max-h-40 overflow-y-auto">
+          <div className="px-6 py-1 text-gray-500 whitespace-pre-wrap bg-gray-900/30 max-h-60 overflow-y-auto text-[11px]">
             {event.result_preview}
           </div>
         )}
@@ -223,6 +253,7 @@ function EventRow({
   if (event.type === 'llm_thinking') {
     return (
       <div className="flex items-center gap-2 px-3 py-1 text-indigo-400/60 border-b border-gray-900/50">
+        {timeStr && <span className="text-gray-700 text-[10px] font-mono shrink-0">{timeStr}</span>}
         <Brain className="w-3 h-3 flex-shrink-0" />
         <span>LLM response</span>
         <span className="text-gray-600">
@@ -237,6 +268,7 @@ function EventRow({
     const sourceLabel = event.source === 'cache' ? 'cached' : event.source === 'disk' ? 'from disk' : event.source === 'cold_build' ? 'cold build' : event.source || ''
     return (
       <div className="flex items-center gap-2 px-3 py-1 text-cyan-400/80 border-b border-gray-900/50">
+        {timeStr && <span className="text-gray-700 text-[10px] font-mono shrink-0">{timeStr}</span>}
         <Search className="w-3 h-3 flex-shrink-0" />
         <span className="truncate">Semantic search: &quot;{event.query}&quot;</span>
         <span className="text-gray-600 flex-shrink-0">
@@ -249,6 +281,7 @@ function EventRow({
   if (event.type === 'index_build') {
     return (
       <div className="flex items-center gap-2 px-3 py-1 text-emerald-400/70 border-b border-gray-900/50">
+        {timeStr && <span className="text-gray-700 text-[10px] font-mono shrink-0">{timeStr}</span>}
         <Database className="w-3 h-3 flex-shrink-0" />
         <span>Code index built</span>
         <span className="text-gray-600">

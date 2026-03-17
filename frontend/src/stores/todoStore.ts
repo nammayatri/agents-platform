@@ -83,6 +83,26 @@ export const useTodoStore = create<TodoState>((set, get) => ({
 
   fetchTodo: async (todoId) => {
     const item = await todosApi.get(todoId) as TodoItem
+    // Seed execution events from persisted subtask data (for completed tasks or page refreshes)
+    const { executionEvents } = get()
+    const existing = executionEvents[todoId] || []
+    if (existing.length === 0 && item.sub_tasks) {
+      const persisted: ExecutionEvent[] = []
+      for (const st of item.sub_tasks) {
+        if (st.execution_events && st.execution_events.length > 0) {
+          persisted.push(...st.execution_events)
+        }
+      }
+      if (persisted.length > 0) {
+        // Sort by backend timestamp
+        persisted.sort((a, b) => (a.ts || 0) - (b.ts || 0))
+        set({
+          todos: { ...get().todos, [todoId]: item },
+          executionEvents: { ...get().executionEvents, [todoId]: persisted },
+        })
+        return
+      }
+    }
     set({ todos: { ...get().todos, [todoId]: item } })
   },
 

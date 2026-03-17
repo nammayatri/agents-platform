@@ -186,16 +186,52 @@ async def workspace_git_status(todo_id: str, user: CurrentUser, db: DB):
 async def workspace_git_diff(
     todo_id: str, user: CurrentUser, db: DB,
     staged: bool = Query(False, description="Show staged diff"),
+    path: str = Query(None, description="Optional file path for per-file diff"),
 ):
-    """Get git diff for the task workspace."""
+    """Get git diff for the task workspace.
+
+    When `path` is provided, returns the diff for that single file only.
+    For untracked files (`??` status), returns a synthetic diff showing the
+    full file content as additions.
+    """
     repo_dir, _ = await _resolve_task_repo(todo_id, user, db)
 
     args = ["diff"]
     if staged:
         args.append("--cached")
 
+    if path:
+        # Validate the path doesn't escape the workspace
+        if ".." in path:
+            raise HTTPException(status_code=400, detail="Path traversal not allowed")
+        args.append("--")
+        args.append(path)
+
     rc, diff = await run_git_command(*args, cwd=repo_dir)
     _, stats = await run_git_command(*args, "--stat", cwd=repo_dir)
+
+    # For untracked files, git diff returns nothing — synthesize a diff
+    if path and rc == 0 and not diff.strip():
+        full_path = os.path.join(repo_dir, path)
+        if os.path.isfile(full_path) and not is_binary(path):
+            try:
+                with open(full_path, "r", errors="replace") as f:
+                    content = f.read(MAX_FILE_SIZE)
+                lines = content.split("\n")
+                # Build a synthetic unified diff
+                diff_lines = [
+                    f"diff --git a/{path} b/{path}",
+                    "new file mode 100644",
+                    "--- /dev/null",
+                    f"+++ b/{path}",
+                    f"@@ -0,0 +1,{len(lines)} @@",
+                ]
+                for line in lines:
+                    diff_lines.append(f"+{line}")
+                diff = "\n".join(diff_lines)
+                stats = f" {path} | {len(lines)} {'+'*min(len(lines), 40)}"
+            except Exception:
+                pass
 
     return {
         "diff": diff if rc == 0 else "",

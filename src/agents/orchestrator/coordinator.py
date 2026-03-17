@@ -1990,6 +1990,7 @@ class AgentCoordinator:
         )
 
         iteration_log: list[dict] = []
+        _accumulated_events: list[dict] = []  # Collect tool events for persistence
         unstuck_advice: str | None = None
         agent_signaled_done = False
         agent_done_summary: str | None = None
@@ -2012,11 +2013,47 @@ class AgentCoordinator:
         # Load architect/editor config for this project
         _ae_project = await self.db.fetchrow(
             "SELECT architect_editor_enabled, architect_model, editor_model FROM projects WHERE id = $1",
-            (await self._load_todo())["project_id"],
+            todo_for_agent["project_id"],
         )
         architect_editor_enabled = bool(_ae_project and _ae_project.get("architect_editor_enabled"))
         architect_model = (_ae_project or {}).get("architect_model")
         editor_model = (_ae_project or {}).get("editor_model")
+
+        # ── Pre-resolve tools ONCE (avoid repeated DB queries per iteration) ──
+        _project_id = str(todo_for_agent["project_id"])
+        _creator_id = str(todo_for_agent["creator_id"])
+        _cached_mcp_tools = await self.tools_registry.resolve_tools(
+            project_id=_project_id, user_id=_creator_id,
+        )
+        _cached_skills_ctx = await self.tools_registry.build_skills_context(
+            project_id=_project_id, user_id=_creator_id,
+        )
+        # Filter per-agent tool allowlist
+        if agent_config and agent_config.get("tools_enabled"):
+            _allowed = set(agent_config["tools_enabled"])
+            if _cached_mcp_tools:
+                _cached_mcp_tools = [t for t in _cached_mcp_tools if t.get("name") in _allowed]
+
+        # Merge built-in workspace tools with MCP tools
+        _cached_all_tools: list[dict] | None = None
+        if workspace_path:
+            builtin_tools = self._get_builtin_tools(workspace_path, role)
+            _task_idx = os.path.join(workspace_path, ".agent_index")
+            for bt in builtin_tools:
+                if bt["name"] == "semantic_search":
+                    bt["_index_dir"] = _task_idx
+            if _cached_mcp_tools:
+                existing_names = {t["name"] for t in _cached_mcp_tools}
+                _cached_all_tools = list(_cached_mcp_tools) + [
+                    t for t in builtin_tools if t["name"] not in existing_names
+                ]
+            else:
+                _cached_all_tools = builtin_tools
+        elif _cached_mcp_tools:
+            _cached_all_tools = _cached_mcp_tools
+
+        # Cache repo map text across iterations (generated once on first iteration)
+        _cached_repo_map: str | None = None
 
         for iteration in range(1, max_iterations + 1):
             # Check for cancellation at the start of each iteration
@@ -2029,15 +2066,19 @@ class AgentCoordinator:
 
             # Emit iteration_start event for streaming visibility
             try:
+                _iter_start_evt = {
+                    "type": "iteration_start",
+                    "sub_task_id": st_id,
+                    "iteration": iteration,
+                    "subtask": sub_task["title"],
+                    "ts": time.time(),
+                }
                 await self.redis.publish(
                     f"task:{self.todo_id}:events",
-                    json.dumps({
-                        "type": "iteration_start",
-                        "sub_task_id": st_id,
-                        "iteration": iteration,
-                        "subtask": sub_task["title"],
-                    }),
+                    json.dumps(_iter_start_evt),
                 )
+                if len(_accumulated_events) < 2000:
+                    _accumulated_events.append(_iter_start_evt)
             except Exception:
                 pass
 
@@ -2064,7 +2105,7 @@ class AgentCoordinator:
                 )
 
                 # 1. Build FRESH context (no carried conversation)
-                context = await self._build_iteration_context(
+                context, _cached_repo_map = await self._build_iteration_context(
                     sub_task=sub_task,
                     iteration=iteration,
                     iteration_log=iteration_log,
@@ -2072,42 +2113,15 @@ class AgentCoordinator:
                     work_rules=role_rules,
                     unstuck_advice=unstuck_advice,
                     agent_config=agent_config,
+                    cached_repo_map=_cached_repo_map,
                 )
 
-                # Resolve MCP tools
-                todo = await self._load_todo()
-                mcp_tools = await self.tools_registry.resolve_tools(
-                    project_id=str(todo["project_id"]),
-                    user_id=str(todo["creator_id"]),
-                )
-                skills_ctx = await self.tools_registry.build_skills_context(
-                    project_id=str(todo["project_id"]),
-                    user_id=str(todo["creator_id"]),
-                )
-
-                # Filter tools per-agent
-                if agent_config and agent_config.get("tools_enabled"):
-                    allowed = set(agent_config["tools_enabled"])
-                    if mcp_tools:
-                        mcp_tools = [t for t in mcp_tools if t.get("name") in allowed]
-
-                # Ensure agents always have workspace tools (built-in fallback)
-                if workspace_path:
-                    builtin_tools = self._get_builtin_tools(workspace_path, role)
-                    # Inject task-local index directory for semantic_search
-                    _task_idx = os.path.join(workspace_path, ".agent_index")
-                    for bt in builtin_tools:
-                        if bt["name"] == "semantic_search":
-                            bt["_index_dir"] = _task_idx
-                    if mcp_tools:
-                        existing_names = {t["name"] for t in mcp_tools}
-                        mcp_tools.extend(t for t in builtin_tools if t["name"] not in existing_names)
-                    else:
-                        mcp_tools = builtin_tools
+                # Use pre-resolved tools (cached before the loop)
+                mcp_tools = _cached_all_tools
 
                 system_prompt = context["system"]
-                if skills_ctx:
-                    system_prompt += skills_ctx
+                if _cached_skills_ctx:
+                    system_prompt += _cached_skills_ctx
 
                 # 2. Execute single iteration (one LLM call + tool loop)
                 messages = [
@@ -2154,10 +2168,14 @@ class AgentCoordinator:
                     """Publish structured tool events for streaming execution visibility."""
                     try:
                         event["sub_task_id"] = st_id
+                        event["ts"] = time.time()
                         await self.redis.publish(
                             f"task:{self.todo_id}:events",
                             json.dumps(event),
                         )
+                        # Accumulate for DB persistence (cap at 2000 events)
+                        if len(_accumulated_events) < 2000:
+                            _accumulated_events.append(event)
                         # Publish extra index_search event when semantic_search completes
                         if event.get("type") == "tool_result" and event.get("name") == "semantic_search":
                             try:
@@ -2165,14 +2183,18 @@ class AgentCoordinator:
                                 _idx_dir = os.path.join(workspace_path, ".agent_index")
                                 search_meta = pop_last_search_meta(_idx_dir)
                                 if search_meta:
+                                    idx_event = {
+                                        "type": "index_search",
+                                        "sub_task_id": st_id,
+                                        "ts": time.time(),
+                                        **search_meta,
+                                    }
                                     await self.redis.publish(
                                         f"task:{self.todo_id}:events",
-                                        json.dumps({
-                                            "type": "index_search",
-                                            "sub_task_id": st_id,
-                                            **search_meta,
-                                        }),
+                                        json.dumps(idx_event),
                                     )
+                                    if len(_accumulated_events) < 2000:
+                                        _accumulated_events.append(idx_event)
                             except Exception:
                                 pass
                     except Exception:
@@ -2351,15 +2373,19 @@ class AgentCoordinator:
 
                 # Emit iteration_end event for streaming visibility
                 try:
+                    _iter_end_evt = {
+                        "type": "iteration_end",
+                        "sub_task_id": st_id,
+                        "iteration": iteration,
+                        "status": "passed" if qc_result["passed"] else qc_result.get("reason", "failed"),
+                        "ts": time.time(),
+                    }
                     await self.redis.publish(
                         f"task:{self.todo_id}:events",
-                        json.dumps({
-                            "type": "iteration_end",
-                            "sub_task_id": st_id,
-                            "iteration": iteration,
-                            "status": "passed" if qc_result["passed"] else qc_result.get("reason", "failed"),
-                        }),
+                        json.dumps(_iter_end_evt),
                     )
+                    if len(_accumulated_events) < 2000:
+                        _accumulated_events.append(_iter_end_evt)
                 except Exception:
                     pass
 
@@ -2408,6 +2434,7 @@ class AgentCoordinator:
                     await self._append_progress_log(
                         sub_task, iteration, "completed", iteration_log,
                     )
+                    await self._persist_execution_events(st_id, _accumulated_events)
                     await self._report_progress(st_id, 100, f"Completed: {sub_task['title']}")
                     return
 
@@ -2479,6 +2506,7 @@ class AgentCoordinator:
                     await self._append_progress_log(
                         sub_task, iteration, "completed_agent_signal", iteration_log,
                     )
+                    await self._persist_execution_events(st_id, _accumulated_events)
                     await self._report_progress(st_id, 100, f"Completed: {sub_task['title']}")
                     return
 
@@ -2561,6 +2589,7 @@ class AgentCoordinator:
         await self._append_progress_log(
             sub_task, max_iterations, "failed_max_iterations", iteration_log,
         )
+        await self._persist_execution_events(st_id, _accumulated_events)
         await self._transition_subtask(
             st_id, "failed",
             error_message=f"Max iterations ({max_iterations}) reached without passing quality checks",
@@ -2575,8 +2604,12 @@ class AgentCoordinator:
         work_rules: dict,
         unstuck_advice: str | None = None,
         agent_config: dict | None = None,
-    ) -> dict:
-        """Build completely fresh context for one RALPH iteration."""
+        cached_repo_map: str | None = None,
+    ) -> tuple[dict, str | None]:
+        """Build completely fresh context for one RALPH iteration.
+
+        Returns (context_dict, repo_map_text) — repo_map_text is returned so
+        callers can cache it across iterations instead of regenerating."""
         todo = await self._load_todo()
         previous_results = await self._get_completed_results()
         intake = safe_json(todo.get("intake_data"))
@@ -2673,8 +2706,9 @@ class AgentCoordinator:
             "This stops the iteration loop. Do NOT keep working after you are done."
         )
 
-        # ── Repo Map (tree-sitter + PageRank) ──
-        if workspace_path:
+        # ── Repo Map (tree-sitter + PageRank) — cached across iterations ──
+        repo_map_text = cached_repo_map
+        if workspace_path and repo_map_text is None:
             try:
                 from agents.indexing.indexer import RepoIndexer
                 from agents.indexing.repo_map import render_repo_map
@@ -2682,26 +2716,26 @@ class AgentCoordinator:
 
                 repo_dir_for_map = os.path.join(workspace_path, "repo")
                 if os.path.isdir(repo_dir_for_map):
-                    # Use task-local index directory
                     _subtask_idx = os.path.join(workspace_path, ".agent_index")
                     indexer = RepoIndexer()
                     graph = indexer.index(repo_dir_for_map, cache_dir=_subtask_idx)
                     if graph.symbol_count > 0:
                         repo_map_budget = settings.repo_map_token_budget
-                        repo_map = render_repo_map(
+                        repo_map_text = render_repo_map(
                             graph,
                             token_budget=repo_map_budget,
                             count_tokens_fn=lambda t: count_tokens(t, "default"),
                         )
-                        system += f"\n\n## Repository Symbol Map\n{repo_map}\n"
                         logger.info(
-                            "[%s] Injected repo map: %d symbols, %d files",
+                            "[%s] Generated repo map: %d symbols, %d files",
                             self.todo_id[:8], graph.symbol_count, graph.file_count,
                         )
             except ImportError:
                 logger.debug("[%s] tree-sitter indexing not available", self.todo_id[:8])
             except Exception:
                 logger.debug("[%s] Repo map generation failed", self.todo_id[:8], exc_info=True)
+        if repo_map_text:
+            system += f"\n\n## Repository Symbol Map\n{repo_map_text}\n"
 
         # ── Project Memories ──
         try:
@@ -2803,7 +2837,7 @@ class AgentCoordinator:
             f"{prev_context}"
         )
 
-        return {"system": system, "user": user_content}
+        return {"system": system, "user": user_content}, repo_map_text
 
     async def _run_quality_checks(
         self, workspace_path: str, work_rules: dict, agent_role: str,
@@ -2919,6 +2953,18 @@ class AgentCoordinator:
             self.todo_id,
             [record],
         )
+
+    async def _persist_execution_events(self, subtask_id: str, events: list[dict]) -> None:
+        """Save accumulated execution events to the sub_tasks table."""
+        if not events:
+            return
+        try:
+            await self.db.execute(
+                "UPDATE sub_tasks SET execution_events = $2::jsonb WHERE id = $1",
+                subtask_id, json.dumps(events),
+            )
+        except Exception:
+            logger.debug("[%s] Failed to persist execution events for %s", self.todo_id[:8], subtask_id[:8], exc_info=True)
 
     # ---- REVIEW-MERGE LOOP ----
 

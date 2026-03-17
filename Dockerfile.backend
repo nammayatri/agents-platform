@@ -17,18 +17,13 @@ RUN pip install --no-cache-dir \
 # Install the package with optional extras
 RUN pip install --no-cache-dir ".[embeddings,treesitter-grammars]"
 
-# Strip heavy test/debug files from installed packages to slim down the image
+# Strip test dirs, caches, and NVIDIA stubs from installed packages
 RUN find /usr/local/lib/python3.12/site-packages \
     \( -name "tests" -o -name "test" -o -name "__pycache__" \
        -o -name "*.pyc" -o -name "*.pyo" \) \
     -type d -exec rm -rf {} + 2>/dev/null; \
-    # Remove NVIDIA/CUDA stubs that sneak in via torch dependencies
     rm -rf /usr/local/lib/python3.12/site-packages/nvidia \
            /usr/local/lib/python3.12/site-packages/torch/test \
-           /usr/local/lib/python3.12/site-packages/torch/_inductor \
-           /usr/local/lib/python3.12/site-packages/torch/_dynamo \
-           /usr/local/lib/python3.12/site-packages/torch/_functorch \
-           /usr/local/lib/python3.12/site-packages/torch/_export \
     ; exit 0
 
 # ── Stage 2: Slim runtime ───────────────────────────────────────

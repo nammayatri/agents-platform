@@ -195,8 +195,13 @@ export const todos = {
       }),
     gitStatus: (todoId: string) =>
       request<GitStatus>(`/todos/${todoId}/workspace/git/status`),
-    gitDiff: (todoId: string, staged?: boolean) =>
-      request<{ diff: string; stats: string }>(`/todos/${todoId}/workspace/git/diff${staged ? '?staged=true' : ''}`),
+    gitDiff: (todoId: string, staged?: boolean, path?: string) => {
+      const params = new URLSearchParams()
+      if (staged) params.set('staged', 'true')
+      if (path) params.set('path', path)
+      const qs = params.toString()
+      return request<{ diff: string; stats: string }>(`/todos/${todoId}/workspace/git/diff${qs ? `?${qs}` : ''}`)
+    },
     gitAdd: (todoId: string, paths: string[]) =>
       request<GitStatus>(`/todos/${todoId}/workspace/git/add`, {
         method: 'POST',
@@ -269,6 +274,11 @@ export const projectChat = {
       }),
     delete: (projectId: string, sessionId: string) =>
       request<void>(`/projects/${projectId}/chat/sessions/${sessionId}`, { method: 'DELETE' }),
+    acceptPlan: (projectId: string, sessionId: string) =>
+      request<{ user_message: ProjectChatMessage; assistant_message: ProjectChatMessage }>(
+        `/projects/${projectId}/chat/sessions/${sessionId}/accept-plan`,
+        { method: 'POST' },
+      ),
   },
   sendInSession: (projectId: string, sessionId: string, content: string, intent?: string, model?: string) =>
     request<{ user_message: ProjectChatMessage; assistant_message: ProjectChatMessage }>(

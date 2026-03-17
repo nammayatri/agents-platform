@@ -1,13 +1,15 @@
-import { useState } from 'react'
-import { Plus, Minus, GitCommitHorizontal, Upload, ChevronDown, ChevronRight } from 'lucide-react'
+import { useState, useCallback } from 'react'
+import { Plus, Minus, GitCommitHorizontal, Upload, ChevronDown, ChevronRight, Diff, Loader2 } from 'lucide-react'
 import { todos } from '../../services/api'
 import type { GitStatus, GitFileStatus } from '../../types'
+import DiffViewer from '../DiffViewer'
 
 interface Props {
   todoId: string
   gitStatus: GitStatus
   onRefresh: () => void
   onFileClick: (path: string) => void
+  onDiffClick: (path: string, staged: boolean) => void
   collapsed: boolean
   onToggle: () => void
 }
@@ -28,16 +30,55 @@ function StatusBadge({ status }: { status: string }) {
   )
 }
 
-export default function GitPanel({ todoId, gitStatus, onRefresh, onFileClick, collapsed, onToggle }: Props) {
+interface InlineDiffState {
+  loading: boolean
+  diff: string
+  stats: string
+  error: string
+}
+
+export default function GitPanel({ todoId, gitStatus, onRefresh, onFileClick, onDiffClick, collapsed, onToggle }: Props) {
   const [commitMsg, setCommitMsg] = useState('')
   const [committing, setCommitting] = useState(false)
   const [pushing, setPushing] = useState(false)
   const [error, setError] = useState('')
   const [success, setSuccess] = useState('')
+  const [expandedDiffs, setExpandedDiffs] = useState<Set<string>>(new Set())
+  const [diffCache, setDiffCache] = useState<Record<string, InlineDiffState>>({})
 
   const staged = gitStatus.files.filter(f => f.staged)
   const unstaged = gitStatus.files.filter(f => !f.staged)
   const changeCount = gitStatus.files.length
+
+  const toggleInlineDiff = useCallback(async (path: string, isStagedFile: boolean) => {
+    const key = `${isStagedFile ? 'staged' : 'unstaged'}:${path}`
+    setExpandedDiffs(prev => {
+      const next = new Set(prev)
+      if (next.has(key)) {
+        next.delete(key)
+      } else {
+        next.add(key)
+      }
+      return next
+    })
+
+    // Fetch diff if not cached
+    if (!diffCache[key] || diffCache[key].error) {
+      setDiffCache(prev => ({ ...prev, [key]: { loading: true, diff: '', stats: '', error: '' } }))
+      try {
+        const result = await todos.workspace.gitDiff(todoId, isStagedFile, path)
+        setDiffCache(prev => ({
+          ...prev,
+          [key]: { loading: false, diff: result.diff, stats: result.stats, error: '' },
+        }))
+      } catch (e) {
+        setDiffCache(prev => ({
+          ...prev,
+          [key]: { loading: false, diff: '', stats: '', error: e instanceof Error ? e.message : 'Failed to load diff' },
+        }))
+      }
+    }
+  }, [todoId, diffCache])
 
   const handleStage = async (paths: string[]) => {
     setError('')
@@ -52,13 +93,7 @@ export default function GitPanel({ todoId, gitStatus, onRefresh, onFileClick, co
   const handleUnstage = async (paths: string[]) => {
     setError('')
     try {
-      // git reset HEAD <paths> to unstage
-      // We don't have a dedicated unstage endpoint, so we use gitAdd with reset behavior
-      // Actually, we need to use git reset. Let's use the add endpoint with "." for stage all
-      // For unstage, we'll implement it as a workaround: stage nothing specific
-      // For now, just refresh — the user can re-stage specific files
-      // TODO: Add a proper unstage endpoint
-      await todos.workspace.gitAdd(todoId, paths) // This re-stages, not unstages
+      await todos.workspace.gitAdd(todoId, paths)
       onRefresh()
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Unstage failed')
@@ -78,6 +113,9 @@ export default function GitPanel({ todoId, gitStatus, onRefresh, onFileClick, co
       const result = await todos.workspace.gitCommit(todoId, commitMsg.trim())
       setSuccess(`Committed: ${result.hash}`)
       setCommitMsg('')
+      // Clear diff cache on commit
+      setDiffCache({})
+      setExpandedDiffs(new Set())
       onRefresh()
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Commit failed')
@@ -103,37 +141,93 @@ export default function GitPanel({ todoId, gitStatus, onRefresh, onFileClick, co
 
   const renderFileList = (files: GitFileStatus[], showStage: boolean) => (
     <div className="space-y-px">
-      {files.map(f => (
-        <div
-          key={f.path}
-          className="flex items-center gap-2 px-2 py-1 hover:bg-gray-800/50 rounded group text-xs"
-        >
-          <StatusBadge status={f.status} />
-          <button
-            onClick={() => onFileClick(f.path)}
-            className="truncate text-gray-400 hover:text-white transition-colors text-left flex-1"
-          >
-            {f.path}
-          </button>
-          {showStage ? (
-            <button
-              onClick={() => handleStage([f.path])}
-              className="opacity-0 group-hover:opacity-100 text-green-500 hover:text-green-400 transition-all"
-              title="Stage"
-            >
-              <Plus className="w-3.5 h-3.5" />
-            </button>
-          ) : (
-            <button
-              onClick={() => handleUnstage([f.path])}
-              className="opacity-0 group-hover:opacity-100 text-red-500 hover:text-red-400 transition-all"
-              title="Unstage"
-            >
-              <Minus className="w-3.5 h-3.5" />
-            </button>
-          )}
-        </div>
-      ))}
+      {files.map(f => {
+        const key = `${showStage ? 'unstaged' : 'staged'}:${f.path}`
+        const isExpanded = expandedDiffs.has(key)
+        const cachedDiff = diffCache[key]
+
+        return (
+          <div key={f.path}>
+            <div className="flex items-center gap-2 px-2 py-1 hover:bg-gray-800/50 rounded group text-xs">
+              <StatusBadge status={f.status} />
+              <button
+                onClick={() => onFileClick(f.path)}
+                className="truncate text-gray-400 hover:text-white transition-colors text-left flex-1"
+              >
+                {f.path}
+              </button>
+              <button
+                onClick={() => onDiffClick(f.path, !showStage)}
+                className="opacity-0 group-hover:opacity-100 text-indigo-400 hover:text-indigo-300 transition-all"
+                title="View diff in editor"
+              >
+                <Diff className="w-3.5 h-3.5" />
+              </button>
+              <button
+                onClick={() => toggleInlineDiff(f.path, !showStage)}
+                className={`transition-all ${
+                  isExpanded
+                    ? 'text-indigo-400 opacity-100'
+                    : 'opacity-0 group-hover:opacity-100 text-gray-500 hover:text-gray-300'
+                }`}
+                title={isExpanded ? 'Collapse diff' : 'Expand diff'}
+              >
+                {isExpanded ? (
+                  <ChevronDown className="w-3.5 h-3.5" />
+                ) : (
+                  <ChevronRight className="w-3.5 h-3.5" />
+                )}
+              </button>
+              {showStage ? (
+                <button
+                  onClick={() => handleStage([f.path])}
+                  className="opacity-0 group-hover:opacity-100 text-green-500 hover:text-green-400 transition-all"
+                  title="Stage"
+                >
+                  <Plus className="w-3.5 h-3.5" />
+                </button>
+              ) : (
+                <button
+                  onClick={() => handleUnstage([f.path])}
+                  className="opacity-0 group-hover:opacity-100 text-red-500 hover:text-red-400 transition-all"
+                  title="Unstage"
+                >
+                  <Minus className="w-3.5 h-3.5" />
+                </button>
+              )}
+            </div>
+
+            {/* Inline diff */}
+            {isExpanded && (
+              <div className="mx-2 mb-1">
+                {cachedDiff?.loading && (
+                  <div className="flex items-center gap-2 px-3 py-2 text-[11px] text-gray-600">
+                    <Loader2 className="w-3 h-3 animate-spin" />
+                    Loading diff...
+                  </div>
+                )}
+                {cachedDiff?.error && (
+                  <div className="px-3 py-2 text-[11px] text-red-400 bg-red-500/5 rounded">
+                    {cachedDiff.error}
+                  </div>
+                )}
+                {cachedDiff && !cachedDiff.loading && !cachedDiff.error && cachedDiff.diff && (
+                  <DiffViewer
+                    diff={cachedDiff.diff}
+                    stats={cachedDiff.stats}
+                    maxHeight="max-h-[300px]"
+                  />
+                )}
+                {cachedDiff && !cachedDiff.loading && !cachedDiff.error && !cachedDiff.diff && (
+                  <div className="px-3 py-2 text-[11px] text-gray-600 text-center border border-dashed border-gray-800 rounded">
+                    No diff available
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+        )
+      })}
     </div>
   )
 

@@ -13,6 +13,7 @@ from pydantic import BaseModel
 
 from agents.api.deps import DB, CurrentUser, EventBusDep, Redis, check_project_access
 from agents.api.routes.project_chat_llm import (
+    create_tasks_from_plan,
     generate_create_task_response,
     generate_debug_response,
     generate_plan_response,
@@ -277,6 +278,65 @@ async def send_session_message(
             "user_message": dict(user_msg),
             "assistant_message": dict(err_msg),
         }
+
+
+@router.post("/projects/{project_id}/chat/sessions/{session_id}/accept-plan")
+async def accept_session_plan(
+    project_id: str, session_id: str, user: CurrentUser, db: DB, event_bus: EventBusDep,
+):
+    """Accept the proposed plan and create tasks directly, bypassing LLM."""
+    session = await _load_session(session_id, project_id, user, db)
+    plan_json = session.get("plan_json")
+    if not plan_json:
+        raise HTTPException(status_code=400, detail="No plan to accept")
+
+    plan_json = safe_json(plan_json) if isinstance(plan_json, str) else plan_json
+
+    created_tasks = await create_tasks_from_plan(
+        project_id=project_id,
+        user_id=str(user["id"]),
+        plan=plan_json,
+        db=db,
+        event_bus=event_bus,
+        session_id=session_id,
+    )
+
+    await db.execute(
+        "UPDATE project_chat_sessions SET plan_mode = FALSE, updated_at = NOW() WHERE id = $1",
+        session_id,
+    )
+
+    task_summary = "\n".join(f"  - {t['title']}" for t in plan_json.get("tasks", []))
+    content = f"**Plan accepted!** Created {len(created_tasks)} tasks:\n{task_summary}"
+
+    metadata = {
+        "action": "plan_accepted",
+        "plan_mode": False,
+        "tasks_created": len(created_tasks),
+        "task_ids": created_tasks,
+    }
+
+    # Store user "approve" message + assistant confirmation
+    user_msg = await db.fetchrow(
+        """
+        INSERT INTO project_chat_messages (project_id, user_id, role, content, session_id)
+        VALUES ($1, $2, 'user', 'approve', $3) RETURNING *
+        """,
+        project_id, user["id"], session_id,
+    )
+
+    assistant_msg = await db.fetchrow(
+        """
+        INSERT INTO project_chat_messages (project_id, user_id, role, content, metadata_json, session_id)
+        VALUES ($1, $2, 'assistant', $3, $4::jsonb, $5) RETURNING *
+        """,
+        project_id, user["id"], content, json.dumps(metadata), session_id,
+    )
+
+    return {
+        "user_message": dict(user_msg),
+        "assistant_message": dict(assistant_msg),
+    }
 
 
 @router.delete("/projects/{project_id}/chat/sessions/{session_id}/messages/{message_id}")
