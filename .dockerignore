@@ -1,0 +1,42 @@
+# Frontend (has its own Dockerfile)
+frontend/
+node_modules/
+
+# Version control
+.git/
+.gitignore
+
+# Development
+tests/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+__pycache__/
+*.pyc
+*.pyo
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Environment
+.env
+.env.*
+*.env
+
+# Docker
+Dockerfile.*
+docker-compose*.yml
+
+# Docs / meta
+*.md
+LICENSE
+CLAUDE.md
+.claude/
+
+# Build artifacts
+dist/
+build/
+*.egg-info/
