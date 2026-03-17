@@ -17,7 +17,7 @@ spec:
     spec:
       containers:
         - name: frontend
-          image: ghcr.io/nammayatri/agents-platform/frontend:8109d7f
+          image: ghcr.io/nammayatri/agents-platform/frontend:79b89eb
           ports:
             - containerPort: 80
           resources:

@@ -7,6 +7,7 @@ self-hosted via OpenAI-compatible API) through a uniform interface.
 
 from __future__ import annotations
 
+import json as _json
 import logging
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator, Callable, Awaitable
@@ -34,6 +35,7 @@ class AIProvider(ABC):
         max_tokens: int = 4096,
         temperature: float = 0.1,
         system_prompt: str | None = None,
+        tool_choice: str | dict | None = None,
     ) -> LLMResponse:
         """Send messages and get a complete response."""
         ...
@@ -48,6 +50,7 @@ class AIProvider(ABC):
         max_tokens: int = 4096,
         temperature: float = 0.1,
         system_prompt: str | None = None,
+        tool_choice: str | dict | None = None,
     ) -> AsyncIterator[StreamChunk]:
         """Stream a response. Used for chat UI."""
         ...
@@ -130,6 +133,9 @@ async def run_tool_loop(
     if tools:
         send_kwargs["tools"] = tools
 
+    # Build known-tools set for hallucination detection
+    known_tool_names = {t["name"] for t in tools} if tools else set()
+
     n_tools = len(tools) if tools else 0
     logger.info("tool_loop: starting (tools=%d, max_rounds=%d)", n_tools, max_rounds)
 
@@ -137,6 +143,9 @@ async def run_tool_loop(
         await on_activity("Thinking...")
 
     response = await provider.send_message(messages, **send_kwargs)
+
+    # After first call, drop tool_choice so subsequent rounds use auto
+    send_kwargs.pop("tool_choice", None)
 
     logger.info(
         "tool_loop: initial response stop_reason=%s tool_calls=%d tokens_in=%d tokens_out=%d",
@@ -191,6 +200,27 @@ async def run_tool_loop(
             tc_name = tc["name"]
             tc_args = tc.get("arguments", {})
             logger.info("tool_loop: round %d — exec %s args_keys=%s", loop_count, tc_name, list(tc_args.keys()))
+
+            # Validate tool name against known tools
+            if known_tool_names and tc_name not in known_tool_names:
+                logger.warning(
+                    "tool_loop: round %d — hallucinated tool '%s', known: %s",
+                    loop_count, tc_name, sorted(known_tool_names),
+                )
+                result_text = _json.dumps({
+                    "error": f"Tool '{tc_name}' does not exist. "
+                    f"Available tools: {', '.join(sorted(known_tool_names))}",
+                })
+                tool_results.append({"tool_use_id": tc["id"], "content": result_text})
+                if on_tool_event:
+                    await on_tool_event({
+                        "type": "tool_result",
+                        "name": tc_name,
+                        "result_preview": result_text[:200],
+                        "chars": len(result_text),
+                        "error": True,
+                    })
+                continue
 
             # Report tool execution activity
             if on_activity:

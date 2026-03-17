@@ -77,11 +77,37 @@ and conventions BEFORE creating a plan.
 
 ## Planning Rules
 
-CRITICAL — ONE TASK, MANY SUB-TASKS:
-- Decompose the work into focused sub-tasks. Each sub-task should be one unit of work \
-(one file, one feature, one concern).
-- Use depends_on (0-based sub-task indexes) to express ordering between sub-tasks.
-- Maximize parallelism: sub-tasks with no dependencies run concurrently.
+CRITICAL — MAXIMIZE PARALLELISM:
+- You have MULTIPLE coding agents that execute concurrently. Your #1 job is to split the \
+work so as many agents can run IN PARALLEL as possible.
+- Decompose the work into focused, INDEPENDENT sub-tasks. Each sub-task should touch a \
+DIFFERENT set of files or a DIFFERENT concern so agents don't conflict.
+- Sub-tasks at the same execution_order with no depends_on run concurrently on separate agents.
+- Use depends_on (0-based sub-task indexes) ONLY when there is a true data dependency \
+(e.g. task B reads a file that task A creates). Do NOT add depends_on for loose coupling.
+
+PARALLELISM STRATEGIES:
+- **Split by file/module**: If 5 files need changes, create 5 parallel coder sub-tasks, one per file.
+- **Split by layer**: Frontend and backend changes can always run in parallel.
+- **Split by feature**: Independent features or components should be separate parallel tasks.
+- **Shared types/interfaces first**: If multiple tasks need a shared type, create one small \
+sub-task for the shared types (execution_order=0), then all consumers depend on it and run \
+in parallel (execution_order=1).
+- **Aim for 3-8 parallel coder sub-tasks** for medium tasks, more for larger ones. \
+A plan with only 1-2 sequential coder sub-tasks is almost always wrong — decompose further.
+
+BAD PLAN (sequential, slow):
+  sub_task 0: "Create backend API" (order=0)
+  sub_task 1: "Create frontend page" (order=1, depends_on=[0])
+  sub_task 2: "Write tests" (order=2, depends_on=[1])
+
+GOOD PLAN (parallel, fast):
+  sub_task 0: "Create shared types and interfaces" (order=0)
+  sub_task 1: "Create backend API endpoint" (order=1, depends_on=[0])
+  sub_task 2: "Create frontend API client" (order=1, depends_on=[0])
+  sub_task 3: "Create frontend page component" (order=1, depends_on=[0])
+  sub_task 4: "Write backend tests" (order=1, depends_on=[0])
+  sub_task 5: "Write frontend tests" (order=1, depends_on=[0])
 
 AGENT ROLES:
 - **coder** — Implements code, fixes bugs, adds features. Use for all code changes.
@@ -291,13 +317,41 @@ class AgentCoordinator:
             for msg in chat_history:
                 messages.append(LLMMessage(role=msg["role"], content=msg["content"]))
 
-        response = await provider.send_message(messages, temperature=0.2)
+        # Build submit_result tool for structured intake output
+        from agents.orchestrator.structured_output import build_submit_tool, extract_submit_result
+
+        intake_schema = {
+            "type": "object",
+            "properties": {
+                "ready": {"type": "boolean", "description": "True if task is clear enough to start"},
+                "requirements": {"type": "string", "description": "Concise summary of requirements"},
+                "approach": {"type": "string", "description": "One-line approach"},
+                "questions": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Questions to ask (only if ready=false)",
+                },
+            },
+            "required": ["ready"],
+        }
+        submit_tool = build_submit_tool(intake_schema, "intake")
+
+        response = await provider.send_message(
+            messages,
+            temperature=0.2,
+            tools=[submit_tool],
+            tool_choice={"name": "submit_result"},
+        )
         await self._track_tokens(response)
 
-        result = parse_llm_json(response.content)
+        # Extract from tool call first, then text fallback
+        result = extract_submit_result(
+            response.tool_calls, response.content, messages=messages,
+        )
+
         if result is None:
             # Retry once with a correction prompt before defaulting
-            logger.warning("Intake: failed to parse JSON, retrying with correction prompt")
+            logger.warning("Intake: failed to parse result, retrying with correction prompt")
             messages.append(LLMMessage(role="assistant", content=response.content))
             messages.append(LLMMessage(
                 role="user",
@@ -314,7 +368,7 @@ class AgentCoordinator:
 
         if result is None:
             # If retry also failed, default to ready with the task title as requirements
-            logger.warning("Intake: JSON parse failed after retry, defaulting to ready=true")
+            logger.warning("Intake: parse failed after retry, defaulting to ready=true")
             result = {
                 "ready": True,
                 "requirements": todo["title"],
@@ -516,6 +570,36 @@ class AgentCoordinator:
                 existing_names = {t["name"] for t in planner_tools}
                 planner_tools.extend(t for t in mcp_tools if t["name"] not in existing_names)
 
+        # Build submit_result tool for structured plan output
+        from agents.orchestrator.structured_output import build_submit_tool, extract_submit_result
+
+        plan_schema = {
+            "type": "object",
+            "properties": {
+                "summary": {"type": "string", "description": "Brief plan summary"},
+                "sub_tasks": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "title": {"type": "string"},
+                            "description": {"type": "string"},
+                            "agent_role": {"type": "string"},
+                            "execution_order": {"type": "integer"},
+                            "depends_on": {"type": "array", "items": {"type": "integer"}},
+                            "review_loop": {"type": "boolean"},
+                            "target_repo": {},
+                        },
+                        "required": ["title", "description", "agent_role"],
+                    },
+                },
+                "estimated_tokens": {"type": "integer"},
+            },
+            "required": ["summary", "sub_tasks"],
+        }
+        plan_submit_tool = build_submit_tool(plan_schema, "plan",
+            "Submit your execution plan. Call this AFTER exploring the codebase.")
+
         plan = None
         max_retries = 3
         for attempt in range(max_retries):
@@ -523,27 +607,41 @@ class AgentCoordinator:
                 # Use tool loop: planner explores codebase, then outputs JSON plan
                 from agents.providers.base import run_tool_loop
 
+                # Add submit_result alongside workspace tools
+                tools_with_submit = list(planner_tools) + [plan_submit_tool]
+
+                async def _plan_tool_exec(name: str, args: dict) -> str:
+                    if name == "submit_result":
+                        return json.dumps({"status": "received"})
+                    return await self.mcp_executor.execute_tool(
+                        name, args, planner_tools,
+                    )
+
                 content, response = await run_tool_loop(
                     provider, messages,
-                    tools=planner_tools,
-                    tool_executor=lambda name, args: self.mcp_executor.execute_tool(
-                        name, args, planner_tools,
-                    ),
+                    tools=tools_with_submit,
+                    tool_executor=_plan_tool_exec,
                     max_rounds=8,
                     on_activity=lambda msg: self._report_planning_activity(msg),
                     temperature=0.1,
                     max_tokens=16384,
                 )
             else:
-                # No workspace — simple LLM call
-                response = await provider.send_message(messages, temperature=0.1, max_tokens=16384)
+                # No workspace — use submit_result with forced tool_choice
+                response = await provider.send_message(
+                    messages, temperature=0.1, max_tokens=16384,
+                    tools=[plan_submit_tool],
+                    tool_choice={"name": "submit_result"},
+                )
                 content = response.content
             await self._track_tokens(response)
 
-            # Try parsing the response as JSON (with trailing comma fix).
-            # With tool loop, content may include exploration text + JSON at the end.
-            # parse_llm_json handles extracting JSON from mixed content.
-            plan = parse_llm_json(content)
+            # Try submit_result tool call first, then text fallback
+            plan = extract_submit_result(
+                response.tool_calls, content, messages=messages,
+            )
+            if plan is None:
+                plan = parse_llm_json(content)
             if plan is not None:
                 logger.info(
                     "[%s] Plan parsed on attempt %d: keys=%s, sub_tasks=%d",
@@ -1476,7 +1574,28 @@ class AgentCoordinator:
 
         tools = self._get_builtin_tools(workspace_path, "tester")
 
+        # Add submit_result tool for structured test output
+        from agents.orchestrator.structured_output import build_submit_tool, extract_submit_result
         from agents.providers.base import run_tool_loop
+
+        test_schema = {
+            "type": "object",
+            "properties": {
+                "passed": {"type": "boolean", "description": "True if all tests passed"},
+                "summary": {"type": "string", "description": "Brief summary of results"},
+                "commands_run": {"type": "array", "items": {"type": "string"}},
+                "failures": {"type": "array", "items": {"type": "string"}},
+            },
+            "required": ["passed", "summary"],
+        }
+        test_submit_tool = build_submit_tool(test_schema, "test_results",
+            "Submit test results. Call this when you have finished running all tests.")
+        tools_with_submit = list(tools) + [test_submit_tool]
+
+        async def _test_tool_exec(name: str, args: dict) -> str:
+            if name == "submit_result":
+                return json.dumps({"status": "received"})
+            return await self.mcp_executor.execute_tool(name, args, tools)
 
         max_parse_retries = 3
         last_content = ""
@@ -1484,15 +1603,20 @@ class AgentCoordinator:
             try:
                 content, response = await run_tool_loop(
                     provider, messages,
-                    tools=tools,
-                    tool_executor=lambda name, args: self.mcp_executor.execute_tool(name, args, tools),
+                    tools=tools_with_submit,
+                    tool_executor=_test_tool_exec,
                     max_rounds=10,
                     temperature=0.1,
                 )
                 await self._track_tokens(response)
                 last_content = content
 
-                result = parse_llm_json(content)
+                # Try submit_result first, then text fallback
+                result = extract_submit_result(
+                    response.tool_calls, content, messages=messages,
+                )
+                if result is None:
+                    result = parse_llm_json(content)
                 if result is not None and isinstance(result.get("passed"), bool):
                     return {
                         "passed": result["passed"],
@@ -1912,14 +2036,30 @@ class AgentCoordinator:
                 ]
                 tools_arg = mcp_tools if mcp_tools else None
 
+                # Add submit_result tool for roles with output schemas
+                from agents.orchestrator.structured_output import (
+                    build_submit_tool_for_role, extract_submit_result as _extract_submit,
+                )
                 from agents.providers.base import run_tool_loop
+
+                _submit_tool = build_submit_tool_for_role(role)
+                _submit_result_data: dict | None = None
+                if _submit_tool and tools_arg:
+                    # Replace task_complete with submit_result for structured output roles
+                    tools_arg = [t for t in tools_arg if t["name"] != "task_complete"]
+                    tools_arg.append(_submit_tool)
 
                 send_kwargs: dict = {"temperature": 0.1, "max_tokens": 16384}
                 if model_override:
                     send_kwargs["model"] = model_override
 
                 async def _iter_tool_exec(name: str, args: dict) -> str:
-                    nonlocal agent_signaled_done, agent_done_summary
+                    nonlocal agent_signaled_done, agent_done_summary, _submit_result_data
+                    if name == "submit_result":
+                        agent_signaled_done = True
+                        _submit_result_data = args
+                        agent_done_summary = args.get("summary", args.get("approach", ""))
+                        return "Structured output received. Task complete."
                     if name == "task_complete":
                         agent_signaled_done = True
                         agent_done_summary = args.get("summary", "")
@@ -4000,27 +4140,43 @@ class AgentCoordinator:
             # ── Structured output validation + retry ──
             from agents.orchestrator.output_validator import (
                 validate_agent_output,
+                validate_agent_output_dict,
                 build_correction_prompt,
                 MAX_VALIDATION_RETRIES,
             )
 
             validated_output = None
-            for val_attempt in range(MAX_VALIDATION_RETRIES + 1):
-                validated_output, val_errors = validate_agent_output(
-                    sub_task["agent_role"], response.content,
+            raw_content = content or response.content or ""
+
+            # If submit_result was called, validate the dict directly
+            if _submit_result_data is not None:
+                validated_output, val_errors = validate_agent_output_dict(
+                    sub_task["agent_role"], dict(_submit_result_data), raw_content,
                 )
-                if validated_output is not None:
-                    break
-                if val_attempt < MAX_VALIDATION_RETRIES:
-                    correction = build_correction_prompt(
-                        sub_task["agent_role"], val_errors, response.content,
+                if validated_output is None:
+                    logger.warning(
+                        "submit_result validation failed for %s (%s): %s — falling through to text parse",
+                        st_id, sub_task["agent_role"], val_errors,
                     )
-                    messages.append(LLMMessage(role="assistant", content=response.content))
-                    messages.append(LLMMessage(role="user", content=correction))
-                    response = await provider.send_message(
-                        messages, temperature=0.1, tools=tools_arg,
-                        **({"model": model_override} if model_override else {}),
+
+            # Fallback: text-based extraction + Pydantic validation with retry
+            if validated_output is None:
+                for val_attempt in range(MAX_VALIDATION_RETRIES + 1):
+                    validated_output, val_errors = validate_agent_output(
+                        sub_task["agent_role"], response.content,
                     )
+                    if validated_output is not None:
+                        break
+                    if val_attempt < MAX_VALIDATION_RETRIES:
+                        correction = build_correction_prompt(
+                            sub_task["agent_role"], val_errors, response.content,
+                        )
+                        messages.append(LLMMessage(role="assistant", content=response.content))
+                        messages.append(LLMMessage(role="user", content=correction))
+                        response = await provider.send_message(
+                            messages, temperature=0.1, tools=tools_arg,
+                            **({"model": model_override} if model_override else {}),
+                        )
 
             if validated_output is None:
                 logger.warning(

@@ -18,7 +18,7 @@ spec:
     spec:
       containers:
         - name: backend
-          image: ghcr.io/nammayatri/agents-platform/backend:8109d7f
+          image: ghcr.io/nammayatri/agents-platform/backend:79b89eb
           ports:
             - containerPort: 8000
           env:

@@ -578,6 +578,6 @@ _register(AgentDefinition(
     display_name="Planner",
     description="Project chat agent — plans work, creates tasks, answers project questions",
     system_prompt=PLANNER_CHAT_PROMPT,
-    default_tools=["read_file", "list_directory", "search_files", "run_command"],
+    default_tools=["read_file", "list_directory", "search_files", "run_command", "semantic_search"],
     tool_rule_categories=["general"],
 ))

@@ -337,15 +337,91 @@ Project: "{project['name']}"
 
 # ── Plan Mode ────────────────────────────────────────────────────────
 
+# Read-only builtins allowed in plan mode (no write_file, edit_file, run_command)
+PLAN_MODE_BUILTIN_TOOLS = {"read_file", "list_directory", "search_files", "semantic_search"}
+
+
+def _filter_plan_mode_tools(
+    builtin_tools: list[dict],
+    mcp_tools: list[dict] | None,
+    planner_config: dict | None,
+) -> list[dict]:
+    """Filter tools for plan mode: read-only builtins + all MCP tools.
+
+    If planner_config has tools_enabled set, further restrict builtins
+    to only those in the allowed list.  MCP tools pass through unfiltered
+    (controlled at the project-level MCP server enable/disable).
+    """
+    filtered = [t for t in builtin_tools if t["name"] in PLAN_MODE_BUILTIN_TOOLS]
+
+    # Honour tools_enabled from agent config if set
+    if planner_config:
+        raw = planner_config.get("tools_enabled")
+        if raw and len(raw) > 0:
+            allowed = set(raw)
+            filtered = [t for t in filtered if t["name"] in allowed]
+
+    return filtered + (mcp_tools or [])
+
+
+def _compact_chat_history(
+    history: list[dict],
+    max_tokens: int,
+    model: str,
+) -> list[dict]:
+    """Compact old chat history to fit within a token budget.
+
+    Keeps the most recent messages in full.  For older messages, truncates
+    long content (especially assistant messages with code blocks or plan JSON)
+    using a middle strategy that preserves start + end.
+    """
+    from agents.utils.context_budget import truncate_to_budget
+    from agents.utils.token_counter import count_tokens
+
+    if not history:
+        return history
+
+    total_tokens = sum(count_tokens(h["content"] or "", model) for h in history)
+    if total_tokens <= max_tokens:
+        return list(history)
+
+    # Keep last 6 messages (3 exchanges) in full
+    keep_recent = min(6, len(history))
+    recent = history[-keep_recent:]
+    older = history[:-keep_recent]
+
+    recent_tokens = sum(count_tokens(h["content"] or "", model) for h in recent)
+    remaining_budget = max(max_tokens - recent_tokens, 2000)
+
+    if not older:
+        return list(recent)
+
+    per_msg_budget = remaining_budget // len(older)
+
+    compacted: list[dict] = []
+    for msg in older:
+        content = msg["content"] or ""
+        msg_tokens = count_tokens(content, model)
+        if msg_tokens > per_msg_budget:
+            truncated = truncate_to_budget(content, per_msg_budget, model, strategy="middle")
+            compacted.append({"role": msg["role"], "content": truncated})
+        else:
+            compacted.append(msg)
+
+    return compacted + list(recent)
+
 
 PLAN_MODE_SYSTEM = """\
 You are a project planning assistant for "{project_name}".
 {project_context}
 
 You are in PLANNING MODE. Your job is to:
-1. Discuss the project scope, requirements, and technical approach with the user
-2. Ask clarifying questions to understand the full picture
-3. Progressively build a structured plan with subtasks
+1. Explore the codebase to understand current structure and patterns
+2. Discuss the project scope, requirements, and technical approach with the user
+3. Ask clarifying questions to understand the full picture
+4. Progressively build a structured plan with subtasks
+
+{tools_doc}
 
 When you and the user agree on a plan, output it as a structured JSON block.
 CRITICAL: Always create exactly ONE task with ALL subtasks inside it. \
@@ -408,8 +484,17 @@ async def generate_plan_response(
     redis=None,
     model_override: str | None = None,
 ) -> dict:
-    """Generate an AI response in plan mode."""
+    """Generate an AI response in plan mode.
+
+    Uses a tool loop with read-only workspace tools + MCP tools so the
+    planner can explore the codebase before proposing a plan.  Write tools
+    (write_file, edit_file, run_command) are excluded.
+    """
+    from agents.agents.registry import get_builtin_tool_schemas
+    from agents.providers.base import run_tool_loop
+    from agents.providers.mcp_executor import McpToolExecutor
     from agents.providers.registry import ProviderRegistry
+    from agents.providers.tools_registry import ToolsRegistry
     from agents.schemas.agent import LLMMessage
 
     registry = ProviderRegistry(db)
@@ -417,6 +502,23 @@ async def generate_plan_response(
 
     planner_config = await resolve_planner_config(db, user_id)
 
+    # ── Resolve tools ────────────────────────────────────────────────
+    tools_reg = ToolsRegistry(db)
+    mcp_tools = await tools_reg.resolve_tools(
+        project_id=project_id, user_id=user_id,
+    )
+    skills_ctx = await tools_reg.build_skills_context(
+        project_id=project_id, user_id=user_id,
+    )
+
+    workspace_path = project.get("workspace_path") or ""
+    builtin_tools = get_builtin_tool_schemas(workspace_path, "planner") if workspace_path else []
+
+    # Filter to read-only tools; respect tools_enabled from agent config
+    all_tools = _filter_plan_mode_tools(builtin_tools, mcp_tools, planner_config)
+    tools_arg = all_tools if all_tools else None
+
+    # ── Build project context ────────────────────────────────────────
     project_ctx_parts = []
     if project.get("description"):
         project_ctx_parts.append(f"Description: {project['description']}")
@@ -453,11 +555,48 @@ async def generate_plan_response(
 
     project_context = "\n".join(project_ctx_parts)
 
+    # ── Build tools documentation for system prompt ──────────────────
+    tools_doc_parts: list[str] = []
+    has_builtins = any(t.get("_builtin") for t in all_tools) if all_tools else False
+    if has_builtins:
+        tools_doc_parts.append(
+            "## Workspace Tools (Read-Only)\n"
+            "You have read-only tools to explore the codebase — USE THEM to research before planning:\n"
+            "- **read_file** — Read a file's contents (path relative to repo root, or ../deps/{name}/path for deps)\n"
+            "- **list_directory** — List files and directories\n"
+            "- **search_files** — Search for a text pattern across files (grep)\n"
+            "- **semantic_search** — Search the codebase semantically with natural language\n\n"
+            "IMPORTANT: Always explore the codebase with these tools before proposing a plan.\n"
+            "Read relevant files, understand the existing code structure, and plan accordingly.\n"
+            "Do NOT guess what the codebase looks like — read it first.\n\n"
+            "CROSS-REPO: Dependency repos are available at ../deps/{name}/ (read-only).\n"
+            "Use list_directory(\"../deps/\") to see them.\n\n"
+            "NOTE: You are in PLANNING mode — you cannot write files or run commands.\n"
+            "Your job is to research and plan, not implement."
+        )
+    mcp_only = [t for t in (all_tools or []) if not t.get("_builtin")]
+    if mcp_only:
+        mcp_names = [t.get("name", "") for t in mcp_only if t.get("name")]
+        if mcp_names:
+            tools_doc_parts.append(
+                f"You also have MCP tools available: {', '.join(mcp_names[:15])}"
+            )
+    if not tools_doc_parts:
+        tools_doc_parts.append(
+            "No workspace tools are available. Plan based on the information provided."
+        )
+    tools_doc = "\n\n".join(tools_doc_parts)
+
     system_prompt = PLAN_MODE_SYSTEM.format(
         project_name=project["name"],
         project_context=project_context,
+        tools_doc=tools_doc,
     )
 
+    if skills_ctx:
+        system_prompt += skills_ctx
+
+    # ── Load & compact chat history ──────────────────────────────────
     history = await db.fetch(
         "SELECT role, content FROM project_chat_messages "
         "WHERE session_id = $1 ORDER BY created_at DESC LIMIT 40",
@@ -465,30 +604,46 @@ async def generate_plan_response(
     )
     history = list(reversed(history))
 
-    messages = [LLMMessage(role="system", content=system_prompt)]
-    for row in history[:-1]:
-        messages.append(LLMMessage(role=row["role"], content=row["content"]))
-    messages.append(LLMMessage(role="user", content=user_message))
-
+    # Determine model for token counting
     plan_send_kwargs: dict = {}
     if model_override:
         plan_send_kwargs["model"] = model_override
     elif planner_config and planner_config.get("model_preference"):
         plan_send_kwargs["model"] = planner_config["model_preference"]
 
-    if redis and session_id:
-        await redis.publish(
-            f"chat:session:{session_id}:activity",
-            json.dumps({"type": "activity", "activity": "Generating plan response..."}),
-        )
+    effective_model = plan_send_kwargs.get("model") or provider.default_model
+    history = _compact_chat_history(history, max_tokens=40_000, model=effective_model)
 
-    response = await provider.send_message(messages, **plan_send_kwargs)
-    content = response.content
+    messages = [LLMMessage(role="system", content=system_prompt)]
+    for row in history[:-1]:
+        messages.append(LLMMessage(role=row["role"], content=row["content"]))
+    messages.append(LLMMessage(role="user", content=user_message))
 
+    # ── Tool executor ────────────────────────────────────────────────
+    mcp_exec = McpToolExecutor(db)
+
+    async def _execute_tool(name: str, arguments: dict) -> str:
+        return await mcp_exec.execute_tool(name, arguments, all_tools)
+
+    on_activity = await _build_on_activity(redis, session_id)
+
+    # ── Run tool loop ────────────────────────────────────────────────
+    content, response = await run_tool_loop(
+        provider, messages,
+        tools=tools_arg,
+        tool_executor=_execute_tool,
+        max_rounds=5,
+        on_activity=on_activity,
+        **plan_send_kwargs,
+    )
+
+    # ── Plan extraction & acceptance (unchanged) ─────────────────────
     metadata = None
     if "```json" in content and '"action"' in content and '"create_plan"' in content:
         try:
-            json_start = content.index("```json") + 7
+            # Use rindex to find the *last* JSON block (avoids false matches
+            # from tool results that might contain markdown JSON fences).
+            json_start = content.rindex("```json") + 7
             json_end = content.index("```", json_start)
             plan_data = json.loads(content[json_start:json_end].strip())
 

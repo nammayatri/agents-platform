@@ -77,6 +77,19 @@ class AnthropicProvider(AIProvider):
             for t in tools
         ]
 
+    @staticmethod
+    def _map_tool_choice(tool_choice: str | dict | None) -> dict | None:
+        """Map canonical tool_choice to Anthropic format."""
+        if tool_choice is None:
+            return None
+        if isinstance(tool_choice, dict) and "name" in tool_choice:
+            return {"type": "tool", "name": tool_choice["name"]}
+        if tool_choice == "required":
+            return {"type": "any"}
+        if tool_choice == "none":
+            return None  # handled by caller removing tools
+        return {"type": "auto"}
+
     async def send_message(
         self,
         messages: list[LLMMessage],
@@ -86,6 +99,7 @@ class AnthropicProvider(AIProvider):
         max_tokens: int = 4096,
         temperature: float = 0.1,
         system_prompt: str | None = None,
+        tool_choice: str | dict | None = None,
     ) -> LLMResponse:
         sys_from_messages, api_messages = self._build_messages(messages)
         system = system_prompt or sys_from_messages
@@ -98,9 +112,15 @@ class AnthropicProvider(AIProvider):
         }
         if system:
             kwargs["system"] = system
+        # For tool_choice="none", skip sending tools entirely
+        if tool_choice == "none":
+            tools = None
         api_tools = self._build_tools(tools)
         if api_tools:
             kwargs["tools"] = api_tools
+        mapped_tc = self._map_tool_choice(tool_choice)
+        if mapped_tc is not None and api_tools:
+            kwargs["tool_choice"] = mapped_tc
 
         response = await self.client.messages.create(**kwargs)
 
@@ -143,6 +163,7 @@ class AnthropicProvider(AIProvider):
         max_tokens: int = 4096,
         temperature: float = 0.1,
         system_prompt: str | None = None,
+        tool_choice: str | dict | None = None,
     ) -> AsyncIterator[StreamChunk]:
         sys_from_messages, api_messages = self._build_messages(messages)
         system = system_prompt or sys_from_messages

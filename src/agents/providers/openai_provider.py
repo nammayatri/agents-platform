@@ -67,20 +67,61 @@ class OpenAIProvider(AIProvider):
             api_messages.insert(0, {"role": "system", "content": system_prompt})
         return api_messages
 
-    def _build_tools(self, tools: list[dict] | None) -> list[dict] | None:
+    @staticmethod
+    def _make_strict_schema(schema: dict) -> dict:
+        """Transform a JSON Schema for OpenAI strict mode.
+
+        Recursively adds ``additionalProperties: false`` and puts all
+        properties into ``required`` on every object-level schema.
+        """
+        if not isinstance(schema, dict):
+            return schema
+
+        result = dict(schema)
+
+        if result.get("type") == "object" and "properties" in result:
+            result["additionalProperties"] = False
+            result["required"] = list(result["properties"].keys())
+            result["properties"] = {
+                k: OpenAIProvider._make_strict_schema(v)
+                for k, v in result["properties"].items()
+            }
+
+        if result.get("type") == "array" and "items" in result:
+            result["items"] = OpenAIProvider._make_strict_schema(result["items"])
+
+        return result
+
+    def _build_tools(
+        self, tools: list[dict] | None, *, strict: bool = True,
+    ) -> list[dict] | None:
         if not tools:
             return None
-        return [
-            {
-                "type": "function",
-                "function": {
-                    "name": t["name"],
-                    "description": t.get("description", ""),
-                    "parameters": t.get("parameters", t.get("input_schema", {})),
-                },
+        result = []
+        for t in tools:
+            params = t.get("parameters", t.get("input_schema", {}))
+            func: dict = {
+                "name": t["name"],
+                "description": t.get("description", ""),
+                "parameters": self._make_strict_schema(params) if strict else params,
             }
-            for t in tools
-        ]
+            if strict:
+                func["strict"] = True
+            result.append({"type": "function", "function": func})
+        return result
+
+    @staticmethod
+    def _map_tool_choice(tool_choice: str | dict | None) -> str | dict | None:
+        """Map canonical tool_choice to OpenAI format."""
+        if tool_choice is None:
+            return None
+        if isinstance(tool_choice, dict) and "name" in tool_choice:
+            return {"type": "function", "function": {"name": tool_choice["name"]}}
+        if tool_choice == "required":
+            return "required"
+        if tool_choice == "none":
+            return "none"
+        return "auto"
 
     async def send_message(
         self,
@@ -91,6 +132,7 @@ class OpenAIProvider(AIProvider):
         max_tokens: int = 4096,
         temperature: float = 0.1,
         system_prompt: str | None = None,
+        tool_choice: str | dict | None = None,
     ) -> LLMResponse:
         api_messages = self._build_messages(messages, system_prompt)
         use_model = model or self.default_model
@@ -104,6 +146,9 @@ class OpenAIProvider(AIProvider):
         api_tools = self._build_tools(tools)
         if api_tools:
             kwargs["tools"] = api_tools
+        mapped_tc = self._map_tool_choice(tool_choice)
+        if mapped_tc is not None and api_tools:
+            kwargs["tool_choice"] = mapped_tc
 
         response = await self.client.chat.completions.create(**kwargs)
         choice = response.choices[0]
@@ -156,6 +201,7 @@ class OpenAIProvider(AIProvider):
         max_tokens: int = 4096,
         temperature: float = 0.1,
         system_prompt: str | None = None,
+        tool_choice: str | dict | None = None,
     ) -> AsyncIterator[StreamChunk]:
         api_messages = self._build_messages(messages, system_prompt)
 
