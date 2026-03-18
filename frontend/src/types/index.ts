@@ -528,7 +528,23 @@ export interface ProjectChatMessage {
     intent?: string
     plan_data?: ChatPlanData & {
       summary?: string
-      sub_tasks?: { title: string; agent_role: string; description?: string }[]
+      sub_tasks?: Array<{
+        title: string
+        agent_role: string
+        description?: string
+        execution_order?: number
+        depends_on?: number[]
+        review_loop?: boolean
+        target_repo?: string
+        context?: {
+          relevant_files?: string[]
+          current_state?: string
+          what_to_change?: string
+          patterns_to_follow?: string
+          related_code?: string
+          integration_points?: string
+        }
+      }>
     }
     plan_title?: string
     task_count?: number

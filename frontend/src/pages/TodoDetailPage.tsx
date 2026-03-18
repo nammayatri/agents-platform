@@ -436,11 +436,13 @@ export default function TodoDetailPage() {
                         {st.review_loop && (
                           <span className="px-1.5 py-0.5 bg-cyan-500/10 border border-cyan-500/20 rounded text-[10px] text-cyan-400/80">review loop</span>
                         )}
-                        {st.target_repo && st.target_repo !== 'main' && (
-                          <span className="px-1.5 py-0.5 bg-purple-500/10 border border-purple-500/20 rounded text-[10px] text-purple-400/80 font-mono">
-                            {st.target_repo}
-                          </span>
-                        )}
+                        <span className={`px-1.5 py-0.5 rounded text-[10px] font-mono ${
+                          st.target_repo && st.target_repo !== 'main'
+                            ? 'bg-purple-500/10 border border-purple-500/20 text-purple-400/80'
+                            : 'bg-gray-800 text-gray-500'
+                        }`}>
+                          {st.target_repo || 'main'}
+                        </span>
                         {st.depends_on && st.depends_on.length > 0 && (
                           <span className="text-[11px] text-gray-700 font-mono">
                             depends on: {st.depends_on.map((d) => `#${d + 1}`).join(', ')}
@@ -760,11 +762,13 @@ export default function TodoDetailPage() {
                             {st.review_verdict === 'approved' ? 'approved' : 'changes requested'}
                           </span>
                         )}
-                        {st.target_repo && (
-                          <span className="px-1.5 py-0.5 bg-purple-500/10 border border-purple-500/20 rounded text-[10px] text-purple-400/80 font-mono">
-                            {st.target_repo.name}
-                          </span>
-                        )}
+                        <span className={`px-1.5 py-0.5 rounded text-[10px] font-mono ${
+                          st.target_repo
+                            ? 'bg-purple-500/10 border border-purple-500/20 text-purple-400/80'
+                            : 'bg-gray-800 text-gray-500'
+                        }`}>
+                          {st.target_repo ? st.target_repo.name : 'main'}
+                        </span>
                         {hasIterations && (
                           <span className="text-[11px] text-gray-600 font-mono shrink-0">
                             {iterLog.length} iter{iterLog.length !== 1 ? 's' : ''}
@@ -788,7 +792,8 @@ export default function TodoDetailPage() {
                         })()}
                         {(() => {
                           const canForceRun = (st.status === 'pending' || st.status === 'failed') && todoId
-                          const canShowDetails = (st.status === 'completed' || st.status === 'failed') && (st.output_result || st.description || st.error_message)
+                          const hasInputContext = st.input_context && Object.keys(st.input_context).length > 0
+                          const canShowDetails = (st.output_result || st.description || st.error_message || hasInputContext)
                           if (!canForceRun && !canShowDetails) return null
                           return (
                             <div className="ml-auto shrink-0 flex items-center gap-1.5">
@@ -1040,6 +1045,57 @@ export default function TodoDetailPage() {
                             <pre className="mt-1.5 text-[11px] text-gray-500 font-mono whitespace-pre-wrap max-h-32 overflow-y-auto leading-relaxed bg-gray-950 rounded px-2.5 py-2 border border-gray-800/50">
                               {st.description}
                             </pre>
+                          </details>
+                        )}
+
+                        {/* Input context from planner */}
+                        {st.input_context && Object.keys(st.input_context).length > 0 && (
+                          <details>
+                            <summary className="text-[10px] text-gray-600 uppercase tracking-wider cursor-pointer hover:text-gray-500">
+                              Agent Context
+                            </summary>
+                            <div className="mt-1.5 space-y-1.5">
+                              {st.input_context.relevant_files && st.input_context.relevant_files.length > 0 && (
+                                <div>
+                                  <span className="text-[10px] text-gray-600">Files:</span>
+                                  <div className="mt-0.5 flex flex-wrap gap-1">
+                                    {st.input_context.relevant_files.map((f: string, fi: number) => (
+                                      <span key={fi} className="text-[11px] font-mono text-indigo-400/70 bg-indigo-500/5 px-1.5 py-0.5 rounded">{f}</span>
+                                    ))}
+                                  </div>
+                                </div>
+                              )}
+                              {st.input_context.what_to_change && (
+                                <div>
+                                  <span className="text-[10px] text-gray-600">What to change:</span>
+                                  <p className="text-[11px] text-gray-500 mt-0.5 leading-relaxed">{st.input_context.what_to_change}</p>
+                                </div>
+                              )}
+                              {st.input_context.current_state && (
+                                <div>
+                                  <span className="text-[10px] text-gray-600">Current state:</span>
+                                  <p className="text-[11px] text-gray-500 mt-0.5 leading-relaxed">{st.input_context.current_state}</p>
+                                </div>
+                              )}
+                              {st.input_context.patterns_to_follow && (
+                                <div>
+                                  <span className="text-[10px] text-gray-600">Patterns to follow:</span>
+                                  <p className="text-[11px] text-gray-500 mt-0.5 leading-relaxed">{st.input_context.patterns_to_follow}</p>
+                                </div>
+                              )}
+                              {st.input_context.related_code && (
+                                <div>
+                                  <span className="text-[10px] text-gray-600">Related code:</span>
+                                  <pre className="text-[11px] text-gray-500 mt-0.5 font-mono whitespace-pre-wrap leading-relaxed bg-gray-950 rounded px-2 py-1.5 border border-gray-800/50 max-h-32 overflow-y-auto">{st.input_context.related_code}</pre>
+                                </div>
+                              )}
+                              {st.input_context.integration_points && (
+                                <div>
+                                  <span className="text-[10px] text-gray-600">Integration points:</span>
+                                  <p className="text-[11px] text-gray-500 mt-0.5 leading-relaxed">{st.input_context.integration_points}</p>
+                                </div>
+                              )}
+                            </div>
                           </details>
                         )}
 
