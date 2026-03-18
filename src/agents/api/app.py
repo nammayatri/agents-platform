@@ -135,6 +135,7 @@ def create_app() -> FastAPI:
         providers,
         skills,
         todos,
+        webhooks,
         websocket,
         workspace,
     )
@@ -154,6 +155,7 @@ def create_app() -> FastAPI:
     app.include_router(agents.router, prefix="/api/config", tags=["agents"])
     app.include_router(notifications.router, prefix="/api", tags=["notifications"])
     app.include_router(admin.router, prefix="/api/admin", tags=["admin"])
+    app.include_router(webhooks.router, prefix="/api", tags=["webhooks"])
     app.include_router(websocket.router, tags=["websocket"])
 
     return app

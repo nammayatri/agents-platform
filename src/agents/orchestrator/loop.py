@@ -177,7 +177,7 @@ class EventDrivenOrchestrator:
             return
 
         # Don't dispatch if awaiting user response, merge approval, or workspace edit review
-        if todo.get("sub_state") in ("awaiting_response", "awaiting_merge_approval", "awaiting_release_approval", "workspace_edited"):
+        if todo.get("sub_state") in ("awaiting_response", "awaiting_merge_approval", "awaiting_release_approval", "awaiting_external_merge", "workspace_edited"):
             logger.info("Task %s awaiting user input (sub_state=%s), skipping", todo_id[:8], todo.get("sub_state"))
             await self.locks.release(todo_id)
             await self.event_bus.ack(msg_id)
@@ -276,7 +276,7 @@ class EventDrivenOrchestrator:
                     AND l.expires_at > NOW()
                 WHERE t.state IN ('intake', 'planning', 'in_progress', 'testing')
                   AND l.todo_id IS NULL
-                  AND (t.sub_state IS NULL OR t.sub_state NOT IN ('awaiting_response', 'awaiting_merge_approval', 'awaiting_release_approval', 'workspace_edited'))
+                  AND (t.sub_state IS NULL OR t.sub_state NOT IN ('awaiting_response', 'awaiting_merge_approval', 'awaiting_release_approval', 'awaiting_external_merge', 'workspace_edited'))
                 ORDER BY
                     CASE t.priority
                         WHEN 'critical' THEN 0

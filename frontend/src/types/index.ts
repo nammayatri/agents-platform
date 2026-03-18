@@ -148,6 +148,7 @@ export interface SubTask {
   description?: string
   agent_role: string
   execution_order: number
+  depends_on?: string[]  // UUID[] of sub-task IDs this task depends on
   status: 'pending' | 'assigned' | 'running' | 'completed' | 'failed' | 'cancelled'
   progress_pct: number
   progress_message?: string

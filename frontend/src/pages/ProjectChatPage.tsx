@@ -109,6 +109,78 @@ function ExecutionDetails({ execution }: { execution: ChatExecutionInfo }) {
   )
 }
 
+function StreamingPanel({
+  liveText,
+  completedText,
+  isStreaming,
+}: {
+  liveText: string
+  completedText: string
+  isStreaming: boolean
+}) {
+  const [expanded, setExpanded] = useState(false)
+  const scrollRef = useRef<HTMLDivElement>(null)
+  const prevIsStreaming = useRef(isStreaming)
+
+  // Auto-expand when streaming starts, auto-collapse when done
+  useEffect(() => {
+    if (isStreaming && !prevIsStreaming.current) {
+      setExpanded(true)
+    } else if (!isStreaming && prevIsStreaming.current) {
+      setExpanded(false)
+    }
+    prevIsStreaming.current = isStreaming
+  }, [isStreaming])
+
+  // Auto-scroll when live content grows
+  useEffect(() => {
+    if (expanded && scrollRef.current) {
+      scrollRef.current.scrollTop = scrollRef.current.scrollHeight
+    }
+  }, [liveText, expanded])
+
+  const fullText = completedText && liveText
+    ? completedText + '\n' + liveText
+    : liveText || completedText
+
+  if (!fullText) return null
+
+  return (
+    <div className="mt-1.5 border border-gray-800/50 rounded-lg overflow-hidden bg-gray-950/50">
+      <button
+        onClick={() => setExpanded(!expanded)}
+        className="w-full flex items-center gap-1.5 px-2.5 py-1.5 text-[11px] text-gray-600 hover:text-gray-400 transition-colors"
+      >
+        <svg
+          className={`w-3 h-3 transition-transform ${expanded ? 'rotate-90' : ''}`}
+          fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}
+        >
+          <path strokeLinecap="round" strokeLinejoin="round" d="M9 5l7 7-7 7" />
+        </svg>
+        <span>
+          {isStreaming ? 'Streaming' : 'LLM output'} ({fullText.length.toLocaleString()} chars)
+        </span>
+        {isStreaming && (
+          <span className="w-1.5 h-1.5 rounded-full bg-indigo-400 animate-pulse" />
+        )}
+      </button>
+      {expanded && (
+        <div
+          ref={scrollRef}
+          className="max-h-32 overflow-y-auto px-2.5 py-2 border-t border-gray-800/50"
+        >
+          <pre className="text-[11px] text-gray-500 font-mono whitespace-pre-wrap leading-relaxed">
+            {fullText}
+            {isStreaming && (
+              <span className="inline-block w-1 h-3 bg-gray-600 animate-pulse ml-0.5 align-text-bottom rounded-sm" />
+            )}
+          </pre>
+        </div>
+      )}
+    </div>
+  )
+}
+
 function RawOutputToggle({ content }: { content: string }) {
   const [open, setOpen] = useState(false)
   return (
@@ -148,7 +220,8 @@ export default function ProjectChatPage() {
   const [creatingSession, setCreatingSession] = useState(false)
   const messagesEnd = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLTextAreaElement>(null)
-  const { activity, streamingText, clearActivity } = useChatSessionWebSocket(activeSessionId)
+  const deletedSessionIdsRef = useRef<Set<string>>(new Set())
+  const { activity, streamingText, completedStreaming, isStreaming, clearActivity, resetStreaming, incomingMessage, clearIncomingMessage } = useChatSessionWebSocket(activeSessionId)
   const [showFeedbackFor, setShowFeedbackFor] = useState<string | null>(null)
   const [feedbackInput, setFeedbackInput] = useState('')
   const [chatModels, setChatModels] = useState<ModelInfo[]>([])
@@ -177,13 +250,33 @@ export default function ProjectChatPage() {
 
   useEffect(() => {
     messagesEnd.current?.scrollIntoView({ behavior: 'smooth' })
-  }, [messages, streamingText])
+  }, [messages, isStreaming, completedStreaming])
+
+  // Handle incoming chat messages from the coordinator via WebSocket
+  // (e.g., task_plan_ready after re-planning, system messages during execution)
+  useEffect(() => {
+    if (!incomingMessage || !projectId) return
+    const msg: ProjectChatMessage = {
+      id: `ws-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      project_id: projectId,
+      user_id: '',
+      role: (incomingMessage.role as 'user' | 'assistant' | 'system') || 'system',
+      content: incomingMessage.content,
+      metadata_json: incomingMessage.metadata_json as ProjectChatMessage['metadata_json'],
+      created_at: new Date().toISOString(),
+    }
+    setMessages((prev) => [...prev, msg])
+    clearIncomingMessage()
+  }, [incomingMessage, projectId, clearIncomingMessage])
 
   async function loadSessions() {
     if (!projectId) return
     try {
       const list = await projectChat.sessions.list(projectId)
-      const sessionList = list as ChatSession[]
+      // Filter out sessions that were deleted locally (handles race with in-flight fetches)
+      const sessionList = (list as ChatSession[]).filter(
+        (s) => !deletedSessionIdsRef.current.has(s.id)
+      )
       setSessions(sessionList)
 
       // Auto-select the most recent session if none is active
@@ -258,11 +351,21 @@ export default function ProjectChatPage() {
     if (!projectId) return
     try {
       await projectChat.sessions.delete(projectId, sessionId)
-      setSessions((prev) => prev.filter((s) => s.id !== sessionId))
-      if (activeSessionId === sessionId) {
-        setActiveSessionId(null)
-        setMessages([])
-      }
+      // Track deletion so in-flight loadSessions() won't restore it
+      deletedSessionIdsRef.current.add(sessionId)
+      setSessions((prev) => {
+        const remaining = prev.filter((s) => s.id !== sessionId)
+        // Auto-select next session if we're deleting the active one
+        if (activeSessionId === sessionId && remaining.length > 0) {
+          const next = remaining[0]
+          setActiveSessionId(next.id)
+          loadSessionMessages(next.id)
+        } else if (activeSessionId === sessionId) {
+          setActiveSessionId(null)
+          setMessages([])
+        }
+        return remaining
+      })
     } catch {
       // ignore
     }
@@ -276,6 +379,7 @@ export default function ProjectChatPage() {
     const content = overrideContent || input.trim()
     if (!content || !projectId || sending) return
     if (!overrideContent) setInput('')
+    resetStreaming()
     setSending(true)
 
     const tempUserMsg: ProjectChatMessage = {
@@ -835,11 +939,11 @@ export default function ProjectChatPage() {
                                         <span className="px-1 py-0.5 bg-cyan-500/10 border border-cyan-500/20 rounded text-[10px] text-cyan-400/80 shrink-0">review</span>
                                       )}
                                       <span className={`px-1 py-0.5 rounded text-[10px] font-mono shrink-0 ${
-                                        st.target_repo && st.target_repo !== 'main'
+                                        st.target_repo && String(st.target_repo) !== 'main'
                                           ? 'bg-purple-500/10 border border-purple-500/20 text-purple-400/80'
                                           : 'bg-gray-800 text-gray-500'
                                       }`}>
-                                        {st.target_repo || 'main'}
+                                        {String(st.target_repo || 'main')}
                                       </span>
                                       {st.depends_on && st.depends_on.length > 0 && (
                                         <span className="text-[10px] text-gray-700 font-mono shrink-0">
@@ -849,14 +953,14 @@ export default function ProjectChatPage() {
                                     </summary>
                                     <div className="ml-7 pl-3 border-l border-gray-800 mt-1 mb-1.5 space-y-1.5 py-1">
                                       {st.description && (
-                                        <p className="text-[11px] text-gray-500 leading-relaxed">{st.description}</p>
+                                        <p className="text-[11px] text-gray-500 leading-relaxed">{String(st.description)}</p>
                                       )}
-                                      {st.context?.relevant_files && st.context.relevant_files.length > 0 && (
+                                      {Array.isArray(st.context?.relevant_files) && st.context!.relevant_files.length > 0 && (
                                         <div>
                                           <span className="text-[10px] text-gray-600 uppercase tracking-wider">Files</span>
                                           <div className="mt-0.5 flex flex-wrap gap-1">
-                                            {st.context.relevant_files.map((f: string, fi: number) => (
-                                              <span key={fi} className="text-[11px] font-mono text-indigo-400/70 bg-indigo-500/5 px-1.5 py-0.5 rounded">{f}</span>
+                                            {st.context!.relevant_files.map((f: string, fi: number) => (
+                                              <span key={fi} className="text-[11px] font-mono text-indigo-400/70 bg-indigo-500/5 px-1.5 py-0.5 rounded">{String(f)}</span>
                                             ))}
                                           </div>
                                         </div>
@@ -864,31 +968,31 @@ export default function ProjectChatPage() {
                                       {st.context?.what_to_change && (
                                         <div>
                                           <span className="text-[10px] text-gray-600 uppercase tracking-wider">What to change</span>
-                                          <p className="text-[11px] text-gray-500 mt-0.5 leading-relaxed">{st.context.what_to_change}</p>
+                                          <p className="text-[11px] text-gray-500 mt-0.5 leading-relaxed">{String(st.context.what_to_change)}</p>
                                         </div>
                                       )}
                                       {st.context?.current_state && (
                                         <div>
                                           <span className="text-[10px] text-gray-600 uppercase tracking-wider">Current state</span>
-                                          <p className="text-[11px] text-gray-500 mt-0.5 leading-relaxed">{st.context.current_state}</p>
+                                          <p className="text-[11px] text-gray-500 mt-0.5 leading-relaxed">{String(st.context.current_state)}</p>
                                         </div>
                                       )}
                                       {st.context?.patterns_to_follow && (
                                         <div>
                                           <span className="text-[10px] text-gray-600 uppercase tracking-wider">Patterns to follow</span>
-                                          <p className="text-[11px] text-gray-500 mt-0.5 leading-relaxed">{st.context.patterns_to_follow}</p>
+                                          <p className="text-[11px] text-gray-500 mt-0.5 leading-relaxed">{String(st.context.patterns_to_follow)}</p>
                                         </div>
                                       )}
                                       {st.context?.related_code && (
                                         <div>
                                           <span className="text-[10px] text-gray-600 uppercase tracking-wider">Related code</span>
-                                          <pre className="text-[11px] text-gray-500 mt-0.5 font-mono whitespace-pre-wrap leading-relaxed bg-gray-950 rounded px-2 py-1.5 border border-gray-800/50 max-h-32 overflow-y-auto">{st.context.related_code}</pre>
+                                          <pre className="text-[11px] text-gray-500 mt-0.5 font-mono whitespace-pre-wrap leading-relaxed bg-gray-950 rounded px-2 py-1.5 border border-gray-800/50 max-h-32 overflow-y-auto">{String(st.context.related_code)}</pre>
                                         </div>
                                       )}
                                       {st.context?.integration_points && (
                                         <div>
                                           <span className="text-[10px] text-gray-600 uppercase tracking-wider">Integration points</span>
-                                          <p className="text-[11px] text-gray-500 mt-0.5 leading-relaxed">{st.context.integration_points}</p>
+                                          <p className="text-[11px] text-gray-500 mt-0.5 leading-relaxed">{String(st.context.integration_points)}</p>
                                         </div>
                                       )}
                                     </div>
@@ -1046,28 +1150,33 @@ export default function ProjectChatPage() {
               )})}
               {sending && (
                 <div className="flex justify-start">
-                  <div className={`bg-gray-900 border border-gray-800 rounded-xl px-4 py-2.5 text-sm ${streamingText ? 'max-w-[80%]' : ''}`}>
-                    {streamingText ? (
-                      <div className="text-gray-300 whitespace-pre-wrap max-h-60 overflow-y-auto">
-                        {streamingText}
-                        <span className="inline-block w-1.5 h-4 bg-indigo-400 animate-pulse ml-0.5 align-text-bottom rounded-sm" />
-                      </div>
-                    ) : activity ? (
-                      <span className="inline-flex items-center gap-2 text-gray-500">
-                        <svg className="w-3 h-3 animate-spin text-indigo-400" fill="none" viewBox="0 0 24 24">
-                          <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-                          <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
-                        </svg>
-                        <span className="text-gray-400">{activity}</span>
-                      </span>
-                    ) : (
-                      <span className="inline-flex gap-1 text-gray-500">
-                        <span className="animate-pulse">Thinking</span>
-                        <span className="animate-bounce" style={{ animationDelay: '0.1s' }}>.</span>
-                        <span className="animate-bounce" style={{ animationDelay: '0.2s' }}>.</span>
-                        <span className="animate-bounce" style={{ animationDelay: '0.3s' }}>.</span>
-                      </span>
-                    )}
+                  <div className="max-w-[80%]">
+                    <div className="bg-gray-900 border border-gray-800 rounded-xl px-4 py-2.5 text-sm">
+                      {activity ? (
+                        <span className="inline-flex items-center gap-2 text-gray-500">
+                          <svg className="w-3 h-3 animate-spin text-indigo-400" fill="none" viewBox="0 0 24 24">
+                            <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                            <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+                          </svg>
+                          <span className="text-gray-400">{activity}</span>
+                        </span>
+                      ) : (
+                        <span className="inline-flex gap-1 text-gray-500">
+                          <span className="animate-pulse">Thinking</span>
+                          <span className="animate-bounce" style={{ animationDelay: '0.1s' }}>.</span>
+                          <span className="animate-bounce" style={{ animationDelay: '0.2s' }}>.</span>
+                          <span className="animate-bounce" style={{ animationDelay: '0.3s' }}>.</span>
+                        </span>
+                      )}
+                    </div>
+                    <StreamingPanel liveText={streamingText} completedText={completedStreaming} isStreaming={isStreaming} />
+                  </div>
+                </div>
+              )}
+              {!sending && completedStreaming && (
+                <div className="flex justify-start">
+                  <div className="max-w-[80%]">
+                    <StreamingPanel liveText="" completedText={completedStreaming} isStreaming={false} />
                   </div>
                 </div>
               )}

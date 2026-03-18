@@ -101,7 +101,7 @@ async def execute_action(tool_name: str, arguments: dict, context: dict) -> str:
 
 @chat_action(
     name="create_task",
-    description="Create a new task for the project. Use when the user describes work they want done.",
+    description="Create a new task for the project. Use when the user describes work they want done. Every sub_task MUST specify target_repo (which repository to work in).",
     scope="project",
     input_schema={
         "type": "object",
@@ -122,7 +122,7 @@ async def execute_action(tool_name: str, arguments: dict, context: dict) -> str:
                 "type": "array",
                 "description": (
                     "Pre-planned sub-tasks. When provided, the task skips intake/planning "
-                    "and goes directly to execution."
+                    "and goes directly to execution. Each sub-task MUST specify target_repo."
                 ),
                 "items": {
                     "type": "object",
@@ -139,8 +139,18 @@ async def execute_action(tool_name: str, arguments: dict, context: dict) -> str:
                             "type": "boolean",
                             "description": "Set true for critical code changes needing coder→reviewer→merge cycle",
                         },
+                        "target_repo": {
+                            "type": "string",
+                            "description": (
+                                "REQUIRED. Which repository this sub-task works in. "
+                                "Use 'main' for the main project repo. "
+                                "For dependency repo work, use the EXACT dependency name "
+                                "(e.g. 'auth-service'). You must know which repo you are "
+                                "targeting before creating a sub-task."
+                            ),
+                        },
                     },
-                    "required": ["title", "agent_role"],
+                    "required": ["title", "agent_role", "target_repo"],
                 },
             },
         },
@@ -157,6 +167,19 @@ async def _handle_create_task(arguments: dict, context: dict) -> dict:
 
     session_id = context.get("session_id")
 
+    # Log raw LLM tool-call arguments for debugging target_repo routing
+    logger.info(
+        "[create_task] project=%s title=%r sub_tasks_count=%d raw_arguments=%s",
+        project_id, arguments.get("title"), len(sub_tasks_input),
+        json.dumps(arguments, indent=2, default=str)[:3000],
+    )
+    if sub_tasks_input:
+        for i, st in enumerate(sub_tasks_input):
+            logger.info(
+                "[create_task]   sub_task[%d]: role=%s target_repo=%r title=%r",
+                i, st.get("agent_role"), st.get("target_repo", "(MISSING)"), st.get("title"),
+            )
+
     if sub_tasks_input:
         plan_json = {
             "summary": arguments.get("description", arguments["title"]),
@@ -168,6 +191,7 @@ async def _handle_create_task(arguments: dict, context: dict) -> dict:
                     "execution_order": st.get("execution_order", i),
                     "depends_on": st.get("depends_on", []),
                     "review_loop": bool(st.get("review_loop", False)),
+                    "target_repo": st.get("target_repo", "main"),
                 }
                 for i, st in enumerate(sub_tasks_input)
             ],
@@ -225,6 +249,7 @@ async def _handle_create_task(arguments: dict, context: dict) -> dict:
                             "title": st["title"],
                             "agent_role": st.get("agent_role", "coder"),
                             "description": st.get("description", "")[:200],
+                            "target_repo": st.get("target_repo", "main"),
                         }
                         for st in plan_json.get("sub_tasks", [])
                     ],
@@ -252,17 +277,29 @@ async def _handle_create_task(arguments: dict, context: dict) -> dict:
         )
         todo_id = str(todo["id"])
 
+        # Load context_docs for target_repo resolution
+        from agents.utils.repo_utils import resolve_target_repo
+
+        project_row = await db.fetchrow(
+            "SELECT context_docs FROM projects WHERE id = $1", project_id,
+        )
+        context_docs = []
+        if project_row and project_row.get("context_docs"):
+            raw_cd = project_row["context_docs"]
+            context_docs = json.loads(raw_cd) if isinstance(raw_cd, str) else raw_cd
+
         # Insert sub-tasks into the sub_tasks table
         sub_task_ids = []
         for i, st in enumerate(plan_json["sub_tasks"]):
             review_loop = bool(st.get("review_loop", False))
+            target_repo = resolve_target_repo(st.get("target_repo"), context_docs)
             row = await db.fetchrow(
                 """
                 INSERT INTO sub_tasks (
                     todo_id, title, description, agent_role,
-                    execution_order, input_context, review_loop
+                    execution_order, input_context, review_loop, target_repo
                 )
-                VALUES ($1, $2, $3, $4, $5, '{}'::jsonb, $6)
+                VALUES ($1, $2, $3, $4, $5, '{}'::jsonb, $6, $7)
                 RETURNING id
                 """,
                 todo_id,
@@ -271,6 +308,7 @@ async def _handle_create_task(arguments: dict, context: dict) -> dict:
                 st["agent_role"],
                 st.get("execution_order", 0),
                 review_loop,
+                json.dumps(target_repo) if target_repo else None,
             )
             sub_task_ids.append(str(row["id"]))
 

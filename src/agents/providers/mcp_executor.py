@@ -30,6 +30,88 @@ _BLOCKED_COMMANDS: list[tuple[str, str]] = [
     (r'\bdd\s+if=', "dd blocked"),
 ]
 
+
+def _analyze_command_safety(command: str, repo_dir: str) -> dict:
+    """Analyze a shell command for safety risks beyond the basic blocklist.
+
+    Returns:
+        dict with "risk_level" ("safe"|"moderate"|"dangerous") and "reason" (str).
+    """
+    import re
+
+    reasons: list[str] = []
+    risk = "safe"
+
+    # Pipe chain analysis — detect data piped to interpreters
+    pipe_to_exec = re.search(
+        r'\|\s*(python[23]?|ruby|perl|node|php|bash|sh|zsh|eval)\b',
+        command, re.IGNORECASE,
+    )
+    if pipe_to_exec:
+        reasons.append(f"Pipe to interpreter: {pipe_to_exec.group()}")
+        risk = "dangerous"
+
+    # Destructive file operations
+    destructive_patterns = [
+        (r'\bfind\b.*-delete\b', "find -delete"),
+        (r'\bfind\b.*-exec\s+rm\b', "find -exec rm"),
+        (r'>\s*/dev/sd[a-z]', "Write to block device"),
+        (r'>\s*\.(env|gitignore|dockerignore|git)', "Overwrite config file"),
+        (r'\btruncate\b', "truncate command"),
+        (r'\bshred\b', "shred command"),
+    ]
+    for pattern, desc in destructive_patterns:
+        if re.search(pattern, command, re.IGNORECASE):
+            reasons.append(f"Destructive operation: {desc}")
+            risk = "dangerous"
+
+    # Network exfiltration patterns
+    network_patterns = [
+        (r'\bcurl\b.*(-X\s*POST|-d\s)', "curl POST/data upload", "moderate"),
+        (r'\bwget\b.*--post', "wget POST", "moderate"),
+        (r'\bnc\b|\bnetcat\b', "netcat usage", "dangerous"),
+        (r'\bscp\b|\brsync\b.*:', "Remote file transfer", "moderate"),
+        (r'\bssh\b\s', "SSH command", "moderate"),
+    ]
+    for pattern, desc, level in network_patterns:
+        if re.search(pattern, command, re.IGNORECASE):
+            reasons.append(f"Network operation: {desc}")
+            if level == "dangerous" or risk != "dangerous":
+                risk = max(risk, level, key=lambda x: {"safe": 0, "moderate": 1, "dangerous": 2}[x])
+
+    # Privilege escalation
+    priv_patterns = [
+        (r'\bchown\b', "chown"),
+        (r'\bchmod\b\s+[0-7]*[67][0-7]{2}', "chmod with broad permissions"),
+        (r'\bsetuid\b|\bsetgid\b', "setuid/setgid"),
+    ]
+    for pattern, desc in priv_patterns:
+        if re.search(pattern, command, re.IGNORECASE):
+            reasons.append(f"Privilege change: {desc}")
+            if risk == "safe":
+                risk = "moderate"
+
+    # Path escape — commands targeting outside repo_dir
+    if repo_dir:
+        outside_patterns = [
+            r'(?:^|\s)/etc/',
+            r'(?:^|\s)/usr/',
+            r'(?:^|\s)/var/',
+            r'(?:^|\s)/tmp/',
+            r'(?:^|\s)~/',
+            r'(?:^|\s)\$HOME/',
+        ]
+        for pattern in outside_patterns:
+            if re.search(pattern, command):
+                reasons.append("Targets paths outside repo")
+                if risk == "safe":
+                    risk = "moderate"
+                break
+
+    reason = "; ".join(reasons) if reasons else "No issues detected"
+    return {"risk_level": risk, "reason": reason}
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -229,6 +311,50 @@ class McpToolExecutor:
                 except Exception as fb_err:
                     logger.debug("MCP fallback also failed: %s", fb_err)
             return json.dumps({"error": str(e)})
+
+    async def execute_tools_batch(
+        self,
+        tool_calls: list[dict],
+        mcp_tools: list[dict],
+        *,
+        max_parallel: int = 5,
+    ) -> list[str]:
+        """Execute multiple tool calls concurrently with bounded parallelism.
+
+        Args:
+            tool_calls: List of dicts with "name" and "arguments" keys.
+            mcp_tools: The resolved tools list (with _mcp_server_id or _builtin metadata).
+            max_parallel: Max concurrent tool executions (default 5).
+
+        Returns:
+            List of result strings in the same order as input tool_calls.
+        """
+        sem = asyncio.Semaphore(max_parallel)
+
+        async def _guarded(tc: dict) -> str:
+            async with sem:
+                return await self.execute_tool(
+                    tc["name"], tc.get("arguments", {}), mcp_tools,
+                )
+
+        results = await asyncio.gather(
+            *[_guarded(tc) for tc in tool_calls],
+            return_exceptions=True,
+        )
+
+        # Convert exceptions to error JSON strings
+        processed: list[str] = []
+        for i, r in enumerate(results):
+            if isinstance(r, Exception):
+                tc_name = tool_calls[i].get("name", "unknown")
+                logger.error("batch_exec: tool %s failed: %s", tc_name, r)
+                processed.append(json.dumps({
+                    "error": f"Tool execution failed: {r}",
+                }))
+            else:
+                processed.append(r)
+
+        return processed
 
     def _resolve_allowed_dirs(self, workspace_path: str, tool_name: str) -> list[str]:
         """Compute allowed directories per tool type.
@@ -442,6 +568,14 @@ class McpToolExecutor:
                     match_count = output.count("\n") if output else 0
                     logger.info("builtin[search_files]: %d matching lines, %d chars", match_count, len(output))
                     return output if output else "No matches found."
+                except asyncio.CancelledError:
+                    try:
+                        proc.kill()
+                    except ProcessLookupError:
+                        pass
+                    await proc.wait()
+                    logger.info("builtin[search_files]: cancelled, subprocess killed")
+                    raise
                 except asyncio.TimeoutError:
                     proc.kill()
                     logger.warning("builtin[search_files]: timed out after 30s (pattern=%s)", pattern)
@@ -499,6 +633,19 @@ class McpToolExecutor:
                         logger.warning("builtin[run_command]: blocked: %s — %s", actual_command[:200], _br)
                         return json.dumps({"exit_code": 1, "output": f"Command blocked: {_br}"})
 
+                # Safety analysis beyond blocklist
+                safety = _analyze_command_safety(actual_command, repo_dir)
+                if safety["risk_level"] == "dangerous":
+                    logger.warning("builtin[run_command]: DANGEROUS command blocked: %s — %s",
+                                   actual_command[:200], safety["reason"])
+                    return json.dumps({
+                        "exit_code": 1,
+                        "output": f"Command blocked (safety analysis): {safety['reason']}",
+                    })
+                elif safety["risk_level"] == "moderate":
+                    logger.info("builtin[run_command]: moderate risk: %s — %s",
+                                actual_command[:200], safety["reason"])
+
                 logger.info("builtin[run_command]: cmd=%s cwd=%s", actual_command[:200], effective_cwd)
                 proc = await asyncio.create_subprocess_shell(
                     actual_command,
@@ -521,6 +668,14 @@ class McpToolExecutor:
                         "exit_code": proc.returncode,
                         "output": output,
                     })
+                except asyncio.CancelledError:
+                    try:
+                        proc.kill()
+                    except ProcessLookupError:
+                        pass
+                    await proc.wait()
+                    logger.info("builtin[run_command]: cancelled, subprocess killed cmd=%s", actual_command[:100])
+                    raise
                 except asyncio.TimeoutError:
                     proc.kill()
                     logger.warning("builtin[run_command]: timed out after 120s cmd=%s", actual_command[:200])

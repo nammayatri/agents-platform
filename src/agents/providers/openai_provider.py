@@ -16,6 +16,13 @@ PRICING = {
     "o3-mini": {"input": 1.10, "output": 4.40},
 }
 
+CONTEXT_WINDOWS = {
+    "gpt-4o": 128_000,
+    "gpt-4o-mini": 128_000,
+    "o3": 200_000,
+    "o3-mini": 128_000,
+}
+
 
 class OpenAIProvider(AIProvider):
     provider_type = "openai"
@@ -330,6 +337,9 @@ class OpenAIProvider(AIProvider):
     def estimate_cost(self, tokens_input: int, tokens_output: int, model: str) -> float:
         pricing = PRICING.get(model, {"input": 2.50, "output": 10.0})
         return (tokens_input * pricing["input"] + tokens_output * pricing["output"]) / 1_000_000
+
+    def get_context_window(self, model: str | None = None) -> int:
+        return CONTEXT_WINDOWS.get(model or self.default_model, 128_000)
 
     async def list_models(self) -> list[dict]:
         known = [

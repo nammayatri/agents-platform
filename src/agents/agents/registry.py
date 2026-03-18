@@ -549,6 +549,17 @@ SUB-TASK GUIDELINES:
 - Use depends_on (0-based indexes) for dependencies between sub_tasks within the task
 - Sub_tasks with no dependencies can run in parallel
 
+CRITICAL — target_repo IS REQUIRED ON EVERY SUB-TASK:
+- Every sub_task MUST have a target_repo field. This tells the system which repository the \
+agent should work in. Without it, the task CANNOT be created.
+- Use "main" for work in the main project repository.
+- For dependency repo work, use the EXACT dependency name (e.g. "auth-service", "shared-types").
+- When exploring the codebase, pay attention to WHICH repo you are reading from — the main repo \
+or a dependency at ../deps/{name}/. This determines what target_repo value to use.
+- If the project has configured dependency repos, they will be listed in your context. You MUST \
+route sub-tasks to the correct repo based on which files need to change.
+- A wrong target_repo means the agent codes in the wrong repository and the task fails.
+
 CROSS-REPO EXPLORATION:
 - Dependency repos are available at ../deps/{name}/ (read-only). Use list_directory("../deps/") \
 to see them.
@@ -556,8 +567,8 @@ to see them.
 patterns), explore both the main repo AND relevant deps before planning.
 - Use read_file("../deps/{name}/src/...") and search_files(pattern="...", path="../deps/{name}/") \
 to understand dependency code.
-- When creating tasks that modify a dependency repo, set target_repo on the sub_task with the \
-dep's repo_url, name, default_branch, and git_provider_id.
+- When you explore a dependency repo and find files that need changes there, those sub-tasks \
+MUST have target_repo set to the dependency name — NOT "main".
 
 QUERY ENRICHMENT:
 - Before answering or creating tasks, identify gaps in the user's request — are there ambiguous \

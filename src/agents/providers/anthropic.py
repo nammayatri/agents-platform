@@ -12,6 +12,13 @@ PRICING = {
     "claude-haiku-3-20250311": {"input": 0.25, "output": 1.25},
 }
 
+# Context window sizes (tokens)
+CONTEXT_WINDOWS = {
+    "claude-sonnet-4-20250514": 200_000,
+    "claude-opus-4-20250514": 200_000,
+    "claude-haiku-3-20250311": 200_000,
+}
+
 
 class AnthropicProvider(AIProvider):
     provider_type = "anthropic"
@@ -264,6 +271,9 @@ class AnthropicProvider(AIProvider):
     def estimate_cost(self, tokens_input: int, tokens_output: int, model: str) -> float:
         pricing = PRICING.get(model, {"input": 3.0, "output": 15.0})
         return (tokens_input * pricing["input"] + tokens_output * pricing["output"]) / 1_000_000
+
+    def get_context_window(self, model: str | None = None) -> int:
+        return CONTEXT_WINDOWS.get(model or self.default_model, 200_000)
 
     async def list_models(self) -> list[dict]:
         known = [

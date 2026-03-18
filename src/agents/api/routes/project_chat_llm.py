@@ -358,6 +358,15 @@ async def generate_project_response(
     else:
         action_tools = get_actions_as_tools("project")
 
+    # Load configured repos (main + deps) so LLM knows which repos are available
+    context_docs = project.get("context_docs") or []
+    if isinstance(context_docs, str):
+        context_docs = json.loads(context_docs)
+    configured_dep_names = [
+        d["name"] for d in context_docs
+        if isinstance(d, dict) and d.get("name") and d.get("repo_url")
+    ]
+
     workspace_path = project.get("workspace_path") or ""
     builtin_tools = get_builtin_tool_schemas(workspace_path, "planner") if workspace_path else []
 
@@ -420,12 +429,26 @@ You have the following task management actions for the linked task:
 - **action__remove_subtask** — Remove a pending subtask. Requires sub_task_id.
 - **action__cancel_task** — Cancel the task and stop all running work. ALWAYS confirm with the user first."""
     else:
-        tools_doc = """
+        # Build repo context for task creation
+        repo_context = "\nMain repository: " + (project.get("repo_url") or "(not configured)")
+        if configured_dep_names:
+            dep_str = ", ".join(f"'{n}'" for n in configured_dep_names)
+            repo_context += f"\nConfigured dependency repos: {dep_str}"
+            repo_context += (
+                "\nWhen creating sub_tasks, set target_repo to 'main' for main repo work, "
+                "or to the EXACT dependency name for work in a dependency repo."
+            )
+        else:
+            repo_context += "\nNo dependency repos configured — use target_repo='main' for all sub_tasks."
+
+        tools_doc = f"""
 You have the following actions available:
 - **action__create_task** — Create a new tracked task. Use when the user describes work they want done. \
 You can include sub_tasks to send work directly to execution, or omit them for the intake/planning pipeline. \
-IMPORTANT: Always create ONE task with ALL sub_tasks inside it. Never create multiple separate tasks for related work.
-- **action__delete_task** — Delete a task. ALWAYS ask for user confirmation before calling this."""
+IMPORTANT: Always create ONE task with ALL sub_tasks inside it. Never create multiple separate tasks for related work. \
+Every sub_task MUST have target_repo set — this is required.
+- **action__delete_task** — Delete a task. ALWAYS ask for user confirmation before calling this.
+{repo_context}"""
 
     if builtin_tools:
         tools_doc += """
@@ -466,6 +489,13 @@ Project: "{project['name']}"
         messages.append(LLMMessage(role=row["role"], content=row["content"]))
     messages.append(LLMMessage(role="user", content=user_message))
 
+    logger.info(
+        "[chat] session=%s mode=%s dep_repos=%s system_prompt_tail:\n...%s",
+        session_id, intent,
+        configured_dep_names if configured_dep_names else "(none)",
+        system_prompt[-800:],
+    )
+
     from agents.providers.base import run_tool_loop
 
     all_tools = (action_tools or []) + builtin_tools + (mcp_tools or [])
@@ -487,6 +517,11 @@ Project: "{project['name']}"
     async def _execute_tool(name: str, arguments: dict) -> str:
         nonlocal metadata
         if is_action_tool(name):
+            logger.info(
+                "[chat_tool] session=%s tool=%s raw_arguments:\n%s",
+                session_id, name,
+                json.dumps(arguments, indent=2, default=str)[:5000],
+            )
             result_text = await execute_action(name, arguments, action_context)
             try:
                 result_data = json.loads(result_text)
@@ -769,6 +804,19 @@ async def generate_plan_response(
     if project.get("repo_url"):
         project_ctx_parts.append(f"Repository: {project['repo_url']}")
 
+    # Add explicit list of dependency repos for target_repo routing
+    context_docs = project.get("context_docs") or []
+    if isinstance(context_docs, str):
+        import json as _json
+        context_docs = _json.loads(context_docs)
+    dep_repo_names = [d["name"] for d in context_docs if isinstance(d, dict) and d.get("name") and d.get("repo_url")]
+    if dep_repo_names:
+        dep_str = ", ".join(f"'{n}'" for n in dep_repo_names)
+        project_ctx_parts.append(
+            f"Dependency repos (for target_repo field): {dep_str}. "
+            "Set target_repo to the EXACT dependency name for subtasks that modify a dep repo."
+        )
+
     settings = safe_json(project.get("settings_json"))
 
     # Reuse the shared context builder (includes full understanding,
@@ -938,7 +986,7 @@ async def generate_plan_response(
     # ── Build execution metadata for UI ──────────────────────────────
     execution_meta = _build_execution_metadata(tool_events, response)
 
-    # ── Plan extraction & acceptance (unchanged) ─────────────────────
+    # ── Plan extraction & acceptance ─────────────────────────────────
     metadata = None
     if "```json" in content and '"action"' in content and '"create_plan"' in content:
         try:
@@ -946,9 +994,22 @@ async def generate_plan_response(
             # from tool results that might contain markdown JSON fences).
             json_start = content.rindex("```json") + 7
             json_end = content.index("```", json_start)
-            plan_data = json.loads(content[json_start:json_end].strip())
+            raw_plan_json = content[json_start:json_end].strip()
+            logger.info(
+                "[plan_mode] session=%s raw plan JSON from LLM:\n%s",
+                session_id, raw_plan_json[:5000],
+            )
+            plan_data = json.loads(raw_plan_json)
 
             if plan_data.get("action") == "create_plan":
+                # Log per-task target_repo for debugging
+                for ti, task in enumerate(plan_data.get("tasks", [])):
+                    for si, st in enumerate(task.get("subtasks", [])):
+                        logger.info(
+                            "[plan_mode]   task[%d].subtask[%d]: role=%s target_repo=%r title=%r",
+                            ti, si, st.get("agent_role"), st.get("target_repo", "(MISSING)"), st.get("title"),
+                        )
+
                 await db.execute(
                     "UPDATE project_chat_sessions SET plan_json = $2::jsonb, updated_at = NOW() WHERE id = $1",
                     session_id,
@@ -960,8 +1021,11 @@ async def generate_plan_response(
                     "task_count": len(plan_data.get("tasks", [])),
                     "plan_data": plan_data,
                 }
-        except (ValueError, json.JSONDecodeError, KeyError):
-            pass
+        except (ValueError, json.JSONDecodeError, KeyError) as exc:
+            logger.warning(
+                "[plan_mode] session=%s plan JSON parse failed: %s\nRaw content tail:\n%s",
+                session_id, exc, content[-2000:],
+            )
 
     plan_json = session.get("plan_json")
     if plan_json and is_plan_acceptance(user_message):
@@ -1482,10 +1546,13 @@ The user wants to create a task. Your job:
 2. Use action__create_task to create it immediately
 3. Include sub_tasks with appropriate agent roles if the scope is clear
 4. If the description is too vague, ask ONE clarifying question, then create
+5. Every sub_task MUST have target_repo set — you must know which repo each sub_task targets
 
 Always create exactly ONE task. Be efficient — don't over-discuss, just create.
 
 {tools_doc}
+
+{repos_doc}
 
 Valid agent roles for sub_tasks: coder, tester, reviewer, pr_creator, report_writer
 Valid task types: code, research, document, general
@@ -1542,12 +1609,33 @@ async def generate_create_task_response(
 
     tools_doc = """You have the following action:
 - **action__create_task** — Create a new tracked task. Include sub_tasks to send work directly to execution.
-  IMPORTANT: Always create ONE task with ALL sub_tasks inside it."""
+  IMPORTANT: Always create ONE task with ALL sub_tasks inside it. Every sub_task MUST have target_repo."""
+
+    # Build repos documentation
+    context_docs = project.get("context_docs") or []
+    if isinstance(context_docs, str):
+        context_docs = json.loads(context_docs)
+    dep_names = [
+        d["name"] for d in context_docs
+        if isinstance(d, dict) and d.get("name") and d.get("repo_url")
+    ]
+
+    repos_parts = [f"Main repository: {project.get('repo_url') or '(not configured)'}"]
+    if dep_names:
+        dep_str = ", ".join(f"'{n}'" for n in dep_names)
+        repos_parts.append(f"Configured dependency repos: {dep_str}")
+        repos_parts.append(
+            "Set target_repo='main' for main repo work, or the EXACT dependency name for dep work."
+        )
+    else:
+        repos_parts.append("No dependency repos configured — use target_repo='main' for all sub_tasks.")
+    repos_doc = "\n".join(repos_parts)
 
     system_prompt = CREATE_TASK_SYSTEM.format(
         project_name=project["name"],
         project_context=project_context,
         tools_doc=tools_doc,
+        repos_doc=repos_doc,
     )
 
     history = await db.fetch(
@@ -1577,6 +1665,11 @@ async def generate_create_task_response(
     async def _execute_tool(name: str, arguments: dict) -> str:
         nonlocal metadata
         if is_action_tool(name):
+            logger.info(
+                "[create_task_mode] session=%s tool=%s raw_arguments:\n%s",
+                session_id, name,
+                json.dumps(arguments, indent=2, default=str)[:5000],
+            )
             result_text = await execute_action(name, arguments, action_context)
             try:
                 result_data = json.loads(result_text)

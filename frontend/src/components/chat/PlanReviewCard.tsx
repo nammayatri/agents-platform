@@ -150,11 +150,11 @@ export default function PlanReviewCard({
                           <span className="px-1 py-0.5 bg-cyan-500/10 border border-cyan-500/20 rounded text-[10px] text-cyan-400/80 shrink-0">review</span>
                         )}
                         <span className={`px-1 py-0.5 rounded text-[10px] font-mono shrink-0 ${
-                          st.target_repo && st.target_repo !== 'main'
+                          st.target_repo && String(st.target_repo) !== 'main'
                             ? 'bg-purple-500/10 border border-purple-500/20 text-purple-400/80'
                             : 'bg-gray-800 text-gray-500'
                         }`}>
-                          {st.target_repo || 'main'}
+                          {String(st.target_repo || 'main')}
                         </span>
                         {st.depends_on && st.depends_on.length > 0 && (
                           <span className="text-[10px] text-gray-700 font-mono shrink-0">
@@ -165,17 +165,17 @@ export default function PlanReviewCard({
                       {isExpanded && (
                         <div className="ml-5 pl-3 border-l border-gray-800 mb-2 space-y-1.5 py-1.5">
                           {st.description && (
-                            <p className="text-[11px] text-gray-500 leading-relaxed">{st.description}</p>
+                            <p className="text-[11px] text-gray-500 leading-relaxed">{String(st.description)}</p>
                           )}
-                          {st.context && (
+                          {st.context && typeof st.context === 'object' && (
                             <>
-                              {st.context.relevant_files && st.context.relevant_files.length > 0 && (
+                              {Array.isArray(st.context.relevant_files) && st.context.relevant_files.length > 0 && (
                                 <div>
                                   <span className="text-[10px] text-gray-600 uppercase tracking-wider">Files</span>
                                   <div className="mt-0.5 flex flex-wrap gap-1">
                                     {st.context.relevant_files.map((f, fi) => (
                                       <span key={fi} className="text-[11px] font-mono text-indigo-400/70 bg-indigo-500/5 px-1.5 py-0.5 rounded">
-                                        {f}
+                                        {String(f)}
                                       </span>
                                     ))}
                                   </div>
@@ -184,31 +184,31 @@ export default function PlanReviewCard({
                               {st.context.what_to_change && (
                                 <div>
                                   <span className="text-[10px] text-gray-600 uppercase tracking-wider">What to change</span>
-                                  <p className="text-[11px] text-gray-500 mt-0.5 leading-relaxed">{st.context.what_to_change}</p>
+                                  <p className="text-[11px] text-gray-500 mt-0.5 leading-relaxed">{String(st.context.what_to_change)}</p>
                                 </div>
                               )}
                               {st.context.current_state && (
                                 <div>
                                   <span className="text-[10px] text-gray-600 uppercase tracking-wider">Current state</span>
-                                  <p className="text-[11px] text-gray-500 mt-0.5 leading-relaxed">{st.context.current_state}</p>
+                                  <p className="text-[11px] text-gray-500 mt-0.5 leading-relaxed">{String(st.context.current_state)}</p>
                                 </div>
                               )}
                               {st.context.patterns_to_follow && (
                                 <div>
                                   <span className="text-[10px] text-gray-600 uppercase tracking-wider">Patterns to follow</span>
-                                  <p className="text-[11px] text-gray-500 mt-0.5 leading-relaxed">{st.context.patterns_to_follow}</p>
+                                  <p className="text-[11px] text-gray-500 mt-0.5 leading-relaxed">{String(st.context.patterns_to_follow)}</p>
                                 </div>
                               )}
                               {st.context.related_code && (
                                 <div>
                                   <span className="text-[10px] text-gray-600 uppercase tracking-wider">Related code</span>
-                                  <pre className="text-[11px] text-gray-500 mt-0.5 font-mono whitespace-pre-wrap leading-relaxed bg-gray-950 rounded px-2 py-1.5 border border-gray-800/50 max-h-32 overflow-y-auto">{st.context.related_code}</pre>
+                                  <pre className="text-[11px] text-gray-500 mt-0.5 font-mono whitespace-pre-wrap leading-relaxed bg-gray-950 rounded px-2 py-1.5 border border-gray-800/50 max-h-32 overflow-y-auto">{String(st.context.related_code)}</pre>
                                 </div>
                               )}
                               {st.context.integration_points && (
                                 <div>
                                   <span className="text-[10px] text-gray-600 uppercase tracking-wider">Integration points</span>
-                                  <p className="text-[11px] text-gray-500 mt-0.5 leading-relaxed">{st.context.integration_points}</p>
+                                  <p className="text-[11px] text-gray-500 mt-0.5 leading-relaxed">{String(st.context.integration_points)}</p>
                                 </div>
                               )}
                             </>

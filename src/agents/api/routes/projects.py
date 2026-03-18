@@ -1,5 +1,6 @@
 import asyncio
 import json
+import secrets
 
 from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel
@@ -609,6 +610,88 @@ async def delete_memory(project_id: str, memory_id: str, user: CurrentUser, db: 
     )
     if result == "DELETE 0":
         raise HTTPException(status_code=404, detail="Memory not found")
+
+
+# ── Webhook Secrets ──────────────────────────────────────────
+
+
+class WebhookSecretInput(BaseModel):
+    provider_type: str  # 'github' | 'gitlab'
+
+
+@router.post("/{project_id}/webhook-secrets", status_code=status.HTTP_201_CREATED)
+async def create_webhook_secret(
+    project_id: str, body: WebhookSecretInput, user: CurrentUser, db: DB,
+):
+    """Generate and store a webhook secret for a provider. Owner-only."""
+    await check_project_owner(db, project_id, user)
+
+    if body.provider_type not in ("github", "gitlab"):
+        raise HTTPException(status_code=400, detail="provider_type must be 'github' or 'gitlab'")
+
+    secret = secrets.token_hex(32)
+
+    # Upsert: deactivate existing, insert new
+    await db.execute(
+        "UPDATE webhook_secrets SET is_active = FALSE WHERE project_id = $1 AND provider_type = $2",
+        project_id, body.provider_type,
+    )
+    row = await db.fetchrow(
+        """
+        INSERT INTO webhook_secrets (project_id, provider_type, secret)
+        VALUES ($1, $2, $3)
+        RETURNING id, provider_type, is_active, created_at
+        """,
+        project_id, body.provider_type, secret,
+    )
+
+    return {
+        "id": str(row["id"]),
+        "provider_type": row["provider_type"],
+        "secret": secret,
+        "webhook_url": f"/api/webhooks/{body.provider_type}/{project_id}",
+        "created_at": str(row["created_at"]),
+    }
+
+
+@router.get("/{project_id}/webhook-secrets")
+async def list_webhook_secrets(project_id: str, user: CurrentUser, db: DB):
+    """List webhook secrets (without exposing secret values). Owner-only."""
+    await check_project_owner(db, project_id, user)
+    rows = await db.fetch(
+        """
+        SELECT id, provider_type, is_active, created_at, updated_at
+        FROM webhook_secrets
+        WHERE project_id = $1
+        ORDER BY created_at DESC
+        """,
+        project_id,
+    )
+    return [
+        {
+            "id": str(r["id"]),
+            "provider_type": r["provider_type"],
+            "is_active": r["is_active"],
+            "webhook_url": f"/api/webhooks/{r['provider_type']}/{project_id}",
+            "created_at": str(r["created_at"]),
+            "updated_at": str(r["updated_at"]),
+        }
+        for r in rows
+    ]
+
+
+@router.delete("/{project_id}/webhook-secrets/{secret_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_webhook_secret(
+    project_id: str, secret_id: str, user: CurrentUser, db: DB,
+):
+    """Delete a webhook secret. Owner-only."""
+    await check_project_owner(db, project_id, user)
+    result = await db.execute(
+        "DELETE FROM webhook_secrets WHERE id = $1 AND project_id = $2",
+        secret_id, project_id,
+    )
+    if result == "DELETE 0":
+        raise HTTPException(status_code=404, detail="Webhook secret not found")
 
 
 async def _analyze_project(project_id: str, db, redis=None) -> None:

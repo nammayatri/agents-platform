@@ -436,15 +436,27 @@ async def approve_plan(todo_id: str, user: CurrentUser, db: DB, redis: Redis, ev
     if isinstance(plan, str):
         plan = json.loads(plan)
 
+    # Load context_docs for target_repo resolution
+    from agents.utils.repo_utils import resolve_target_repo
+    project_row = await db.fetchrow(
+        "SELECT context_docs FROM projects WHERE id = $1", todo["project_id"],
+    )
+    context_docs = []
+    if project_row and project_row.get("context_docs"):
+        raw = project_row["context_docs"]
+        context_docs = json.loads(raw) if isinstance(raw, str) else raw
+
     sub_task_ids = []
     for st in plan.get("sub_tasks", []):
+        review_loop = bool(st.get("review_loop", False))
+        target_repo = resolve_target_repo(st.get("target_repo"), context_docs)
         row = await db.fetchrow(
             """
             INSERT INTO sub_tasks (
                 todo_id, title, description, agent_role,
-                execution_order, input_context
+                execution_order, input_context, review_loop, target_repo
             )
-            VALUES ($1, $2, $3, $4, $5, $6::jsonb)
+            VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8::jsonb)
             RETURNING id
             """,
             todo_id,
@@ -453,8 +465,16 @@ async def approve_plan(todo_id: str, user: CurrentUser, db: DB, redis: Redis, ev
             st["agent_role"],
             st.get("execution_order", 0),
             json.dumps(st.get("context", {})),
+            review_loop,
+            json.dumps(target_repo) if target_repo else None,
         )
         sub_task_ids.append(str(row["id"]))
+
+        if review_loop:
+            await db.execute(
+                "UPDATE sub_tasks SET review_chain_id = $1 WHERE id = $1",
+                row["id"],
+            )
 
     for i, st in enumerate(plan.get("sub_tasks", [])):
         depends_on = st.get("depends_on", [])

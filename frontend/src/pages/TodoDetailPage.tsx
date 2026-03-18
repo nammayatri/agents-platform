@@ -38,6 +38,7 @@ const ROLE_LABELS: Record<string, string> = {
   pr_creator: 'PR',
   report_writer: 'Report',
   merge_agent: 'Merge',
+  merge_observer: 'Watch',
   release_build_watcher: 'Build',
   release_deployer: 'Deploy',
 }
@@ -45,6 +46,15 @@ const ROLE_LABELS: Record<string, string> = {
 const VERDICT_COLORS: Record<string, string> = {
   approved: 'bg-emerald-500/10 text-emerald-400/80 border-emerald-500/20',
   needs_changes: 'bg-amber-500/10 text-amber-400/80 border-amber-500/20',
+}
+
+/** Safely render a value that might be an object (LLM output) as a string. */
+function safeStr(v: unknown): string {
+  if (v == null) return ''
+  if (typeof v === 'string') return v
+  if (typeof v === 'number' || typeof v === 'boolean') return String(v)
+  if (typeof v === 'object' && 'name' in (v as Record<string, unknown>)) return String((v as Record<string, unknown>).name)
+  return JSON.stringify(v)
 }
 
 export default function TodoDetailPage() {
@@ -337,6 +347,30 @@ export default function TodoDetailPage() {
           )
         })()}
 
+        {/* External Merge Observer Panel */}
+        {todo.sub_state === 'awaiting_external_merge' && (() => {
+          const prDeliverable = taskDeliverables.find((d: Deliverable) => d.type === 'pull_request' && d.pr_url)
+          return (
+            <div className="mb-5 bg-gray-900 border border-cyan-500/20 rounded-lg overflow-hidden">
+              <div className="px-4 py-3 border-b border-gray-800 flex items-center gap-2">
+                <span className="w-2 h-2 rounded-full bg-cyan-400 animate-pulse" />
+                <h2 className="text-sm font-medium text-white">Waiting for External Merge</h2>
+              </div>
+              <div className="px-4 py-3">
+                <p className="text-sm text-gray-400 mb-2">
+                  A PR has been created and is awaiting merge on your git provider. The system is watching for the merge — no action needed here.
+                </p>
+                {prDeliverable && prDeliverable.pr_url && (
+                  <a href={prDeliverable.pr_url} target="_blank" rel="noreferrer"
+                    className="text-sm text-indigo-400 hover:underline">
+                    PR #{prDeliverable.pr_number}: {prDeliverable.title}
+                  </a>
+                )}
+              </div>
+            </div>
+          )
+        })()}
+
         {/* Release Approval Panel */}
         {todo.sub_state === 'awaiting_release_approval' && (
           <div className="mb-5 bg-gray-900 border border-amber-500/20 rounded-lg overflow-hidden">
@@ -423,7 +457,7 @@ export default function TodoDetailPage() {
             )}
 
             <div className="divide-y divide-gray-800">
-              {todo.plan_json.sub_tasks.map((st: PlanSubTask, i: number) => (
+              {(todo.plan_json.sub_tasks || []).map((st: PlanSubTask, i: number) => (
                 <div key={i} className="px-4 py-3">
                   <div className="flex items-start gap-3">
                     <span className="text-[11px] text-gray-600 font-mono mt-0.5 w-5 text-right shrink-0">{i + 1}</span>
@@ -437,11 +471,11 @@ export default function TodoDetailPage() {
                           <span className="px-1.5 py-0.5 bg-cyan-500/10 border border-cyan-500/20 rounded text-[10px] text-cyan-400/80">review loop</span>
                         )}
                         <span className={`px-1.5 py-0.5 rounded text-[10px] font-mono ${
-                          st.target_repo && st.target_repo !== 'main'
+                          st.target_repo && safeStr(st.target_repo) !== 'main'
                             ? 'bg-purple-500/10 border border-purple-500/20 text-purple-400/80'
                             : 'bg-gray-800 text-gray-500'
                         }`}>
-                          {st.target_repo || 'main'}
+                          {safeStr(st.target_repo) || 'main'}
                         </span>
                         {st.depends_on && st.depends_on.length > 0 && (
                           <span className="text-[11px] text-gray-700 font-mono">
@@ -450,18 +484,18 @@ export default function TodoDetailPage() {
                         )}
                       </div>
                       {st.description && (
-                        <p className="text-[11px] text-gray-500 leading-relaxed mt-1">{st.description}</p>
+                        <p className="text-[11px] text-gray-500 leading-relaxed mt-1">{safeStr(st.description)}</p>
                       )}
                       {/* Context details */}
-                      {st.context && Object.keys(st.context).length > 0 && (
+                      {st.context && typeof st.context === 'object' && Object.keys(st.context).length > 0 && (
                         <div className="mt-2 space-y-1.5 pl-0.5">
-                          {st.context.relevant_files && st.context.relevant_files.length > 0 && (
+                          {Array.isArray(st.context.relevant_files) && st.context.relevant_files.length > 0 && (
                             <div>
                               <span className="text-[10px] text-gray-600 uppercase tracking-wider">Files</span>
                               <div className="mt-0.5 flex flex-wrap gap-1">
                                 {st.context.relevant_files.map((f, fi) => (
                                   <span key={fi} className="text-[11px] font-mono text-indigo-400/70 bg-indigo-500/5 px-1.5 py-0.5 rounded">
-                                    {f}
+                                    {safeStr(f)}
                                   </span>
                                 ))}
                               </div>
@@ -470,31 +504,31 @@ export default function TodoDetailPage() {
                           {st.context.what_to_change && (
                             <div>
                               <span className="text-[10px] text-gray-600 uppercase tracking-wider">What to change</span>
-                              <p className="text-[11px] text-gray-500 mt-0.5 leading-relaxed">{st.context.what_to_change}</p>
+                              <p className="text-[11px] text-gray-500 mt-0.5 leading-relaxed">{safeStr(st.context.what_to_change)}</p>
                             </div>
                           )}
                           {st.context.current_state && (
                             <div>
                               <span className="text-[10px] text-gray-600 uppercase tracking-wider">Current state</span>
-                              <p className="text-[11px] text-gray-500 mt-0.5 leading-relaxed">{st.context.current_state}</p>
+                              <p className="text-[11px] text-gray-500 mt-0.5 leading-relaxed">{safeStr(st.context.current_state)}</p>
                             </div>
                           )}
                           {st.context.patterns_to_follow && (
                             <div>
                               <span className="text-[10px] text-gray-600 uppercase tracking-wider">Patterns to follow</span>
-                              <p className="text-[11px] text-gray-500 mt-0.5 leading-relaxed">{st.context.patterns_to_follow}</p>
+                              <p className="text-[11px] text-gray-500 mt-0.5 leading-relaxed">{safeStr(st.context.patterns_to_follow)}</p>
                             </div>
                           )}
                           {st.context.related_code && (
                             <div>
                               <span className="text-[10px] text-gray-600 uppercase tracking-wider">Related code</span>
-                              <pre className="text-[11px] text-gray-500 mt-0.5 font-mono whitespace-pre-wrap leading-relaxed bg-gray-950 rounded px-2 py-1.5 border border-gray-800/50 max-h-32 overflow-y-auto">{st.context.related_code}</pre>
+                              <pre className="text-[11px] text-gray-500 mt-0.5 font-mono whitespace-pre-wrap leading-relaxed bg-gray-950 rounded px-2 py-1.5 border border-gray-800/50 max-h-32 overflow-y-auto">{safeStr(st.context.related_code)}</pre>
                             </div>
                           )}
                           {st.context.integration_points && (
                             <div>
                               <span className="text-[10px] text-gray-600 uppercase tracking-wider">Integration points</span>
-                              <p className="text-[11px] text-gray-500 mt-0.5 leading-relaxed">{st.context.integration_points}</p>
+                              <p className="text-[11px] text-gray-500 mt-0.5 leading-relaxed">{safeStr(st.context.integration_points)}</p>
                             </div>
                           )}
                         </div>
@@ -725,6 +759,9 @@ export default function TodoDetailPage() {
         {todo.sub_tasks && todo.sub_tasks.length > 0 && (() => {
           const currentTasks = todo.sub_tasks.filter((st: SubTask) => !isSubTaskPreviousRun(st))
           const previousTasks = todo.sub_tasks.filter((st: SubTask) => isSubTaskPreviousRun(st))
+          // Build UUID → 1-based index map for dependency display
+          const stIdToIndex = new Map<string, number>()
+          currentTasks.forEach((st: SubTask, idx: number) => stIdToIndex.set(st.id, idx + 1))
 
           return (
           <div className="mb-6">
@@ -769,6 +806,14 @@ export default function TodoDetailPage() {
                         }`}>
                           {st.target_repo ? st.target_repo.name : 'main'}
                         </span>
+                        {st.depends_on && st.depends_on.length > 0 && (
+                          <span className={`text-[10px] font-mono shrink-0 ${
+                            st.status === 'pending' ? 'text-amber-400/70' : 'text-gray-600'
+                          }`}>
+                            {st.status === 'pending' ? 'blocked by' : 'after'}{' '}
+                            {st.depends_on.map((depId) => `#${stIdToIndex.get(depId) ?? '?'}`).join(', ')}
+                          </span>
+                        )}
                         {hasIterations && (
                           <span className="text-[11px] text-gray-600 font-mono shrink-0">
                             {iterLog.length} iter{iterLog.length !== 1 ? 's' : ''}
@@ -825,6 +870,15 @@ export default function TodoDetailPage() {
                           )
                         })()}
                       </div>
+                      {/* Inline output summary for completed/failed subtasks */}
+                      {(st.status === 'completed' || st.status === 'failed') && st.output_result && (() => {
+                        const out = st.output_result
+                        const summary = (out.summary || out.approach || out.root_cause || out.test_summary || out.executive_summary || out.merge_decision) as string | undefined
+                        if (!summary) return null
+                        return (
+                          <p className="mt-1 ml-0 text-[11px] text-gray-500 leading-relaxed line-clamp-2">{summary}</p>
+                        )
+                      })()}
                       {st.status === 'running' && (
                         <div className="mt-2">
                           <div className="w-full bg-gray-800 rounded-full h-1">
@@ -1129,6 +1183,9 @@ export default function TodoDetailPage() {
                             if (out.merge_decision) items.push({ label: 'Decision', value: out.merge_decision as string })
                             if (out.reason) items.push({ label: 'Reason', value: out.reason as string })
                             items.push({ label: 'CI Passed', value: (out.ci_passed as boolean) ? 'Yes' : 'No' })
+                          } else if (role === 'merge_observer') {
+                            if (out.pr_merged != null) items.push({ label: 'PR Merged', value: (out.pr_merged as boolean) ? 'Yes' : 'No' })
+                            if (out.merge_commit_sha) items.push({ label: 'Merge SHA', value: out.merge_commit_sha as string })
                           } else if (role === 'reviewer') {
                             // Reviewer already has its own detailed section above, just show summary here
                             if (out.summary) items.push({ label: 'Summary', value: out.summary as string })
@@ -1282,25 +1339,171 @@ export default function TodoDetailPage() {
               })}
             </div>
 
-            {/* Previous run sub-tasks (greyed out) */}
+            {/* Previous run sub-tasks (greyed out, with expandable details) */}
             {previousTasks.length > 0 && (
               <div className="mt-4">
                 <div className="text-[10px] text-gray-600 uppercase tracking-wider mb-1.5">Previous Run</div>
-                <div className="space-y-1 opacity-40">
-                  {previousTasks.map((st: SubTask) => (
-                    <div key={st.id} className="px-3 py-2 bg-gray-900/50 rounded-lg border border-gray-800/30">
-                      <div className="flex items-center gap-2 flex-wrap">
-                        <span className={`px-1.5 py-0.5 rounded text-[11px] font-medium text-white ${SUBTASK_COLORS[st.status]}`}>
-                          {st.status}
-                        </span>
-                        <span className="text-[11px] text-indigo-400/70">{ROLE_LABELS[st.agent_role] || st.agent_role}</span>
-                        <span className="text-sm text-gray-400">{st.title}</span>
-                        {st.error_message && (
-                          <span className="ml-auto text-[11px] text-red-400/60 font-mono truncate max-w-xs">{st.error_message}</span>
+                <div className="space-y-1.5 opacity-50">
+                  {previousTasks.map((st: SubTask) => {
+                    const hasOutputDetails = st.output_result && Object.keys(st.output_result).some(k => k !== 'raw_content' && k !== 'content')
+                    const hasInputCtx = st.input_context && Object.keys(st.input_context).length > 0
+                    const hasDetails = hasOutputDetails || st.description || st.error_message || hasInputCtx
+                    const isOpen = expandedDetails.has(st.id)
+
+                    return (
+                      <div key={st.id} className="bg-gray-900/50 rounded-lg border border-gray-800/30 overflow-hidden">
+                        <div className="px-3 py-2">
+                          <div className="flex items-center gap-2 flex-wrap">
+                            <span className={`px-1.5 py-0.5 rounded text-[11px] font-medium text-white ${SUBTASK_COLORS[st.status]}`}>
+                              {st.status}
+                            </span>
+                            <span className="text-[11px] text-indigo-400/70">{ROLE_LABELS[st.agent_role] || st.agent_role}</span>
+                            <span className="text-sm text-gray-400">{st.title}</span>
+                            {st.target_repo && (
+                              <span className="px-1.5 py-0.5 rounded text-[10px] font-mono bg-purple-500/10 border border-purple-500/20 text-purple-400/80">
+                                {st.target_repo.name || 'main'}
+                              </span>
+                            )}
+                            {st.error_message && !isOpen && (
+                              <span className="text-[11px] text-red-400/60 font-mono truncate max-w-xs">{st.error_message}</span>
+                            )}
+                            {hasDetails && (
+                              <button
+                                onClick={() => setExpandedDetails((prev) => {
+                                  const next = new Set(prev)
+                                  if (next.has(st.id)) next.delete(st.id); else next.add(st.id)
+                                  return next
+                                })}
+                                className="ml-auto px-2 py-0.5 bg-gray-800 hover:bg-gray-700 rounded text-[10px] text-gray-400 transition-colors shrink-0"
+                              >
+                                {isOpen ? 'Hide' : 'Details'}
+                              </button>
+                            )}
+                          </div>
+
+                          {/* Inline output summary for completed subtasks */}
+                          {st.status === 'completed' && st.output_result && (() => {
+                            const out = st.output_result
+                            const summary = (out.summary || out.approach || out.root_cause || out.test_summary || out.executive_summary || out.merge_decision) as string | undefined
+                            if (!summary) return null
+                            return (
+                              <p className="mt-1.5 text-[11px] text-gray-500 leading-relaxed line-clamp-2">{summary}</p>
+                            )
+                          })()}
+                        </div>
+
+                        {/* Expanded details */}
+                        {isOpen && (
+                          <div className="border-t border-gray-800/30 px-3 py-2.5 bg-gray-950/30 space-y-2">
+                            {st.description && (
+                              <details open>
+                                <summary className="text-[10px] text-gray-600 uppercase tracking-wider cursor-pointer hover:text-gray-500">
+                                  Task Instructions
+                                </summary>
+                                <pre className="mt-1.5 text-[11px] text-gray-500 font-mono whitespace-pre-wrap max-h-32 overflow-y-auto leading-relaxed bg-gray-950 rounded px-2.5 py-2 border border-gray-800/50">
+                                  {st.description}
+                                </pre>
+                              </details>
+                            )}
+
+                            {hasInputCtx && (
+                              <details>
+                                <summary className="text-[10px] text-gray-600 uppercase tracking-wider cursor-pointer hover:text-gray-500">
+                                  Agent Context
+                                </summary>
+                                <div className="mt-1.5 space-y-1.5">
+                                  {st.input_context!.relevant_files && st.input_context!.relevant_files.length > 0 && (
+                                    <div>
+                                      <span className="text-[10px] text-gray-600">Files:</span>
+                                      <div className="mt-0.5 flex flex-wrap gap-1">
+                                        {st.input_context!.relevant_files.map((f: string, fi: number) => (
+                                          <span key={fi} className="text-[11px] font-mono text-indigo-400/70 bg-indigo-500/5 px-1.5 py-0.5 rounded">{f}</span>
+                                        ))}
+                                      </div>
+                                    </div>
+                                  )}
+                                  {st.input_context!.what_to_change && (
+                                    <div>
+                                      <span className="text-[10px] text-gray-600">What to change:</span>
+                                      <p className="text-[11px] text-gray-500 mt-0.5 leading-relaxed">{st.input_context!.what_to_change}</p>
+                                    </div>
+                                  )}
+                                </div>
+                              </details>
+                            )}
+
+                            {/* Output result details */}
+                            {st.output_result && (() => {
+                              const out = st.output_result!
+                              const role = st.agent_role
+                              const items: Array<{ label: string; value: string | string[] | boolean | undefined | null }> = []
+
+                              if (role === 'coder') {
+                                if (out.approach) items.push({ label: 'Approach', value: out.approach as string })
+                                if (out.files_changed && (out.files_changed as string[]).length > 0) items.push({ label: 'Files Changed', value: out.files_changed as string[] })
+                              } else if (role === 'tester') {
+                                if (out.test_summary) items.push({ label: 'Test Summary', value: out.test_summary as string })
+                                if (out.passed != null) items.push({ label: 'Passed', value: (out.passed as boolean) ? 'Yes' : 'No' })
+                              } else if (role === 'debugger') {
+                                if (out.root_cause) items.push({ label: 'Root Cause', value: out.root_cause as string })
+                                if (out.evidence && (out.evidence as string[]).length > 0) items.push({ label: 'Evidence', value: out.evidence as string[] })
+                                if (out.recommendation) items.push({ label: 'Recommendation', value: out.recommendation as string })
+                              } else if (role === 'reviewer') {
+                                if (out.summary) items.push({ label: 'Summary', value: out.summary as string })
+                              } else if (role === 'merge_agent') {
+                                if (out.merge_decision) items.push({ label: 'Decision', value: out.merge_decision as string })
+                                if (out.reason) items.push({ label: 'Reason', value: out.reason as string })
+                              } else if (role === 'merge_observer') {
+                                if (out.pr_merged != null) items.push({ label: 'PR Merged', value: (out.pr_merged as boolean) ? 'Yes' : 'No' })
+                                if (out.merge_commit_sha) items.push({ label: 'Merge SHA', value: out.merge_commit_sha as string })
+                              } else {
+                                for (const [k, v] of Object.entries(out)) {
+                                  if (k === 'raw_content' || k === 'content') continue
+                                  if (typeof v === 'string' && v) items.push({ label: k, value: v })
+                                  if (Array.isArray(v) && v.length > 0) items.push({ label: k, value: v as string[] })
+                                }
+                              }
+
+                              if (items.length === 0) return null
+                              return (
+                                <div className="space-y-1.5">
+                                  <div className="text-[10px] text-gray-600 uppercase tracking-wider">Output</div>
+                                  {items.map((item, idx) => (
+                                    <div key={idx}>
+                                      <span className="text-[10px] text-gray-600">{item.label}:</span>
+                                      {Array.isArray(item.value) ? (
+                                        <div className="mt-0.5 pl-2 space-y-0.5">
+                                          {(item.value as string[]).map((v, vi) => (
+                                            <div key={vi} className="text-[11px] text-gray-400 font-mono flex items-start gap-1.5">
+                                              <span className="w-1 h-1 rounded-full bg-gray-700 mt-1.5 shrink-0" />
+                                              {String(v)}
+                                            </div>
+                                          ))}
+                                        </div>
+                                      ) : (
+                                        <pre className="mt-0.5 text-[11px] text-gray-400 whitespace-pre-wrap leading-relaxed max-h-24 overflow-y-auto">
+                                          {String(item.value)}
+                                        </pre>
+                                      )}
+                                    </div>
+                                  ))}
+                                </div>
+                              )
+                            })()}
+
+                            {st.error_message && (
+                              <div>
+                                <div className="text-[10px] text-red-400/70 uppercase tracking-wider mb-1">Error</div>
+                                <pre className="text-[11px] text-red-300/50 font-mono whitespace-pre-wrap max-h-24 overflow-y-auto leading-relaxed bg-red-500/5 rounded px-2.5 py-2 border border-red-500/10">
+                                  {st.error_message}
+                                </pre>
+                              </div>
+                            )}
+                          </div>
                         )}
                       </div>
-                    </div>
-                  ))}
+                    )
+                  })}
                 </div>
               </div>
             )}
