@@ -609,6 +609,84 @@ async def reject_merge(
     return {"status": "rejected"}
 
 
+# ── Release Approval ────────────────────────────────────────────────
+
+
+@router.post("/todos/{todo_id}/approve-release")
+async def approve_release(todo_id: str, user: CurrentUser, db: DB, redis: Redis, event_bus: EventBusDep):
+    """Approve a pending production release."""
+    todo = await db.fetchrow("SELECT * FROM todo_items WHERE id = $1", todo_id)
+    if not todo:
+        raise HTTPException(status_code=404)
+    await check_project_access(db, str(todo["project_id"]), user)
+    if todo.get("sub_state") != "awaiting_release_approval":
+        raise HTTPException(status_code=400, detail="Task is not awaiting release approval")
+
+    await db.execute(
+        "UPDATE todo_items SET sub_state = 'release_prod_approved', updated_at = NOW() WHERE id = $1",
+        todo_id,
+    )
+    await db.execute(
+        "INSERT INTO chat_messages (todo_id, role, content) VALUES ($1, 'system', $2)",
+        todo_id,
+        "Production release approved by user. Proceeding with deployment.",
+    )
+    await redis.publish(
+        f"task:{todo_id}:events",
+        json.dumps({"type": "state_change", "state": "in_progress", "sub_state": "release_prod_approved"}),
+    )
+    await event_bus.publish(TaskEvent(
+        event_type="release_approved",
+        todo_id=todo_id,
+        state="in_progress",
+    ))
+    return {"status": "approved"}
+
+
+@router.post("/todos/{todo_id}/reject-release")
+async def reject_release(
+    todo_id: str, body: RequestChangesInput, user: CurrentUser, db: DB, redis: Redis, event_bus: EventBusDep,
+):
+    """Reject a pending production release."""
+    todo = await db.fetchrow("SELECT * FROM todo_items WHERE id = $1", todo_id)
+    if not todo:
+        raise HTTPException(status_code=404)
+    await check_project_access(db, str(todo["project_id"]), user)
+    if todo.get("sub_state") != "awaiting_release_approval":
+        raise HTTPException(status_code=400, detail="Task is not awaiting release approval")
+
+    release_st = await db.fetchrow(
+        "SELECT id FROM sub_tasks WHERE todo_id = $1 AND agent_role = 'release_deployer' "
+        "AND status = 'pending' AND description LIKE '%prod%' LIMIT 1",
+        todo_id,
+    )
+    if release_st:
+        await transition_subtask(
+            db, str(release_st["id"]), "failed",
+            error_message=f"Production release rejected by user: {body.feedback}",
+        )
+
+    await db.execute(
+        "UPDATE todo_items SET sub_state = 'release_rejected', updated_at = NOW() WHERE id = $1",
+        todo_id,
+    )
+    await db.execute(
+        "INSERT INTO chat_messages (todo_id, role, content) VALUES ($1, 'user', $2)",
+        todo_id,
+        f"[Release Rejected]: {body.feedback}",
+    )
+    await redis.publish(
+        f"task:{todo_id}:events",
+        json.dumps({"type": "state_change", "state": "in_progress", "sub_state": "release_rejected"}),
+    )
+    await event_bus.publish(TaskEvent(
+        event_type="task_activated",
+        todo_id=todo_id,
+        state="in_progress",
+    ))
+    return {"status": "rejected"}
+
+
 # ── Subtask Trigger ──────────────────────────────────────────────────
 
 
@@ -812,14 +890,36 @@ async def _build_previous_run_context(db, todo_id: str, todo) -> dict:
     if git_diff:
         ctx["git_diff"] = git_diff
 
+    # Collect diffs from dependency workspaces
+    task_dir = os.path.join(
+        settings.workspace_root, str(todo["project_id"]), "tasks", todo_id,
+    )
+    if os.path.isdir(task_dir):
+        dep_diffs = {}
+        for entry in os.listdir(task_dir):
+            if entry.startswith("dep_") and os.path.isdir(os.path.join(task_dir, entry)):
+                dep_name = entry[4:]  # strip "dep_" prefix
+                dep_diff = await _get_task_workspace_diff_for_dir(
+                    os.path.join(task_dir, entry, "repo")
+                )
+                if dep_diff:
+                    dep_diffs[dep_name] = dep_diff
+        if dep_diffs:
+            ctx["dep_diffs"] = dep_diffs
+
     return ctx
 
 
 async def _get_task_workspace_diff(project_id: str, todo_id: str) -> dict | None:
-    """Get git diff from the task workspace for retry context."""
+    """Get git diff from the main task workspace for retry context."""
     repo_dir = os.path.join(
         settings.workspace_root, project_id, "tasks", todo_id, "repo",
     )
+    return await _get_task_workspace_diff_for_dir(repo_dir)
+
+
+async def _get_task_workspace_diff_for_dir(repo_dir: str) -> dict | None:
+    """Get git diff from any repo directory for retry context."""
     if not os.path.isdir(repo_dir):
         return None
 

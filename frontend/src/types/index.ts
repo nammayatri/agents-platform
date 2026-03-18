@@ -34,6 +34,38 @@ export interface ProjectDependency {
   debug_context?: DebugContext
 }
 
+export interface DepUnderstanding {
+  purpose: string
+  architecture: string
+  tech_stack: string[]
+  key_patterns: string[]
+  api_surface: string
+  exports?: string[]
+  important_context: string[]
+  summary: string
+  raw?: boolean
+}
+
+export interface LinkingIntegration {
+  source_repo: string
+  target_repo: string
+  pattern: string
+  shared_interfaces: string[]
+  data_flow: string
+}
+
+export interface LinkingDocument {
+  overview: string
+  integrations: LinkingIntegration[]
+  shared_types: string[]
+  architecture_diagram_text?: string
+}
+
+export interface IndexMetadata {
+  main: { indexed?: boolean; has_repo_map?: boolean }
+  deps: Record<string, { indexed?: boolean; has_repo_map?: boolean }>
+}
+
 export type GitProviderType = 'github' | 'gitlab' | 'bitbucket' | 'custom'
 
 export interface WorkRules {
@@ -66,6 +98,7 @@ export interface Project {
     build_commands?: string[]
     merge_method?: 'merge' | 'squash' | 'rebase'
     require_merge_approval?: boolean
+    require_plan_approval?: boolean
     debug_context?: DebugContext
     project_understanding?: {
       summary?: string
@@ -73,6 +106,11 @@ export interface Project {
       tech_stack?: string[]
       [key: string]: unknown
     }
+    dep_understandings?: Record<string, DepUnderstanding>
+    linking_document?: LinkingDocument
+    index_metadata?: IndexMetadata
+    release_pipeline_enabled?: boolean
+    release_config?: ReleaseConfig
   }
   created_at: string
   updated_at: string
@@ -140,6 +178,15 @@ export interface SubTask {
     name: string
     default_branch: string
     git_provider_id?: string | null
+  }
+  input_context?: {
+    relevant_files?: string[]
+    current_state?: string
+    what_to_change?: string
+    patterns_to_follow?: string
+    related_code?: string
+    integration_points?: string
+    [key: string]: unknown
   }
   execution_events?: ExecutionEvent[]
   created_at: string
@@ -320,6 +367,16 @@ export interface PlanSubTask {
   agent_role: string
   execution_order: number
   depends_on: number[]
+  review_loop?: boolean
+  target_repo?: string
+  context?: {
+    relevant_files?: string[]
+    current_state?: string
+    what_to_change?: string
+    patterns_to_follow?: string
+    related_code?: string
+    integration_points?: string
+  }
 }
 
 export interface PlanData {
@@ -328,7 +385,7 @@ export interface PlanData {
   estimated_tokens?: number
 }
 
-export type ChatMode = 'chat' | 'plan' | 'debug' | 'create_task'
+export type ChatMode = 'auto' | 'chat' | 'plan' | 'debug' | 'create_task'
 
 export interface ChatSession {
   id: string
@@ -338,6 +395,7 @@ export interface ChatSession {
   mode: 'chat' | 'plan'
   plan_mode: boolean
   chat_mode?: ChatMode
+  last_routing_mode?: string
   plan_json?: Record<string, unknown>
   ai_model?: string
   linked_todo_id?: string
@@ -422,6 +480,16 @@ export interface PlanTaskSubtask {
   agent_role: string
   depends_on?: number[]
   parallel?: boolean
+  review_loop?: boolean
+  target_repo?: string
+  context?: {
+    relevant_files?: string[]
+    current_state?: string
+    what_to_change?: string
+    patterns_to_follow?: string
+    related_code?: string
+    integration_points?: string
+  }
 }
 
 export interface PlanTask {
@@ -458,12 +526,18 @@ export interface ProjectChatMessage {
     task_id?: string
     task_title?: string
     intent?: string
-    plan_data?: ChatPlanData
+    plan_data?: ChatPlanData & {
+      summary?: string
+      sub_tasks?: { title: string; agent_role: string; description?: string }[]
+    }
     plan_title?: string
     task_count?: number
     tasks_created?: number
     task_ids?: string[]
     execution?: ChatExecutionInfo
+    raw_output?: string
+    routing_mode?: string
+    mode_auto_switched?: boolean
   }
   created_at: string
 }
@@ -511,6 +585,35 @@ export interface WSEvent {
 }
 
 // ── API Payload Types ──────────────────────────────────────────────
+
+// ── Release Pipeline Types ────────────────────────────────────────
+
+export interface ReleaseEndpointConfig {
+  enabled: boolean
+  api_url?: string
+  http_method?: string
+  headers?: Record<string, string>
+  body_template?: string
+  success_status_codes?: number[]
+  poll_status_url?: string
+  poll_success_value?: string
+  require_approval?: boolean
+}
+
+export interface BuildProviderConfig {
+  workflow_name?: string      // GitHub Actions
+  job_url?: string            // Jenkins
+  token?: string              // Jenkins auth token
+  timeout_minutes?: number
+  poll_interval_seconds?: number
+}
+
+export interface ReleaseConfig {
+  build_provider: 'github_actions' | 'jenkins'
+  build_config?: BuildProviderConfig
+  test_release?: ReleaseEndpointConfig
+  prod_release?: ReleaseEndpointConfig
+}
 
 export interface ProjectCreatePayload {
   name: string

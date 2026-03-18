@@ -212,6 +212,41 @@ class Notifier:
                     f"*Review Needed* | `{title}`\n"
                     f"Task `{todo_id[:8]}` needs your review.\n{detail}"
                 )
+            case "build_started":
+                return (
+                    f"*Build Started* | `{title}`\n"
+                    f"Task `{todo_id[:8]}` — CI/CD build has started after merge.\n{detail}"
+                )
+            case "build_completed":
+                return (
+                    f"*Build Completed* | `{title}`\n"
+                    f"Task `{todo_id[:8]}` — Build completed successfully.\n{detail}"
+                )
+            case "build_failed":
+                return (
+                    f"*Build Failed* | `{title}`\n"
+                    f"Task `{todo_id[:8]}` — CI/CD build failed.\n{detail}"
+                )
+            case "release_test_completed":
+                return (
+                    f"*Staging Deployed* | `{title}`\n"
+                    f"Task `{todo_id[:8]}` — Staging release completed.\n{detail}"
+                )
+            case "release_test_failed":
+                return (
+                    f"*Staging Deploy Failed* | `{title}`\n"
+                    f"Task `{todo_id[:8]}` — Staging release failed.\n{detail}"
+                )
+            case "release_prod_completed":
+                return (
+                    f"*Production Deployed* | `{title}`\n"
+                    f"Task `{todo_id[:8]}` — Production release completed.\n{detail}"
+                )
+            case "release_prod_failed":
+                return (
+                    f"*Production Deploy Failed* | `{title}`\n"
+                    f"Task `{todo_id[:8]}` — Production release failed.\n{detail}"
+                )
             case _:
                 return f"*{event.upper()}* | `{title}`\n{detail}"
 

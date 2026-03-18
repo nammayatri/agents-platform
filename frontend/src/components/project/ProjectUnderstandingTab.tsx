@@ -1,6 +1,7 @@
 import { useState, useCallback, useEffect, useRef } from 'react'
 import { projects as projectsApi } from '../../services/api'
 import { useAnalysisWebSocket } from '../../hooks/useAnalysisWebSocket'
+import type { DepUnderstanding, LinkingDocument, IndexMetadata } from '../../types'
 
 interface ProjectUnderstanding {
   summary?: string
@@ -25,14 +26,21 @@ interface ProjectUnderstandingTabProps {
 }
 
 const STEP_LABELS: Record<string, string> = {
-  cloning: 'Clone repository',
+  cloning: 'Fetch latest code',
   scanning: 'Scan codebase',
   sampling: 'Sample files',
   dependencies: 'Read dependencies',
   analyzing: 'LLM analysis',
+  indexing: 'Build code indexes',
+  dep_analysis: 'Analyze dependencies',
+  linking: 'Build linking document',
+  dep_indexing: 'Index dependency repos',
 }
 
-const STEP_ORDER = ['cloning', 'scanning', 'sampling', 'dependencies', 'analyzing']
+const STEP_ORDER = [
+  'cloning', 'scanning', 'sampling', 'dependencies', 'analyzing',
+  'indexing', 'dep_analysis', 'linking', 'dep_indexing',
+]
 
 export default function ProjectUnderstandingTab({
   projectId, repoUrl, analysisStatus, projectUnderstanding,
@@ -40,15 +48,31 @@ export default function ProjectUnderstandingTab({
 }: ProjectUnderstandingTabProps) {
   const [starting, setStarting] = useState(false)
   const [cancelling, setCancelling] = useState(false)
+  const [depUnderstandings, setDepUnderstandings] = useState<Record<string, DepUnderstanding> | null>(null)
+  const [linkingDocument, setLinkingDocument] = useState<(LinkingDocument & { summary?: string; raw?: boolean }) | null>(null)
+  const [indexMetadata, setIndexMetadata] = useState<IndexMetadata | null>(null)
+  const [expandedDeps, setExpandedDeps] = useState<Set<string>>(new Set())
   const isAnalyzing = analysisStatus === 'analyzing'
 
+  const loadExtraData = useCallback(async () => {
+    try {
+      const p = await projectsApi.get(projectId)
+      const settings = typeof p.settings_json === 'string' ? JSON.parse(p.settings_json) : p.settings_json
+      setDepUnderstandings(settings?.dep_understandings || null)
+      setLinkingDocument(settings?.linking_document || null)
+      setIndexMetadata(settings?.index_metadata || null)
+    } catch { /* ignore */ }
+  }, [projectId])
+
   const handleComplete = useCallback(async () => {
-    // Fetch the final project data to get the understanding
     try {
       const p = await projectsApi.get(projectId)
       const settings = typeof p.settings_json === 'string' ? JSON.parse(p.settings_json) : p.settings_json
       setAnalysisStatus(settings?.analysis_status || 'complete')
       setProjectUnderstanding(settings?.project_understanding || null)
+      setDepUnderstandings(settings?.dep_understandings || null)
+      setLinkingDocument(settings?.linking_document || null)
+      setIndexMetadata(settings?.index_metadata || null)
     } catch {
       setAnalysisStatus('complete')
     }
@@ -63,8 +87,14 @@ export default function ProjectUnderstandingTab({
     projectId, isAnalyzing, handleComplete, handleFailed,
   )
 
-  // Polling fallback: check DB status every 5s when analyzing,
-  // in case WebSocket misses the completion/failure event
+  // Load dep understandings when analysis is complete but dep data isn't loaded yet
+  useEffect(() => {
+    if (analysisStatus === 'complete' && projectId && !depUnderstandings) {
+      loadExtraData()
+    }
+  }, [analysisStatus, projectId, depUnderstandings, loadExtraData])
+
+  // Polling fallback: check DB status every 5s when analyzing
   const setAnalysisStatusRef = useRef(setAnalysisStatus)
   const setProjectUnderstandingRef = useRef(setProjectUnderstanding)
   setAnalysisStatusRef.current = setAnalysisStatus
@@ -81,6 +111,9 @@ export default function ProjectUnderstandingTab({
           setAnalysisStatusRef.current(status)
           if (status === 'complete') {
             setProjectUnderstandingRef.current(settings?.project_understanding || null)
+            setDepUnderstandings(settings?.dep_understandings || null)
+            setLinkingDocument(settings?.linking_document || null)
+            setIndexMetadata(settings?.index_metadata || null)
           }
         }
       } catch { /* ignore polling errors */ }
@@ -101,6 +134,17 @@ export default function ProjectUnderstandingTab({
       setCancelling(false)
     }
   }
+
+  const toggleDep = (name: string) => {
+    setExpandedDeps(prev => {
+      const next = new Set(prev)
+      if (next.has(name)) next.delete(name)
+      else next.add(name)
+      return next
+    })
+  }
+
+  const depEntries = depUnderstandings ? Object.entries(depUnderstandings) : []
 
   return (
     <>
@@ -197,53 +241,214 @@ export default function ProjectUnderstandingTab({
       )}
 
       {analysisStatus === 'complete' && projectUnderstanding && (
-        <div className="bg-gray-900 border border-gray-800 rounded-lg overflow-hidden divide-y divide-gray-800">
-          {projectUnderstanding.summary && (
-            <div className="px-4 py-3"><p className="text-sm text-gray-300 leading-relaxed">{projectUnderstanding.summary}</p></div>
-          )}
-          {projectUnderstanding.purpose && (
-            <div className="px-4 py-3">
-              <span className="text-[11px] text-gray-600 uppercase tracking-wider">Purpose</span>
-              <p className="text-sm text-gray-400 mt-1 leading-relaxed">{projectUnderstanding.purpose}</p>
+        <div className="space-y-4">
+          {/* Main repo understanding */}
+          <div>
+            <span className="text-[11px] text-gray-600 uppercase tracking-wider">Main Repository</span>
+            <div className="mt-1.5 bg-gray-900 border border-gray-800 rounded-lg overflow-hidden divide-y divide-gray-800">
+              {projectUnderstanding.summary && (
+                <div className="px-4 py-3"><p className="text-sm text-gray-300 leading-relaxed">{projectUnderstanding.summary}</p></div>
+              )}
+              {projectUnderstanding.purpose && (
+                <div className="px-4 py-3">
+                  <span className="text-[11px] text-gray-600 uppercase tracking-wider">Purpose</span>
+                  <p className="text-sm text-gray-400 mt-1 leading-relaxed">{projectUnderstanding.purpose}</p>
+                </div>
+              )}
+              {projectUnderstanding.architecture && (
+                <div className="px-4 py-3">
+                  <span className="text-[11px] text-gray-600 uppercase tracking-wider">Architecture</span>
+                  <p className="text-sm text-gray-400 mt-1 leading-relaxed whitespace-pre-line">{projectUnderstanding.architecture}</p>
+                </div>
+              )}
+              {projectUnderstanding.tech_stack && projectUnderstanding.tech_stack.length > 0 && (
+                <div className="px-4 py-3">
+                  <span className="text-[11px] text-gray-600 uppercase tracking-wider">Tech Stack</span>
+                  <div className="flex flex-wrap gap-1.5 mt-1.5">
+                    {projectUnderstanding.tech_stack.map((t, i) => (
+                      <span key={i} className="px-2 py-0.5 bg-gray-800 rounded text-[11px] text-gray-400">{t}</span>
+                    ))}
+                  </div>
+                </div>
+              )}
+              {projectUnderstanding.key_patterns && projectUnderstanding.key_patterns.length > 0 && (
+                <div className="px-4 py-3">
+                  <span className="text-[11px] text-gray-600 uppercase tracking-wider">Key Patterns</span>
+                  <ul className="mt-1.5 space-y-1">
+                    {projectUnderstanding.key_patterns.map((p, i) => (
+                      <li key={i} className="text-sm text-gray-400 flex items-start gap-2"><span className="w-1 h-1 rounded-full bg-gray-600 mt-2 shrink-0" />{p}</li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+              {projectUnderstanding.dependency_map && projectUnderstanding.dependency_map.length > 0 && (
+                <div className="px-4 py-3">
+                  <span className="text-[11px] text-gray-600 uppercase tracking-wider">Dependency Roles</span>
+                  <div className="mt-1.5 space-y-1">
+                    {projectUnderstanding.dependency_map.map((d, i) => (
+                      <div key={i} className="flex items-baseline gap-2 text-sm">
+                        <span className="text-gray-300 font-mono text-xs shrink-0">{d.name}</span>
+                        <span className="text-gray-600">--</span>
+                        <span className="text-gray-500">{d.role}</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
             </div>
-          )}
-          {projectUnderstanding.architecture && (
-            <div className="px-4 py-3">
-              <span className="text-[11px] text-gray-600 uppercase tracking-wider">Architecture</span>
-              <p className="text-sm text-gray-400 mt-1 leading-relaxed whitespace-pre-line">{projectUnderstanding.architecture}</p>
-            </div>
-          )}
-          {projectUnderstanding.tech_stack && projectUnderstanding.tech_stack.length > 0 && (
-            <div className="px-4 py-3">
-              <span className="text-[11px] text-gray-600 uppercase tracking-wider">Tech Stack</span>
-              <div className="flex flex-wrap gap-1.5 mt-1.5">
-                {projectUnderstanding.tech_stack.map((t, i) => (
-                  <span key={i} className="px-2 py-0.5 bg-gray-800 rounded text-[11px] text-gray-400">{t}</span>
-                ))}
+          </div>
+
+          {/* Dependency understandings */}
+          {depEntries.length > 0 && (
+            <div>
+              <span className="text-[11px] text-gray-600 uppercase tracking-wider">Dependency Repos ({depEntries.length})</span>
+              <div className="mt-1.5 space-y-1.5">
+                {depEntries.map(([depName, dep]) => {
+                  const isExpanded = expandedDeps.has(depName)
+                  return (
+                    <div key={depName} className="bg-gray-900 border border-gray-800 rounded-lg overflow-hidden">
+                      <button
+                        onClick={() => toggleDep(depName)}
+                        className="w-full px-4 py-2.5 flex items-center justify-between hover:bg-gray-800/50 transition-colors"
+                      >
+                        <div className="flex items-center gap-2 min-w-0">
+                          <span className="text-sm text-gray-300 font-mono shrink-0">{depName}</span>
+                          {dep.purpose && (
+                            <span className="text-xs text-gray-600 truncate">{dep.purpose}</span>
+                          )}
+                        </div>
+                        <svg
+                          className={`w-3.5 h-3.5 text-gray-600 shrink-0 transition-transform ${isExpanded ? 'rotate-180' : ''}`}
+                          viewBox="0 0 20 20" fill="currentColor"
+                        >
+                          <path fillRule="evenodd" d="M5.23 7.21a.75.75 0 011.06.02L10 11.168l3.71-3.938a.75.75 0 111.08 1.04l-4.25 4.5a.75.75 0 01-1.08 0l-4.25-4.5a.75.75 0 01.02-1.06z" clipRule="evenodd" />
+                        </svg>
+                      </button>
+                      {isExpanded && (
+                        <div className="border-t border-gray-800 divide-y divide-gray-800">
+                          {dep.summary && (
+                            <div className="px-4 py-3">
+                              <p className="text-sm text-gray-300 leading-relaxed">{dep.summary}</p>
+                            </div>
+                          )}
+                          {dep.tech_stack && dep.tech_stack.length > 0 && (
+                            <div className="px-4 py-3">
+                              <span className="text-[11px] text-gray-600 uppercase tracking-wider">Tech Stack</span>
+                              <div className="flex flex-wrap gap-1.5 mt-1.5">
+                                {dep.tech_stack.map((t, i) => (
+                                  <span key={i} className="px-2 py-0.5 bg-gray-800 rounded text-[11px] text-gray-400">{t}</span>
+                                ))}
+                              </div>
+                            </div>
+                          )}
+                          {dep.api_surface && (
+                            <div className="px-4 py-3">
+                              <span className="text-[11px] text-gray-600 uppercase tracking-wider">API Surface</span>
+                              <p className="text-sm text-gray-400 mt-1 leading-relaxed whitespace-pre-line">{dep.api_surface}</p>
+                            </div>
+                          )}
+                          {dep.key_patterns && dep.key_patterns.length > 0 && (
+                            <div className="px-4 py-3">
+                              <span className="text-[11px] text-gray-600 uppercase tracking-wider">Key Patterns</span>
+                              <ul className="mt-1.5 space-y-1">
+                                {dep.key_patterns.map((p, i) => (
+                                  <li key={i} className="text-sm text-gray-400 flex items-start gap-2"><span className="w-1 h-1 rounded-full bg-gray-600 mt-2 shrink-0" />{p}</li>
+                                ))}
+                              </ul>
+                            </div>
+                          )}
+                          {dep.exports && dep.exports.length > 0 && (
+                            <div className="px-4 py-3">
+                              <span className="text-[11px] text-gray-600 uppercase tracking-wider">Exports</span>
+                              <div className="flex flex-wrap gap-1.5 mt-1.5">
+                                {dep.exports.map((e, i) => (
+                                  <span key={i} className="px-2 py-0.5 bg-gray-800 rounded text-[11px] text-gray-400 font-mono">{e}</span>
+                                ))}
+                              </div>
+                            </div>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  )
+                })}
               </div>
             </div>
           )}
-          {projectUnderstanding.key_patterns && projectUnderstanding.key_patterns.length > 0 && (
-            <div className="px-4 py-3">
-              <span className="text-[11px] text-gray-600 uppercase tracking-wider">Key Patterns</span>
-              <ul className="mt-1.5 space-y-1">
-                {projectUnderstanding.key_patterns.map((p, i) => (
-                  <li key={i} className="text-sm text-gray-400 flex items-start gap-2"><span className="w-1 h-1 rounded-full bg-gray-600 mt-2 shrink-0" />{p}</li>
-                ))}
-              </ul>
+
+          {/* Cross-repo linking document */}
+          {linkingDocument && (
+            <div>
+              <span className="text-[11px] text-gray-600 uppercase tracking-wider">Cross-Repo Architecture</span>
+              <div className="mt-1.5 bg-gray-900 border border-gray-800 rounded-lg overflow-hidden divide-y divide-gray-800">
+                {(linkingDocument.overview || linkingDocument.summary) && (
+                  <div className="px-4 py-3">
+                    <p className="text-sm text-gray-300 leading-relaxed whitespace-pre-line">
+                      {linkingDocument.overview || linkingDocument.summary}
+                    </p>
+                  </div>
+                )}
+                {linkingDocument.integrations && linkingDocument.integrations.length > 0 && (
+                  <div className="px-4 py-3">
+                    <span className="text-[11px] text-gray-600 uppercase tracking-wider">Integrations</span>
+                    <div className="mt-1.5 space-y-2">
+                      {linkingDocument.integrations.map((intg, i) => (
+                        <div key={i} className="px-3 py-2 bg-gray-800/50 rounded-lg">
+                          <div className="flex items-center gap-2 text-xs">
+                            <span className="text-gray-300 font-mono">{intg.source_repo}</span>
+                            <span className="text-gray-600">-&gt;</span>
+                            <span className="text-gray-300 font-mono">{intg.target_repo}</span>
+                          </div>
+                          <p className="text-xs text-gray-500 mt-1">{intg.pattern}</p>
+                          {intg.data_flow && (
+                            <p className="text-xs text-gray-600 mt-0.5">{intg.data_flow}</p>
+                          )}
+                          {intg.shared_interfaces && intg.shared_interfaces.length > 0 && (
+                            <div className="flex flex-wrap gap-1 mt-1">
+                              {intg.shared_interfaces.map((si, j) => (
+                                <span key={j} className="px-1.5 py-0.5 bg-indigo-500/10 border border-indigo-500/20 rounded text-[10px] text-indigo-400">{si}</span>
+                              ))}
+                            </div>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+                {linkingDocument.shared_types && linkingDocument.shared_types.length > 0 && (
+                  <div className="px-4 py-3">
+                    <span className="text-[11px] text-gray-600 uppercase tracking-wider">Shared Types</span>
+                    <div className="flex flex-wrap gap-1.5 mt-1.5">
+                      {linkingDocument.shared_types.map((t, i) => (
+                        <span key={i} className="px-2 py-0.5 bg-indigo-500/10 border border-indigo-500/20 rounded text-[10px] text-indigo-400 font-mono">{t}</span>
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </div>
             </div>
           )}
-          {projectUnderstanding.dependency_map && projectUnderstanding.dependency_map.length > 0 && (
-            <div className="px-4 py-3">
-              <span className="text-[11px] text-gray-600 uppercase tracking-wider">Dependency Roles</span>
-              <div className="mt-1.5 space-y-1">
-                {projectUnderstanding.dependency_map.map((d, i) => (
-                  <div key={i} className="flex items-baseline gap-2 text-sm">
-                    <span className="text-gray-300 font-mono text-xs shrink-0">{d.name}</span>
-                    <span className="text-gray-600">--</span>
-                    <span className="text-gray-500">{d.role}</span>
+
+          {/* Index metadata */}
+          {indexMetadata && indexMetadata.deps && Object.keys(indexMetadata.deps).length > 0 && (
+            <div>
+              <span className="text-[11px] text-gray-600 uppercase tracking-wider">Search Indexes</span>
+              <div className="mt-1.5 bg-gray-900 border border-gray-800 rounded-lg px-4 py-3">
+                <div className="space-y-1">
+                  <div className="flex items-center gap-2 text-xs">
+                    <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 shrink-0" />
+                    <span className="text-gray-400">Main repo</span>
+                    <span className="text-gray-600 ml-auto">indexed</span>
                   </div>
-                ))}
+                  {Object.entries(indexMetadata.deps).map(([name, meta]) => (
+                    <div key={name} className="flex items-center gap-2 text-xs">
+                      <span className={`w-1.5 h-1.5 rounded-full ${meta.indexed ? 'bg-emerald-400' : 'bg-gray-600'} shrink-0`} />
+                      <span className="text-gray-400 font-mono">{name}</span>
+                      <span className="text-gray-600 ml-auto">{meta.indexed ? 'indexed' : 'pending'}</span>
+                    </div>
+                  ))}
+                </div>
+                <p className="text-[11px] text-gray-600 mt-2">Semantic search covers all indexed repos.</p>
               </div>
             </div>
           )}

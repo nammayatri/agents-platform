@@ -11,7 +11,24 @@ import os
 import threading
 from collections import OrderedDict
 
+import re as _re_module
+
 import asyncpg
+
+# Dangerous command patterns — checked before shell execution in run_command.
+# Each tuple: (regex_pattern, human-readable reason).
+_BLOCKED_COMMANDS: list[tuple[str, str]] = [
+    (r'\brm\s+(-[a-zA-Z]*r[a-zA-Z]*f|.*--recursive)\b', "Recursive rm blocked"),
+    (r'\bgit\s+push\b(?!.*--dry-run)', "git push blocked (use --dry-run to preview)"),
+    (r'\bgit\s+reset\s+--hard\b', "git reset --hard blocked"),
+    (r'\bcurl\b.*\|\s*(bash|sh|zsh)\b', "Piping curl to shell blocked"),
+    (r'\bwget\b.*\|\s*(bash|sh|zsh)\b', "Piping wget to shell blocked"),
+    (r'\bsudo\b', "sudo blocked"),
+    (r'\bnpm\s+publish\b', "npm publish blocked"),
+    (r'\bchmod\s+777\b', "chmod 777 blocked"),
+    (r'\bmkfs\b', "mkfs blocked"),
+    (r'\bdd\s+if=', "dd blocked"),
+]
 
 logger = logging.getLogger(__name__)
 
@@ -233,6 +250,10 @@ class McpToolExecutor:
             main_repo_dir = os.path.join(workspace_path, "main_repo")
             if os.path.exists(main_repo_dir):
                 allowed.append(os.path.realpath(main_repo_dir))
+            # Allow reading .context/ docs (project understanding files)
+            context_dir = os.path.join(workspace_path, ".context")
+            if os.path.exists(context_dir):
+                allowed.append(os.path.realpath(context_dir))
 
         return allowed
 
@@ -472,6 +493,12 @@ class McpToolExecutor:
                         effective_cwd = resolved
                     logger.info("builtin[run_command]: cd to subdir=%s cmd=%s", cd_target, actual_command[:100])
 
+                # Check against blocked command patterns
+                for _bp, _br in _BLOCKED_COMMANDS:
+                    if _re.search(_bp, actual_command, _re.IGNORECASE):
+                        logger.warning("builtin[run_command]: blocked: %s — %s", actual_command[:200], _br)
+                        return json.dumps({"exit_code": 1, "output": f"Command blocked: {_br}"})
+
                 logger.info("builtin[run_command]: cmd=%s cwd=%s", actual_command[:200], effective_cwd)
                 proc = await asyncio.create_subprocess_shell(
                     actual_command,
@@ -505,10 +532,21 @@ class McpToolExecutor:
                 if not query:
                     return json.dumps({"error": "query is required"})
                 try:
-                    from agents.indexing.search_tool import execute_semantic_search
                     # Use shared project-level index directory if available
                     index_dir = tool_meta.get("_index_dir")
-                    result_text, meta = execute_semantic_search(repo_dir, query, top_k=top_k, cache_dir=index_dir)
+                    dep_index_dirs = tool_meta.get("_dep_index_dirs")
+
+                    if dep_index_dirs:
+                        from agents.indexing.search_tool import execute_multi_repo_search
+                        result_text, meta = execute_multi_repo_search(
+                            repo_dir, query, top_k=top_k,
+                            cache_dir=index_dir, dep_index_dirs=dep_index_dirs,
+                        )
+                    else:
+                        from agents.indexing.search_tool import execute_semantic_search
+                        result_text, meta = execute_semantic_search(
+                            repo_dir, query, top_k=top_k, cache_dir=index_dir,
+                        )
                     logger.info(
                         "builtin[semantic_search]: query=%s top_k=%d results=%d top_score=%.3f latency=%dms source=%s",
                         query[:100], top_k,

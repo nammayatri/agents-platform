@@ -12,6 +12,7 @@ interface Props {
   onDiffClick: (path: string, staged: boolean) => void
   collapsed: boolean
   onToggle: () => void
+  repo?: string
 }
 
 function StatusBadge({ status }: { status: string }) {
@@ -37,7 +38,7 @@ interface InlineDiffState {
   error: string
 }
 
-export default function GitPanel({ todoId, gitStatus, onRefresh, onFileClick, onDiffClick, collapsed, onToggle }: Props) {
+export default function GitPanel({ todoId, gitStatus, onRefresh, onFileClick, onDiffClick, collapsed, onToggle, repo }: Props) {
   const [commitMsg, setCommitMsg] = useState('')
   const [committing, setCommitting] = useState(false)
   const [pushing, setPushing] = useState(false)
@@ -66,7 +67,7 @@ export default function GitPanel({ todoId, gitStatus, onRefresh, onFileClick, on
     if (!diffCache[key] || diffCache[key].error) {
       setDiffCache(prev => ({ ...prev, [key]: { loading: true, diff: '', stats: '', error: '' } }))
       try {
-        const result = await todos.workspace.gitDiff(todoId, isStagedFile, path)
+        const result = await todos.workspace.gitDiff(todoId, isStagedFile, path, repo)
         setDiffCache(prev => ({
           ...prev,
           [key]: { loading: false, diff: result.diff, stats: result.stats, error: '' },
@@ -78,12 +79,12 @@ export default function GitPanel({ todoId, gitStatus, onRefresh, onFileClick, on
         }))
       }
     }
-  }, [todoId, diffCache])
+  }, [todoId, diffCache, repo])
 
   const handleStage = async (paths: string[]) => {
     setError('')
     try {
-      await todos.workspace.gitAdd(todoId, paths)
+      await todos.workspace.gitAdd(todoId, paths, repo)
       onRefresh()
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Stage failed')
@@ -93,7 +94,7 @@ export default function GitPanel({ todoId, gitStatus, onRefresh, onFileClick, on
   const handleUnstage = async (paths: string[]) => {
     setError('')
     try {
-      await todos.workspace.gitAdd(todoId, paths)
+      await todos.workspace.gitAdd(todoId, paths, repo)
       onRefresh()
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Unstage failed')
@@ -110,7 +111,7 @@ export default function GitPanel({ todoId, gitStatus, onRefresh, onFileClick, on
     setSuccess('')
     setCommitting(true)
     try {
-      const result = await todos.workspace.gitCommit(todoId, commitMsg.trim())
+      const result = await todos.workspace.gitCommit(todoId, commitMsg.trim(), repo)
       setSuccess(`Committed: ${result.hash}`)
       setCommitMsg('')
       // Clear diff cache on commit
@@ -129,7 +130,7 @@ export default function GitPanel({ todoId, gitStatus, onRefresh, onFileClick, on
     setSuccess('')
     setPushing(true)
     try {
-      const result = await todos.workspace.gitPush(todoId)
+      const result = await todos.workspace.gitPush(todoId, repo)
       setSuccess(`Pushed to ${result.branch}`)
       onRefresh()
     } catch (e) {

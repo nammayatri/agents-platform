@@ -1,5 +1,6 @@
+import json as _json_mod
 import logging
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable, Awaitable
 
 import openai
 
@@ -179,6 +180,99 @@ class OpenAIProvider(AIProvider):
 
         # Normalize stop_reason: OpenAI uses "tool_calls", Anthropic uses "tool_use"
         stop_reason = choice.finish_reason or ""
+        if stop_reason == "tool_calls":
+            stop_reason = "tool_use"
+
+        return LLMResponse(
+            content=content,
+            tool_calls=tool_calls,
+            tokens_input=tokens_in,
+            tokens_output=tokens_out,
+            model=use_model,
+            stop_reason=stop_reason,
+            cost_usd=cost,
+        )
+
+    async def send_message_streaming(
+        self,
+        messages: list[LLMMessage],
+        *,
+        on_token: Callable[[str], Awaitable[None]],
+        model: str | None = None,
+        tools: list[dict] | None = None,
+        max_tokens: int = 4096,
+        temperature: float = 0.1,
+        system_prompt: str | None = None,
+        tool_choice: str | dict | None = None,
+    ) -> LLMResponse:
+        api_messages = self._build_messages(messages, system_prompt)
+        use_model = model or self.default_model
+
+        kwargs: dict = {
+            "model": use_model,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "messages": api_messages,
+            "stream": True,
+            "stream_options": {"include_usage": True},
+        }
+        api_tools = self._build_tools(tools)
+        if api_tools:
+            kwargs["tools"] = api_tools
+        mapped_tc = self._map_tool_choice(tool_choice)
+        if mapped_tc is not None and api_tools:
+            kwargs["tool_choice"] = mapped_tc
+
+        stream = await self.client.chat.completions.create(**kwargs)
+
+        content_parts: list[str] = []
+        tc_map: dict[int, dict] = {}  # index → {id, name, args}
+        tokens_in = 0
+        tokens_out = 0
+        finish_reason = ""
+
+        async for chunk in stream:
+            if chunk.usage:
+                tokens_in = chunk.usage.prompt_tokens or 0
+                tokens_out = chunk.usage.completion_tokens or 0
+            if not chunk.choices:
+                continue
+            choice = chunk.choices[0]
+            if choice.finish_reason:
+                finish_reason = choice.finish_reason
+            delta = choice.delta
+            if delta.content:
+                content_parts.append(delta.content)
+                await on_token(delta.content)
+            if delta.tool_calls:
+                for tc_delta in delta.tool_calls:
+                    idx = tc_delta.index
+                    if idx not in tc_map:
+                        tc_map[idx] = {"id": "", "name": "", "args": ""}
+                    if tc_delta.id:
+                        tc_map[idx]["id"] = tc_delta.id
+                    if tc_delta.function:
+                        if tc_delta.function.name:
+                            tc_map[idx]["name"] = tc_delta.function.name
+                        if tc_delta.function.arguments:
+                            tc_map[idx]["args"] += tc_delta.function.arguments
+
+        content = "".join(content_parts)
+        tool_calls = []
+        for idx in sorted(tc_map.keys()):
+            tc = tc_map[idx]
+            try:
+                args = _json_mod.loads(tc["args"])
+            except (_json_mod.JSONDecodeError, TypeError):
+                logger.warning(
+                    "Failed to parse streamed tool call arguments for %s: %s",
+                    tc["name"], tc["args"][:200],
+                )
+                args = {"_raw_arguments": tc["args"]}
+            tool_calls.append({"id": tc["id"], "name": tc["name"], "arguments": args})
+
+        cost = self.estimate_cost(tokens_in, tokens_out, use_model)
+        stop_reason = finish_reason
         if stop_reason == "tool_calls":
             stop_reason = "tool_use"
 

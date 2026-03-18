@@ -1,6 +1,6 @@
 import { useEffect, useState, useCallback, useRef } from 'react'
 import Editor from '@monaco-editor/react'
-import { X, PanelBottomClose, PanelBottomOpen, PanelLeftClose, PanelLeftOpen, Loader2, Diff, FileCode } from 'lucide-react'
+import { X, PanelBottomClose, PanelBottomOpen, PanelLeftClose, PanelLeftOpen, Loader2, Diff, FileCode, GitBranch } from 'lucide-react'
 import { todos } from '../../services/api'
 import type { FileTreeNode, GitStatus } from '../../types'
 import FileTree from './FileTree'
@@ -22,6 +22,11 @@ interface OpenTab {
   diffError?: string
 }
 
+interface WorkspaceRepo {
+  name: string
+  label: string
+}
+
 interface Props {
   todoId: string
 }
@@ -37,32 +42,61 @@ export default function WorkspaceView({ todoId }: Props) {
   const [error, setError] = useState('')
   const editorRef = useRef<unknown>(null)
 
+  // Multi-repo state
+  const [availableRepos, setAvailableRepos] = useState<WorkspaceRepo[]>([])
+  const [selectedRepo, setSelectedRepo] = useState<string | undefined>(undefined)
+
   // Full diff state for "all changes" view
   const [fullDiff, setFullDiff] = useState<{ diff: string; stats: string } | null>(null)
   const [fullDiffLoading, setFullDiffLoading] = useState(false)
   const [showFullDiff, setShowFullDiff] = useState(false)
 
+  const loadRepos = useCallback(async () => {
+    try {
+      const repos = await todos.workspace.repos(todoId)
+      setAvailableRepos(repos)
+    } catch {
+      // Single-repo fallback
+      setAvailableRepos([{ name: 'main', label: 'Main Repository' }])
+    }
+  }, [todoId])
+
   const loadTree = useCallback(async () => {
     try {
-      const t = await todos.workspace.tree(todoId)
+      const t = await todos.workspace.tree(todoId, selectedRepo)
       setTree(t)
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Failed to load file tree')
     }
-  }, [todoId])
+  }, [todoId, selectedRepo])
 
   const loadGitStatus = useCallback(async () => {
     try {
-      const s = await todos.workspace.gitStatus(todoId)
+      const s = await todos.workspace.gitStatus(todoId, selectedRepo)
       setGitStatus(s)
     } catch {
       // Ignore git status errors
     }
-  }, [todoId])
+  }, [todoId, selectedRepo])
+
+  useEffect(() => {
+    loadRepos()
+  }, [loadRepos])
 
   useEffect(() => {
     Promise.all([loadTree(), loadGitStatus()]).finally(() => setLoading(false))
   }, [loadTree, loadGitStatus])
+
+  // Reset workspace state when switching repos
+  const handleRepoChange = useCallback((repoName: string) => {
+    const repo = repoName === 'main' ? undefined : repoName
+    setSelectedRepo(repo)
+    setTabs([])
+    setActiveTab(null)
+    setFullDiff(null)
+    setShowFullDiff(false)
+    setLoading(true)
+  }, [])
 
   const handleFileSelect = useCallback(async (path: string) => {
     // Check if tab already open (in editor mode)
@@ -74,7 +108,7 @@ export default function WorkspaceView({ todoId }: Props) {
     }
 
     try {
-      const file = await todos.workspace.file(todoId, path)
+      const file = await todos.workspace.file(todoId, path, selectedRepo)
       if (file.binary) {
         setError('Binary files cannot be opened in the editor')
         return
@@ -93,7 +127,7 @@ export default function WorkspaceView({ todoId }: Props) {
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Failed to open file')
     }
-  }, [tabs, todoId])
+  }, [tabs, todoId, selectedRepo])
 
   const handleDiffClick = useCallback(async (path: string, staged: boolean) => {
     // Create a diff tab identifier
@@ -124,7 +158,7 @@ export default function WorkspaceView({ todoId }: Props) {
 
     // Fetch the diff
     try {
-      const result = await todos.workspace.gitDiff(todoId, staged, path)
+      const result = await todos.workspace.gitDiff(todoId, staged, path, selectedRepo)
       setTabs(prev => prev.map(t =>
         t.path === diffTabId
           ? { ...t, diffLoading: false, diffContent: result.diff, diffStats: result.stats }
@@ -137,7 +171,7 @@ export default function WorkspaceView({ todoId }: Props) {
           : t
       ))
     }
-  }, [tabs, todoId])
+  }, [tabs, todoId, selectedRepo])
 
   const handleCloseTab = useCallback((path: string, e?: React.MouseEvent) => {
     e?.stopPropagation()
@@ -166,7 +200,7 @@ export default function WorkspaceView({ todoId }: Props) {
     if (!tab || !tab.dirty || tab.diffMode) return
 
     try {
-      await todos.workspace.saveFile(todoId, tab.path, tab.content)
+      await todos.workspace.saveFile(todoId, tab.path, tab.content, selectedRepo)
       setTabs(prev => prev.map(t =>
         t.path === tab.path
           ? { ...t, savedContent: t.content, dirty: false }
@@ -176,7 +210,7 @@ export default function WorkspaceView({ todoId }: Props) {
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Failed to save file')
     }
-  }, [activeTab, tabs, todoId, loadGitStatus])
+  }, [activeTab, tabs, todoId, loadGitStatus, selectedRepo])
 
   // Keyboard shortcuts
   useEffect(() => {
@@ -209,7 +243,7 @@ export default function WorkspaceView({ todoId }: Props) {
     if (!fullDiff) {
       setFullDiffLoading(true)
       try {
-        const result = await todos.workspace.gitDiff(todoId)
+        const result = await todos.workspace.gitDiff(todoId, undefined, undefined, selectedRepo)
         setFullDiff(result)
       } catch {
         setFullDiff({ diff: '', stats: '' })
@@ -217,7 +251,7 @@ export default function WorkspaceView({ todoId }: Props) {
         setFullDiffLoading(false)
       }
     }
-  }, [todoId, fullDiff])
+  }, [todoId, fullDiff, selectedRepo])
 
   const modifiedPaths = new Set(gitStatus.files.map(f => f.path))
   const currentTab = tabs.find(t => t.path === activeTab)
@@ -264,6 +298,24 @@ export default function WorkspaceView({ todoId }: Props) {
             <PanelLeftClose className="w-3.5 h-3.5" />
           </button>
         </div>
+        {/* Repo selector — only shown when multiple repos available */}
+        {availableRepos.length > 1 && (
+          <div className="px-2 py-1.5 border-b border-gray-800">
+            <div className="flex items-center gap-1.5 mb-1">
+              <GitBranch className="w-3 h-3 text-gray-600" />
+              <span className="text-[10px] text-gray-600 uppercase tracking-wider">Repository</span>
+            </div>
+            <select
+              value={selectedRepo || 'main'}
+              onChange={e => handleRepoChange(e.target.value)}
+              className="w-full px-2 py-1 bg-gray-900 border border-gray-800 rounded text-xs text-white focus:outline-none focus:border-indigo-500 transition-colors"
+            >
+              {availableRepos.map(r => (
+                <option key={r.name} value={r.name}>{r.label}</option>
+              ))}
+            </select>
+          </div>
+        )}
         <FileTree
           tree={tree}
           activeFile={activeTab && !activeTab.startsWith('diff:') ? activeTab : null}
@@ -459,6 +511,7 @@ export default function WorkspaceView({ todoId }: Props) {
             onDiffClick={handleDiffClick}
             collapsed={gitPanelCollapsed}
             onToggle={() => setGitPanelCollapsed(c => !c)}
+            repo={selectedRepo}
           />
         </div>
       </div>

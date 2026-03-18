@@ -14,6 +14,7 @@ from pydantic import BaseModel
 from agents.api.deps import DB, CurrentUser, EventBusDep, Redis, check_project_access
 from agents.api.routes.project_chat_llm import (
     create_tasks_from_plan,
+    detect_intent,
     generate_create_task_response,
     generate_debug_response,
     generate_plan_response,
@@ -32,7 +33,7 @@ class ProjectChatInput(BaseModel):
 
 
 class SessionCreateInput(BaseModel):
-    mode: str = "plan"  # 'chat' | 'plan' — defaults to plan mode
+    mode: str = "auto"  # 'auto' | 'chat' | 'plan' — defaults to auto mode
     title: str | None = None
 
 
@@ -62,8 +63,8 @@ async def create_session(
 ):
     """Create a new chat session."""
     await check_project_access(db, project_id, user)
-    if body.mode not in ("chat", "plan"):
-        raise HTTPException(status_code=400, detail="Mode must be 'chat' or 'plan'")
+    if body.mode not in ("auto", "chat", "plan"):
+        raise HTTPException(status_code=400, detail="Mode must be 'auto', 'chat', or 'plan'")
 
     title = body.title or ("New Plan" if body.mode == "plan" else "New Chat")
     row = await db.fetchrow(
@@ -128,7 +129,7 @@ async def set_chat_mode(
     """Set the chat mode for a session (chat, plan, debug, create_task)."""
     await _load_session(session_id, project_id, user, db)
     mode = (body or {}).get("mode", "chat")
-    if mode not in ("chat", "plan", "debug", "create_task"):
+    if mode not in ("auto", "chat", "plan", "debug", "create_task"):
         raise HTTPException(status_code=400, detail="Invalid mode")
     await db.execute(
         "UPDATE project_chat_sessions SET chat_mode = $2, updated_at = NOW() WHERE id = $1",
@@ -198,11 +199,49 @@ async def send_session_message(
                 session_id, body.model,
             )
 
-        chat_mode = dict(session).get("chat_mode", "chat")
+        chat_mode = dict(session).get("chat_mode", "auto")
         if chat_mode == "chat" and dict(session).get("plan_mode"):
             chat_mode = "plan"
 
-        if chat_mode == "plan":
+        # Resolve routing mode — for "auto", run intent detection
+        routing_mode = chat_mode
+        mode_auto_switched = False
+
+        if chat_mode == "auto":
+            last_routing = dict(session).get("last_routing_mode") or "chat"
+            try:
+                from agents.providers.registry import ProviderRegistry
+
+                provider = await ProviderRegistry(db).resolve_for_project(
+                    project_id, str(user["id"]),
+                )
+                recent = await db.fetch(
+                    "SELECT role, content FROM project_chat_messages "
+                    "WHERE session_id = $1 ORDER BY created_at DESC LIMIT 3",
+                    session_id,
+                )
+                detected, confidence = await detect_intent(
+                    provider=provider,
+                    user_message=body.content,
+                    current_routing_mode=last_routing,
+                    recent_messages=[dict(r) for r in reversed(recent)],
+                )
+                if confidence >= 0.7:
+                    routing_mode = detected
+                else:
+                    routing_mode = last_routing
+
+                if routing_mode != last_routing:
+                    mode_auto_switched = True
+                await db.execute(
+                    "UPDATE project_chat_sessions SET last_routing_mode = $2, updated_at = NOW() WHERE id = $1",
+                    session_id, routing_mode,
+                )
+            except Exception:
+                logger.warning("Intent detection failed, using last_routing=%s", last_routing)
+                routing_mode = last_routing
+
+        if routing_mode == "plan":
             assistant_msg = await generate_plan_response(
                 project_id=project_id,
                 session_id=session_id,
@@ -215,7 +254,7 @@ async def send_session_message(
                 redis=redis,
                 model_override=model_override,
             )
-        elif chat_mode == "debug":
+        elif routing_mode == "debug":
             assistant_msg = await generate_debug_response(
                 project_id=project_id,
                 session_id=session_id,
@@ -227,7 +266,7 @@ async def send_session_message(
                 redis=redis,
                 model_override=model_override,
             )
-        elif chat_mode == "create_task":
+        elif routing_mode == "create_task":
             assistant_msg = await generate_create_task_response(
                 project_id=project_id,
                 session_id=session_id,
@@ -261,6 +300,8 @@ async def send_session_message(
         return {
             "user_message": dict(user_msg),
             "assistant_message": dict(assistant_msg),
+            "routing_mode": routing_mode,
+            "mode_auto_switched": mode_auto_switched,
         }
     except Exception as e:
         logger.error("Project chat error: %s", e)

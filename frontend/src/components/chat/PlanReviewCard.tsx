@@ -1,4 +1,5 @@
 import { useState } from 'react'
+import { ChevronDown, ChevronRight } from 'lucide-react'
 import type { ChatPlanData } from '../../types'
 
 const ROLE_LABELS: Record<string, string> = {
@@ -8,6 +9,9 @@ const ROLE_LABELS: Record<string, string> = {
   pr_creator: 'PR',
   report_writer: 'Report',
   merge_agent: 'Merge',
+  debugger: 'Debug',
+  release_build_watcher: 'Build',
+  release_deployer: 'Deploy',
 }
 
 const PRIORITY_COLORS: Record<string, string> = {

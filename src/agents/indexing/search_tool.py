@@ -198,6 +198,80 @@ def execute_semantic_search(
     return _format_results(results, query), meta
 
 
+def execute_multi_repo_search(
+    workspace_path: str,
+    query: str,
+    top_k: int = 10,
+    *,
+    cache_dir: str | None = None,
+    dep_index_dirs: dict[str, str] | None = None,
+) -> tuple[str, dict]:
+    """Execute semantic search across main repo and all dependency repos.
+
+    Searches each repo's index independently, merges results by score,
+    and tags each result with its repo name.
+
+    Args:
+        workspace_path: Path to the main repo.
+        query: Natural language search query.
+        top_k: Total results to return across all repos.
+        cache_dir: Cache dir for the main repo index.
+        dep_index_dirs: Mapping of dep_name -> index_dir for dependency repos.
+
+    Returns:
+        ``(result_text, meta)`` — same format as execute_semantic_search.
+    """
+    t0 = time.monotonic()
+    all_results: list[tuple[str, SearchResult]] = []  # (repo_name, result)
+
+    # Search main repo
+    try:
+        main_index = get_or_build_index(workspace_path, cache_dir=cache_dir)
+        main_results = main_index.search(query, top_k=top_k)
+        for r in main_results:
+            all_results.append(("main", r))
+    except Exception as e:
+        logger.warning("multi_repo_search: main repo search failed: %s", e)
+
+    # Search each dependency repo
+    if dep_index_dirs:
+        for dep_name, dep_idx_dir in dep_index_dirs.items():
+            try:
+                dep_index = get_or_build_index(dep_idx_dir, cache_dir=dep_idx_dir)
+                dep_results = dep_index.search(query, top_k=top_k)
+                for r in dep_results:
+                    all_results.append((dep_name, r))
+            except Exception as e:
+                logger.warning(
+                    "multi_repo_search: dep %s search failed: %s", dep_name, e,
+                )
+
+    latency_ms = int((time.monotonic() - t0) * 1000)
+
+    # Sort by score descending and take top_k
+    all_results.sort(key=lambda x: x[1].score, reverse=True)
+    all_results = all_results[:top_k]
+
+    top_score = round(all_results[0][1].score, 3) if all_results else 0
+    repos_searched = 1 + (len(dep_index_dirs) if dep_index_dirs else 0)
+    meta = {
+        "results_count": len(all_results),
+        "top_score": top_score,
+        "latency_ms": latency_ms,
+        "source": "multi_repo",
+        "query": query[:100],
+        "repos_searched": repos_searched,
+    }
+
+    cache_key = cache_dir or workspace_path
+    _last_search_meta[cache_key] = meta
+
+    if not all_results:
+        return "No results found across any repo. Try rephrasing or use search_files for exact pattern matching.", meta
+
+    return _format_multi_repo_results(all_results, query), meta
+
+
 def _format_results(results: list[SearchResult], query: str) -> str:
     """Format search results for the agent."""
     lines = [f"Semantic search results for: \"{query}\"", ""]
@@ -212,14 +286,33 @@ def _format_results(results: list[SearchResult], query: str) -> str:
     return "\n".join(lines)
 
 
+def _format_multi_repo_results(
+    results: list[tuple[str, SearchResult]], query: str,
+) -> str:
+    """Format multi-repo search results with repo labels."""
+    lines = [f"Semantic search results for: \"{query}\" (across all repos)", ""]
+
+    for i, (repo_name, r) in enumerate(results, 1):
+        score_pct = int(r.score * 100)
+        repo_label = f"[{repo_name}]" if repo_name != "main" else "[main repo]"
+        lines.append(f"--- Result {i} {repo_label} (relevance: {score_pct}%) ---")
+        lines.append(f"File: {r.file_path} (lines {r.line_start}-{r.line_end})")
+        lines.append(r.snippet)
+        lines.append("")
+
+    return "\n".join(lines)
+
+
 # Tool definition for the agent registry
 SEMANTIC_SEARCH_TOOL = {
     "name": "semantic_search",
     "description": (
-        "Search the codebase semantically using natural language. "
+        "Search the codebase semantically using natural language across the main repo "
+        "and all configured dependency repos. "
         "Use this when you need to find code related to a concept, feature, or pattern. "
         "More powerful than search_files/grep for conceptual queries like "
         "'where is authentication handled' or 'error handling patterns'. "
+        "Results are labeled with their source repo. "
         "For exact string matching, use search_files instead."
     ),
     "parameters": {

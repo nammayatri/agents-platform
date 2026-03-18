@@ -174,15 +174,16 @@ function EventRow({
   }
 
   if (event.type === 'tool_start') {
-    const fileHint = event.file_path ? basename(event.file_path) : ''
+    const hint = event.args_summary || (event.file_path ? basename(event.file_path) : '')
     if (compact) {
       return (
         <div className="flex items-center gap-2 px-3 py-0.5 text-blue-400 border-b border-gray-900/50">
           {timeStr && <span className="text-gray-700 text-[10px] font-mono shrink-0">{timeStr}</span>}
           <Wrench className="w-3 h-3 flex-shrink-0" />
-          <span className="truncate">{event.name}{fileHint ? `: ${fileHint}` : ''}</span>
+          <span className="shrink-0">{event.name}</span>
+          {hint && <span className="text-gray-500 truncate">{hint}</span>}
           {event.total_tools && event.total_tools > 1 && (
-            <span className="text-gray-600">({event.tool_index}/{event.total_tools})</span>
+            <span className="text-gray-600 shrink-0">({event.tool_index}/{event.total_tools})</span>
           )}
         </div>
       )
@@ -199,10 +200,10 @@ function EventRow({
           ) : (
             <Wrench className="w-3 h-3 flex-shrink-0" />
           )}
-          <span>{event.name}</span>
-          {fileHint && <span className="text-gray-500 font-mono text-[11px]">{fileHint}</span>}
+          <span className="shrink-0">{event.name}</span>
+          {hint && <span className="text-gray-500 text-[11px] truncate">{hint}</span>}
           {event.total_tools && event.total_tools > 1 && (
-            <span className="text-gray-600">({event.tool_index}/{event.total_tools})</span>
+            <span className="text-gray-600 shrink-0">({event.tool_index}/{event.total_tools})</span>
           )}
         </div>
         {expanded && (
@@ -210,7 +211,6 @@ function EventRow({
             {event.file_path && <div className="text-gray-400 font-mono mb-0.5">{event.file_path}</div>}
             {event.command && <div className="text-gray-400 font-mono mb-0.5">$ {event.command}</div>}
             {event.pattern && <div className="text-gray-400 mb-0.5">pattern: {event.pattern}</div>}
-            {event.args_summary && <div>{event.args_summary}</div>}
           </div>
         )}
       </div>

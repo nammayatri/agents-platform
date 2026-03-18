@@ -195,6 +195,15 @@ class WorkspaceManager:
         if os.path.isdir(project_deps) and not os.path.exists(task_deps):
             os.symlink(project_deps, task_deps)
 
+        # Copy project context docs (.context/) into task workspace
+        project_context = os.path.join(project_workspace, ".context")
+        task_context = os.path.join(task_dir, ".context")
+        if os.path.isdir(project_context) and not os.path.exists(task_context):
+            try:
+                shutil.copytree(project_context, task_context)
+            except Exception:
+                logger.debug("Could not copy .context/ into task workspace")
+
         return task_dir
 
     async def cleanup_task_workspace(self, todo_id: str) -> None:

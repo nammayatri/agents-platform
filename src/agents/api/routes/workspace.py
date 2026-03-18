@@ -1,7 +1,8 @@
 """Workspace IDE endpoints: file browsing, editing, and git operations.
 
 Extracted from todos.py to keep route modules focused.
-All endpoints resolve the task workspace at {project_workspace}/tasks/{todo_id}/repo/.
+Resolves the task workspace at {project_workspace}/tasks/{todo_id}/repo/
+or {project_workspace}/tasks/{todo_id}/dep_{repo}/repo/ for dependency repos.
 """
 
 import json
@@ -27,8 +28,14 @@ router = APIRouter()
 # ── Helpers ──────────────────────────────────────────────────────────
 
 
-async def _resolve_task_repo(todo_id: str, user, db) -> tuple[str, str]:
+async def _resolve_task_repo(
+    todo_id: str, user, db, repo: str | None = None,
+) -> tuple[str, str]:
     """Resolve the task workspace repo directory.
+
+    Args:
+        repo: Optional dependency repo name. When provided and not "main",
+              resolves to dep_{repo}/repo/ instead of repo/.
 
     Returns (repo_dir, todo_id).
     """
@@ -42,7 +49,14 @@ async def _resolve_task_repo(todo_id: str, user, db) -> tuple[str, str]:
     )
     if not project or not project.get("workspace_path"):
         raise HTTPException(status_code=404, detail="No workspace configured")
-    repo_dir = os.path.join(str(project["workspace_path"]), "tasks", todo_id, "repo")
+
+    task_dir = os.path.join(str(project["workspace_path"]), "tasks", todo_id)
+    if repo and repo != "main":
+        dep_name = repo.replace("/", "_").replace(" ", "_")
+        repo_dir = os.path.join(task_dir, f"dep_{dep_name}", "repo")
+    else:
+        repo_dir = os.path.join(task_dir, "repo")
+
     if not os.path.isdir(repo_dir):
         raise HTTPException(status_code=404, detail="Task workspace not found")
     return repo_dir, todo_id
@@ -53,13 +67,47 @@ def _raise_path_error(msg: str) -> None:
     raise HTTPException(status_code=400, detail=msg)
 
 
+# ── Repo Listing ─────────────────────────────────────────────────────
+
+
+@router.get("/todos/{todo_id}/workspace/repos")
+async def workspace_repos(todo_id: str, user: CurrentUser, db: DB):
+    """List available repos (main + dependency workspaces) for a task."""
+    todo = await db.fetchrow("SELECT * FROM todo_items WHERE id = $1", todo_id)
+    if not todo:
+        raise HTTPException(status_code=404, detail="Task not found")
+    await check_project_access(db, str(todo["project_id"]), user)
+    project = await db.fetchrow(
+        "SELECT workspace_path FROM projects WHERE id = $1",
+        str(todo["project_id"]),
+    )
+    if not project or not project.get("workspace_path"):
+        raise HTTPException(status_code=404, detail="No workspace configured")
+
+    task_dir = os.path.join(str(project["workspace_path"]), "tasks", todo_id)
+    repos = [{"name": "main", "label": "Main Repository"}]
+
+    if os.path.isdir(task_dir):
+        for entry in sorted(os.listdir(task_dir)):
+            if entry.startswith("dep_") and os.path.isdir(
+                os.path.join(task_dir, entry, "repo")
+            ):
+                dep_name = entry[4:]  # strip "dep_" prefix
+                repos.append({"name": dep_name, "label": dep_name})
+
+    return repos
+
+
 # ── File Tree & File Read/Write ──────────────────────────────────────
 
 
 @router.get("/todos/{todo_id}/workspace/tree")
-async def workspace_tree(todo_id: str, user: CurrentUser, db: DB):
+async def workspace_tree(
+    todo_id: str, user: CurrentUser, db: DB,
+    repo: str = Query(None, description="Repo name: 'main' or dependency name"),
+):
     """Get the file tree for a task workspace."""
-    repo_dir, _ = await _resolve_task_repo(todo_id, user, db)
+    repo_dir, _ = await _resolve_task_repo(todo_id, user, db, repo=repo)
     tree = build_file_tree(repo_dir, repo_dir)
     return tree
 
@@ -68,9 +116,10 @@ async def workspace_tree(todo_id: str, user: CurrentUser, db: DB):
 async def workspace_read_file(
     todo_id: str, user: CurrentUser, db: DB,
     path: str = Query(..., description="Relative file path"),
+    repo: str = Query(None, description="Repo name: 'main' or dependency name"),
 ):
     """Read a file from the task workspace."""
-    repo_dir, _ = await _resolve_task_repo(todo_id, user, db)
+    repo_dir, _ = await _resolve_task_repo(todo_id, user, db, repo=repo)
     try:
         full_path = validate_workspace_path(repo_dir, path)
     except ValueError as e:
@@ -112,12 +161,13 @@ async def workspace_read_file(
 class SaveFileInput(BaseModel):
     path: str
     content: str
+    repo: str | None = None
 
 
 @router.put("/todos/{todo_id}/workspace/file")
 async def workspace_save_file(todo_id: str, body: SaveFileInput, user: CurrentUser, db: DB):
     """Save a file to the task workspace."""
-    repo_dir, _ = await _resolve_task_repo(todo_id, user, db)
+    repo_dir, _ = await _resolve_task_repo(todo_id, user, db, repo=body.repo)
     try:
         full_path = validate_workspace_path(repo_dir, body.path)
     except ValueError as e:
@@ -142,9 +192,12 @@ async def workspace_save_file(todo_id: str, body: SaveFileInput, user: CurrentUs
 
 
 @router.get("/todos/{todo_id}/workspace/git/status")
-async def workspace_git_status(todo_id: str, user: CurrentUser, db: DB):
+async def workspace_git_status(
+    todo_id: str, user: CurrentUser, db: DB,
+    repo: str = Query(None, description="Repo name: 'main' or dependency name"),
+):
     """Get git status for the task workspace."""
-    repo_dir, _ = await _resolve_task_repo(todo_id, user, db)
+    repo_dir, _ = await _resolve_task_repo(todo_id, user, db, repo=repo)
 
     rc, branch = await run_git_command("rev-parse", "--abbrev-ref", "HEAD", cwd=repo_dir)
     branch = branch.strip() if rc == 0 else "unknown"
@@ -187,6 +240,7 @@ async def workspace_git_diff(
     todo_id: str, user: CurrentUser, db: DB,
     staged: bool = Query(False, description="Show staged diff"),
     path: str = Query(None, description="Optional file path for per-file diff"),
+    repo: str = Query(None, description="Repo name: 'main' or dependency name"),
 ):
     """Get git diff for the task workspace.
 
@@ -194,7 +248,7 @@ async def workspace_git_diff(
     For untracked files (`??` status), returns a synthetic diff showing the
     full file content as additions.
     """
-    repo_dir, _ = await _resolve_task_repo(todo_id, user, db)
+    repo_dir, _ = await _resolve_task_repo(todo_id, user, db, repo=repo)
 
     args = ["diff"]
     if staged:
@@ -241,12 +295,13 @@ async def workspace_git_diff(
 
 class GitAddInput(BaseModel):
     paths: list[str]
+    repo: str | None = None
 
 
 @router.post("/todos/{todo_id}/workspace/git/add")
 async def workspace_git_add(todo_id: str, body: GitAddInput, user: CurrentUser, db: DB):
     """Stage files in the task workspace."""
-    repo_dir, _ = await _resolve_task_repo(todo_id, user, db)
+    repo_dir, _ = await _resolve_task_repo(todo_id, user, db, repo=body.repo)
 
     for p in body.paths:
         if ".." in p and p != ".":
@@ -256,11 +311,12 @@ async def workspace_git_add(todo_id: str, body: GitAddInput, user: CurrentUser, 
     if rc != 0:
         raise HTTPException(status_code=400, detail=f"git add failed: {output}")
 
-    return await workspace_git_status(todo_id, user, db)
+    return await workspace_git_status(todo_id, user, db, repo=body.repo)
 
 
 class GitCommitInput(BaseModel):
     message: str
+    repo: str | None = None
 
 
 @router.post("/todos/{todo_id}/workspace/git/commit")
@@ -268,7 +324,7 @@ async def workspace_git_commit(
     todo_id: str, body: GitCommitInput, user: CurrentUser, db: DB, redis: Redis,
 ):
     """Commit staged changes in the task workspace. Notifies the orchestrator."""
-    repo_dir, _ = await _resolve_task_repo(todo_id, user, db)
+    repo_dir, _ = await _resolve_task_repo(todo_id, user, db, repo=body.repo)
 
     rc, output = await run_git_command("commit", "-m", body.message, cwd=repo_dir)
     if rc != 0:
@@ -327,10 +383,18 @@ async def workspace_git_commit(
     }
 
 
+class GitPushInput(BaseModel):
+    repo: str | None = None
+
+
 @router.post("/todos/{todo_id}/workspace/git/push")
-async def workspace_git_push(todo_id: str, user: CurrentUser, db: DB, redis: Redis):
+async def workspace_git_push(
+    todo_id: str, user: CurrentUser, db: DB, redis: Redis,
+    body: GitPushInput | None = None,
+):
     """Push commits to remote in the task workspace."""
-    repo_dir, _ = await _resolve_task_repo(todo_id, user, db)
+    repo_name = body.repo if body else None
+    repo_dir, _ = await _resolve_task_repo(todo_id, user, db, repo=repo_name)
 
     # Look up project_id for credential resolution
     todo = await db.fetchrow("SELECT project_id FROM todo_items WHERE id = $1", todo_id)

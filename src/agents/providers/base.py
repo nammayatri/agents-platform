@@ -7,6 +7,7 @@ self-hosted via OpenAI-compatible API) through a uniform interface.
 
 from __future__ import annotations
 
+import hashlib as _hashlib
 import json as _json
 import logging
 from abc import ABC, abstractmethod
@@ -14,6 +15,7 @@ from collections.abc import AsyncIterator, Callable, Awaitable
 from typing import Any
 
 from agents.schemas.agent import LLMMessage, LLMResponse, StreamChunk
+from agents.utils.token_counter import get_context_window
 
 logger = logging.getLogger(__name__)
 
@@ -84,6 +86,34 @@ class AIProvider(ABC):
         """
         ...
 
+    async def send_message_streaming(
+        self,
+        messages: list[LLMMessage],
+        *,
+        on_token: Callable[[str], Awaitable[None]],
+        model: str | None = None,
+        tools: list[dict] | None = None,
+        max_tokens: int = 4096,
+        temperature: float = 0.1,
+        system_prompt: str | None = None,
+        tool_choice: str | dict | None = None,
+    ) -> LLMResponse:
+        """Like send_message but streams text deltas via on_token callback.
+
+        Returns the full LLMResponse (same as send_message) after streaming
+        completes. Subclasses override for real streaming; the default falls
+        back to send_message (no streaming).
+        """
+        return await self.send_message(
+            messages,
+            model=model,
+            tools=tools,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            system_prompt=system_prompt,
+            tool_choice=tool_choice,
+        )
+
 
 # Type alias for tool executor callbacks:
 #   async def executor(tool_name: str, tool_args: dict) -> str
@@ -92,11 +122,94 @@ ToolExecutor = Callable[[str, dict], Awaitable[str]]
 
 ActivityCallback = Callable[[str], Awaitable[None]]
 
+# Callback for streaming text deltas during LLM generation
+TokenCallback = Callable[[str], Awaitable[None]]
+
 # Structured tool event callback for streaming execution visibility
 ToolEventCallback = Callable[[dict], Awaitable[None]]
 
 # Callback to check for injected user messages between tool rounds
 InjectCheckCallback = Callable[[], Awaitable[str | None]]
+
+
+def _compact_messages_for_overflow(
+    messages: list[LLMMessage],
+    keep_recent: int = 6,
+) -> list[LLMMessage]:
+    """Replace old tool-round messages with a summary when approaching context limits.
+
+    Keeps the initial context (system + first user messages) and the last
+    ``keep_recent`` messages intact.  Everything in between is summarized
+    into a single user message listing tool names and brief result previews.
+    """
+    # Identify initial context: everything up to the first non-tool user message
+    head: list[LLMMessage] = []
+    for m in messages:
+        head.append(m)
+        if m.role == "user" and not m.tool_results:
+            break
+    if len(messages) <= len(head) + keep_recent:
+        return messages  # nothing to compact
+
+    tail = messages[-keep_recent:]
+    middle = messages[len(head):-keep_recent]
+
+    summary_parts: list[str] = []
+    for m in middle:
+        if m.tool_calls:
+            tools = [tc["name"] for tc in m.tool_calls]
+            summary_parts.append(f"Called: {', '.join(tools)}")
+        elif m.tool_results:
+            for tr in m.tool_results:
+                preview = (tr.get("content", "") or "")[:150]
+                summary_parts.append(f"Result: {preview}")
+        elif m.content and m.role == "assistant":
+            summary_parts.append(f"Response: {m.content[:150]}")
+
+    # Keep the last 20 summary entries to stay reasonably compact
+    summary = "Previous exploration summary (compacted):\n" + "\n".join(summary_parts[-20:])
+    return [*head, LLMMessage(role="user", content=summary), *tail]
+
+
+async def _retry_on_rate_limit(
+    call: Callable[[], Awaitable[Any]],
+    *,
+    max_retries: int = 3,
+    on_activity: ActivityCallback | None = None,
+) -> Any:
+    """Retry an async call on rate-limit (429) or overloaded (529) errors.
+
+    Respects ``retry-after`` headers when available, otherwise uses
+    exponential backoff (5s, 10s, 20s… capped at 60s).
+    """
+    import asyncio as _asyncio
+
+    for attempt in range(max_retries + 1):
+        try:
+            return await call()
+        except Exception as e:
+            status = getattr(e, "status_code", None) or getattr(e, "status", None)
+            err_s = str(e).lower()
+            retriable = (
+                status in (429, 529)
+                or ("rate" in err_s and "limit" in err_s)
+                or "overloaded" in err_s
+            )
+            if retriable and attempt < max_retries:
+                retry_after = getattr(e, "retry_after", None)
+                if retry_after is None:
+                    hdrs = getattr(e, "headers", {}) or {}
+                    retry_after = hdrs.get("retry-after")
+                wait = float(retry_after) if retry_after else min(2 ** attempt * 5, 60)
+                logger.warning(
+                    "Rate limit hit (attempt %d/%d), waiting %.1fs",
+                    attempt + 1, max_retries, wait,
+                )
+                if on_activity:
+                    await on_activity(f"Rate limited, retrying in {wait:.0f}s...")
+                await _asyncio.sleep(wait)
+                continue
+            raise
 
 
 async def run_tool_loop(
@@ -110,6 +223,8 @@ async def run_tool_loop(
     on_activity: ActivityCallback | None = None,
     on_tool_event: ToolEventCallback | None = None,
     on_inject_check: InjectCheckCallback | None = None,
+    on_cancel_check: Callable[[], Awaitable[bool]] | None = None,
+    on_token: TokenCallback | None = None,
     **send_kwargs: Any,
 ) -> tuple[str, LLMResponse]:
     """Standard tool-call loop with content accumulation.
@@ -130,6 +245,12 @@ async def run_tool_loop(
         on_inject_check: Optional callback to poll for user-injected messages
             between tool rounds. Called after tools execute, before the next LLM
             call.  Return a string to inject or ``None`` for no pending message.
+        on_cancel_check: Optional ``async () -> bool`` callback polled between
+            tool rounds.  Returns ``True`` to abort.  When triggered the loop
+            exits with ``stop_reason="cancelled"`` on the response.
+        on_token: Optional callback for streaming text deltas during LLM
+            generation. When provided, uses ``provider.send_message_streaming``
+            to stream tokens in real-time.
         **send_kwargs: Forwarded to ``provider.send_message`` (temperature, model…).
 
     Returns:
@@ -146,10 +267,18 @@ async def run_tool_loop(
     n_tools = len(tools) if tools else 0
     logger.info("tool_loop: starting (tools=%d, max_rounds=%d)", n_tools, max_rounds)
 
+    # Helper: call LLM with optional token streaming
+    async def _call_llm() -> LLMResponse:
+        if on_token:
+            return await provider.send_message_streaming(
+                messages, on_token=on_token, **send_kwargs,
+            )
+        return await provider.send_message(messages, **send_kwargs)
+
     if on_activity:
         await on_activity("Thinking...")
 
-    response = await provider.send_message(messages, **send_kwargs)
+    response = await _retry_on_rate_limit(_call_llm, on_activity=on_activity)
 
     # After first call, drop tool_choice so subsequent rounds use auto
     send_kwargs.pop("tool_choice", None)
@@ -165,8 +294,8 @@ async def run_tool_loop(
     if on_activity:
         n_tc = len(response.tool_calls) if response.tool_calls else 0
         if n_tc > 0:
-            tool_names = [tc["name"] for tc in response.tool_calls]
-            await on_activity(f"Agent will: {', '.join(tool_names)}")
+            briefs = [_tool_brief(tc["name"], tc.get("arguments", {})) for tc in response.tool_calls]
+            await on_activity(f"Agent will: {', '.join(briefs)}")
         else:
             await on_activity("Agent responded")
 
@@ -184,6 +313,11 @@ async def run_tool_loop(
     total_tool_calls = 0
     loop_count = 0
     nudged = False
+
+    # Doom-loop detection: track recent (tool_name, args_hash) signatures
+    _recent_sigs: list[list[str]] = []
+    _DOOM_WINDOW = 5
+    _DOOM_THRESHOLD = 3
 
     # Nudge: if tools were provided but the model wrote text instead of calling
     # them, inject a correction and retry once.  This catches models (e.g.
@@ -206,7 +340,7 @@ async def run_tool_loop(
         ))
         if response.content:
             content_parts.append(response.content)
-        response = await provider.send_message(messages, **send_kwargs)
+        response = await _retry_on_rate_limit(_call_llm, on_activity=on_activity)
         nudged = True
         logger.info(
             "tool_loop: nudge response stop_reason=%s tool_calls=%d",
@@ -318,6 +452,34 @@ async def run_tool_loop(
 
         messages.append(LLMMessage(role="user", content="", tool_results=tool_results))
 
+        # --- Doom loop detection ---
+        round_sigs = []
+        for tc in response.tool_calls:
+            sig = tc["name"] + ":" + _hashlib.md5(
+                _json.dumps(tc.get("arguments", {}), sort_keys=True).encode()
+            ).hexdigest()[:12]
+            round_sigs.append(sig)
+        _recent_sigs.append(round_sigs)
+
+        if len(_recent_sigs) >= _DOOM_THRESHOLD:
+            window = _recent_sigs[-_DOOM_WINDOW:]
+            flat = [s for rnd in window for s in rnd]
+            from collections import Counter as _Counter
+            counts = _Counter(flat)
+            repeated = [s.split(":")[0] for s, c in counts.items() if c >= _DOOM_THRESHOLD]
+            if repeated:
+                logger.warning("tool_loop: doom loop — %s repeated %d+ times in last %d rounds",
+                               repeated, _DOOM_THRESHOLD, len(window))
+                messages.append(LLMMessage(
+                    role="user",
+                    content=(
+                        f"STOP: You are stuck in a loop calling {', '.join(repeated)} "
+                        f"with the same arguments. Try a DIFFERENT approach or call submit_result."
+                    ),
+                ))
+                if on_activity:
+                    await on_activity(f"Breaking stuck loop ({', '.join(repeated)})")
+
         # Check for injected user messages between tool rounds
         if on_inject_check:
             injected_parts: list[str] = []
@@ -338,10 +500,16 @@ async def run_tool_loop(
                 logger.info("tool_loop: injected %d user message(s) before round %d",
                             len(injected_parts), loop_count + 1)
 
+        # Cancellation check between tool rounds
+        if on_cancel_check and await on_cancel_check():
+            logger.info("tool_loop: cancelled by caller after round %d", loop_count)
+            response.stop_reason = "cancelled"
+            break
+
         if on_activity:
             await on_activity(f"Thinking... (round {loop_count + 1})")
 
-        response = await provider.send_message(messages, **send_kwargs)
+        response = await _retry_on_rate_limit(_call_llm, on_activity=on_activity)
 
         logger.info(
             "tool_loop: round %d response stop_reason=%s tool_calls=%d",
@@ -352,8 +520,8 @@ async def run_tool_loop(
         if on_activity:
             n_tc = len(response.tool_calls) if response.tool_calls else 0
             if n_tc > 0:
-                tool_names = [tc["name"] for tc in response.tool_calls]
-                await on_activity(f"Agent will: {', '.join(tool_names)}")
+                briefs = [_tool_brief(tc["name"], tc.get("arguments", {})) for tc in response.tool_calls]
+                await on_activity(f"Agent will: {', '.join(briefs)}")
             else:
                 await on_activity(f"Agent responded (round {loop_count})")
 
@@ -365,6 +533,19 @@ async def run_tool_loop(
                 "tokens_out": response.tokens_output,
                 "round": loop_count,
             })
+
+        # Context overflow guard — compact old tool rounds if approaching limit
+        if response.tokens_input > 0:
+            ctx_window = get_context_window(response.model or provider.default_model)
+            if ctx_window and response.tokens_input > ctx_window * 0.85:
+                logger.warning(
+                    "tool_loop: context at %.0f%% (%d/%d tokens), compacting",
+                    100 * response.tokens_input / ctx_window,
+                    response.tokens_input, ctx_window,
+                )
+                messages[:] = _compact_messages_for_overflow(messages)
+                if on_activity:
+                    await on_activity("Compacting context (approaching limit)...")
 
     truncated = loop_count >= max_rounds and bool(response.tool_calls)
     if truncated:
@@ -485,3 +666,25 @@ def _tool_activity_summary(name: str, args: dict) -> str:
         return f"Editing {_osp.basename(path)} ({old_len}\u2192{new_len} chars)"
     # Generic fallback
     return f"Tool: {name}"
+
+
+def _tool_brief(name: str, args: dict) -> str:
+    """Compact tool+arg hint for 'Agent will:' lines, e.g. run_command(npm test)."""
+    import os.path as _osp
+
+    if name in ("read_file", "write_file", "edit_file"):
+        return f"{name}({_osp.basename(args.get('path', '?'))})"
+    if name == "list_directory":
+        return f"list_directory({_osp.basename(args.get('path', '?'))}/)"
+    if name == "search_files":
+        pat = args.get("pattern", "?")
+        return f"search_files(\"{pat[:40]}\")"
+    if name == "run_command":
+        cmd = args.get("command", "?")
+        if len(cmd) > 60:
+            cmd = cmd[:57] + "..."
+        return f"run_command({cmd})"
+    if name == "semantic_search":
+        q = args.get("query", "?")[:40]
+        return f"semantic_search(\"{q}\")"
+    return name

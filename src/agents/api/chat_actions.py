@@ -155,8 +155,9 @@ async def _handle_create_task(arguments: dict, context: dict) -> dict:
     event_bus = context.get("event_bus")
     sub_tasks_input = arguments.get("sub_tasks") or []
 
+    session_id = context.get("session_id")
+
     if sub_tasks_input:
-        # Direct execution path: create task in in_progress with sub-tasks
         plan_json = {
             "summary": arguments.get("description", arguments["title"]),
             "sub_tasks": [
@@ -176,13 +177,68 @@ async def _handle_create_task(arguments: dict, context: dict) -> dict:
             "approach": "Pre-planned by planner agent",
         }
 
+        if session_id:
+            # Chat session context: create in plan_ready for user approval.
+            # Sub-tasks are NOT inserted here — the approve-plan endpoint
+            # creates them from plan_json when the user approves.
+            todo = await db.fetchrow(
+                """
+                INSERT INTO todo_items (
+                    project_id, creator_id, title, description, priority, task_type,
+                    state, plan_json, intake_data
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, 'plan_ready', $7::jsonb, $8::jsonb)
+                RETURNING *
+                """,
+                project_id,
+                user_id,
+                arguments["title"],
+                arguments.get("description", ""),
+                arguments.get("priority", "medium"),
+                arguments.get("task_type", "general"),
+                json.dumps(plan_json),
+                json.dumps(intake_data),
+            )
+            todo_id = str(todo["id"])
+
+            # Link to chat session
+            await db.execute(
+                "UPDATE todo_items SET chat_session_id = $1 WHERE id = $2",
+                session_id, todo_id,
+            )
+            await db.execute(
+                "UPDATE project_chat_sessions SET linked_todo_id = $1 WHERE id = $2",
+                todo_id, session_id,
+            )
+
+            return {
+                "action": "task_created",
+                "task_id": todo_id,
+                "title": arguments["title"],
+                "priority": arguments.get("priority", "medium"),
+                "task_type": arguments.get("task_type", "general"),
+                "awaiting_approval": True,
+                "plan_data": {
+                    "summary": plan_json.get("summary", ""),
+                    "sub_tasks": [
+                        {
+                            "title": st["title"],
+                            "agent_role": st.get("agent_role", "coder"),
+                            "description": st.get("description", "")[:200],
+                        }
+                        for st in plan_json.get("sub_tasks", [])
+                    ],
+                },
+            }
+
+        # No chat session — direct execution path (API / non-chat callers)
         todo = await db.fetchrow(
             """
             INSERT INTO todo_items (
                 project_id, creator_id, title, description, priority, task_type,
                 state, sub_state, plan_json, intake_data
             )
-            VALUES ($1, $2, $3, $4, $5, $6, 'in_progress', 'executing', $7, $8)
+            VALUES ($1, $2, $3, $4, $5, $6, 'in_progress', 'executing', $7::jsonb, $8::jsonb)
             RETURNING *
             """,
             project_id,
@@ -191,8 +247,8 @@ async def _handle_create_task(arguments: dict, context: dict) -> dict:
             arguments.get("description", ""),
             arguments.get("priority", "medium"),
             arguments.get("task_type", "general"),
-            plan_json,
-            intake_data,
+            json.dumps(plan_json),
+            json.dumps(intake_data),
         )
         todo_id = str(todo["id"])
 
@@ -218,14 +274,12 @@ async def _handle_create_task(arguments: dict, context: dict) -> dict:
             )
             sub_task_ids.append(str(row["id"]))
 
-            # For review_loop sub-tasks, set review_chain_id to themselves (chain root)
             if review_loop:
                 await db.execute(
                     "UPDATE sub_tasks SET review_chain_id = $1 WHERE id = $1",
                     row["id"],
                 )
 
-        # Set up depends_on using index→UUID mapping
         for i, st in enumerate(plan_json["sub_tasks"]):
             deps = st.get("depends_on", [])
             if deps:
@@ -236,18 +290,6 @@ async def _handle_create_task(arguments: dict, context: dict) -> dict:
                         sub_task_ids[i],
                         dep_ids,
                     )
-
-        # Link to chat session if created from a session
-        session_id = context.get("session_id")
-        if session_id:
-            await db.execute(
-                "UPDATE todo_items SET chat_session_id = $1 WHERE id = $2",
-                session_id, todo_id,
-            )
-            await db.execute(
-                "UPDATE project_chat_sessions SET linked_todo_id = $1 WHERE id = $2",
-                todo_id, session_id,
-            )
 
         # Emit event for orchestrator — task starts at in_progress
         if event_bus:
@@ -270,7 +312,6 @@ async def _handle_create_task(arguments: dict, context: dict) -> dict:
             "task_type": arguments.get("task_type", "general"),
             "sub_tasks_created": len(sub_task_ids),
             "direct_execution": True,
-            "linked_session_id": session_id,
         }
 
     # Standard path: create task in intake state
@@ -289,7 +330,6 @@ async def _handle_create_task(arguments: dict, context: dict) -> dict:
     todo_id = str(todo["id"])
 
     # Link to chat session if created from a session
-    session_id = context.get("session_id")
     if session_id:
         await db.execute(
             "UPDATE todo_items SET chat_session_id = $1 WHERE id = $2",

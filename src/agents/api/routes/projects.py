@@ -407,6 +407,45 @@ class BuildSettingsInput(BaseModel):
     build_commands: list[str] | None = None
     merge_method: str | None = None
     require_merge_approval: bool | None = None
+    require_plan_approval: bool | None = None
+
+
+# ── Release Pipeline Settings ─────────────────────────────────────
+
+
+class ReleaseEndpointConfig(BaseModel):
+    enabled: bool = False
+    api_url: str | None = None
+    http_method: str = "POST"
+    headers: dict[str, str] | None = None
+    body_template: str | None = None
+    success_status_codes: list[int] | None = None
+    poll_status_url: str | None = None
+    poll_success_value: str | None = None
+
+
+class ProdReleaseEndpointConfig(ReleaseEndpointConfig):
+    require_approval: bool = False
+
+
+class BuildConfig(BaseModel):
+    workflow_name: str | None = None      # GitHub Actions
+    job_url: str | None = None            # Jenkins
+    token: str | None = None              # Jenkins auth token
+    timeout_minutes: int = 30
+    poll_interval_seconds: int = 30
+
+
+class ReleaseConfig(BaseModel):
+    build_provider: str = "github_actions"  # "github_actions" | "jenkins"
+    build_config: BuildConfig | None = None
+    test_release: ReleaseEndpointConfig | None = None
+    prod_release: ProdReleaseEndpointConfig | None = None
+
+
+class ReleaseSettingsInput(BaseModel):
+    release_pipeline_enabled: bool | None = None
+    release_config: ReleaseConfig | None = None
 
 
 @router.get("/{project_id}/build-settings")
@@ -421,6 +460,7 @@ async def get_build_settings(project_id: str, user: CurrentUser, db: DB):
         "build_commands": settings.get("build_commands", []),
         "merge_method": settings.get("merge_method", "squash"),
         "require_merge_approval": settings.get("require_merge_approval", False),
+        "require_plan_approval": settings.get("require_plan_approval", False),
     }
 
 
@@ -443,6 +483,8 @@ async def update_build_settings(
         settings["merge_method"] = body.merge_method
     if body.require_merge_approval is not None:
         settings["require_merge_approval"] = body.require_merge_approval
+    if body.require_plan_approval is not None:
+        settings["require_plan_approval"] = body.require_plan_approval
 
     await db.execute(
         "UPDATE projects SET settings_json = $2, updated_at = NOW() WHERE id = $1",
@@ -453,6 +495,50 @@ async def update_build_settings(
         "build_commands": settings.get("build_commands", []),
         "merge_method": settings.get("merge_method", "squash"),
         "require_merge_approval": settings.get("require_merge_approval", False),
+        "require_plan_approval": settings.get("require_plan_approval", False),
+    }
+
+
+@router.get("/{project_id}/release-settings")
+async def get_release_settings(project_id: str, user: CurrentUser, db: DB):
+    """Get project release pipeline settings."""
+    await check_project_access(db, project_id, user)
+    row = await db.fetchrow("SELECT settings_json FROM projects WHERE id = $1", project_id)
+    settings = row["settings_json"] or {}
+    if isinstance(settings, str):
+        settings = json.loads(settings)
+    return {
+        "release_pipeline_enabled": settings.get("release_pipeline_enabled", False),
+        "release_config": settings.get("release_config", {}),
+    }
+
+
+@router.put("/{project_id}/release-settings")
+async def update_release_settings(
+    project_id: str, body: ReleaseSettingsInput, user: CurrentUser, db: DB,
+):
+    """Update project release pipeline settings. Owner-only."""
+    await check_project_owner(db, project_id, user)
+    row = await db.fetchrow("SELECT settings_json FROM projects WHERE id = $1", project_id)
+    if not row:
+        raise HTTPException(status_code=404)
+    settings = row["settings_json"] or {}
+    if isinstance(settings, str):
+        settings = json.loads(settings)
+
+    if body.release_pipeline_enabled is not None:
+        settings["release_pipeline_enabled"] = body.release_pipeline_enabled
+    if body.release_config is not None:
+        settings["release_config"] = body.release_config.model_dump(exclude_none=True)
+
+    await db.execute(
+        "UPDATE projects SET settings_json = $2, updated_at = NOW() WHERE id = $1",
+        project_id,
+        settings,
+    )
+    return {
+        "release_pipeline_enabled": settings.get("release_pipeline_enabled", False),
+        "release_config": settings.get("release_config", {}),
     }
 
 

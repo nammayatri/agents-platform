@@ -1,4 +1,4 @@
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable, Awaitable
 
 import anthropic
 
@@ -152,6 +152,72 @@ class AnthropicProvider(AIProvider):
             stop_reason=response.stop_reason or "",
             cost_usd=cost,
             cached_tokens=getattr(response.usage, "cache_read_input_tokens", 0) or 0,
+        )
+
+    async def send_message_streaming(
+        self,
+        messages: list[LLMMessage],
+        *,
+        on_token: Callable[[str], Awaitable[None]],
+        model: str | None = None,
+        tools: list[dict] | None = None,
+        max_tokens: int = 4096,
+        temperature: float = 0.1,
+        system_prompt: str | None = None,
+        tool_choice: str | dict | None = None,
+    ) -> LLMResponse:
+        sys_from_messages, api_messages = self._build_messages(messages)
+        system = system_prompt or sys_from_messages
+
+        kwargs: dict = {
+            "model": model or self.default_model,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "messages": api_messages,
+        }
+        if system:
+            kwargs["system"] = system
+        if tool_choice == "none":
+            tools = None
+        api_tools = self._build_tools(tools)
+        if api_tools:
+            kwargs["tools"] = api_tools
+        mapped_tc = self._map_tool_choice(tool_choice)
+        if mapped_tc is not None and api_tools:
+            kwargs["tool_choice"] = mapped_tc
+
+        async with self.client.messages.stream(**kwargs) as stream:
+            async for text in stream.text_stream:
+                await on_token(text)
+            final = await stream.get_final_message()
+
+        content = ""
+        tool_calls = []
+        for block in final.content:
+            if block.type == "text":
+                content += block.text
+            elif block.type == "tool_use":
+                tool_calls.append({
+                    "id": block.id,
+                    "name": block.name,
+                    "arguments": block.input,
+                })
+
+        cost = self.estimate_cost(
+            final.usage.input_tokens,
+            final.usage.output_tokens,
+            kwargs["model"],
+        )
+
+        return LLMResponse(
+            content=content,
+            tool_calls=tool_calls,
+            tokens_input=final.usage.input_tokens,
+            tokens_output=final.usage.output_tokens,
+            model=kwargs["model"],
+            stop_reason=final.stop_reason or "",
+            cost_usd=cost,
+            cached_tokens=getattr(final.usage, "cache_read_input_tokens", 0) or 0,
         )
 
     async def stream_message(

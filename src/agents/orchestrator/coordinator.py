@@ -45,12 +45,6 @@ from agents.agents.registry import (
 
 MAX_REVIEW_ROUNDS = 10
 
-STUCK_DETECTOR_PROMPT = """\
-Analyze the last 5 iteration logs for loop patterns (same fix repeated, flip-flopping, \
-undoing changes, same error recurring). Respond with JSON only:
-{"stuck": true/false, "pattern": "loop description or null", "advice": "actionable fix or null"}
-"""
-
 
 INTAKE_SYSTEM_PROMPT = """\
 You are a task intake agent. Decide if the task is clear enough to start.
@@ -136,6 +130,15 @@ and what the expected outcome is.
 - Include relevant context from your codebase exploration so the agent doesn't need to \
 re-discover everything.
 
+SUB-TASK CONTEXT (the "context" field — REQUIRED for coder/debugger sub-tasks):
+Populate the "context" object on each sub-task with your exploration findings:
+- relevant_files: list of file paths the agent should look at or modify
+- current_state: what the code currently does (so the agent knows the starting point)
+- what_to_change: specific changes needed (not just "fix the bug" — describe the fix)
+- patterns_to_follow: coding patterns, naming conventions, or examples from the codebase
+- related_code: brief snippets or function signatures discovered during exploration
+- integration_points: how this sub-task connects to other sub-tasks or repos
+
 ## Cross-Repo Exploration
 
 Dependency repos are available at ../deps/{name}/ (read-only via workspace tools).
@@ -144,8 +147,8 @@ Dependency repos are available at ../deps/{name}/ (read-only via workspace tools
 - Use search_files(pattern="...", path="../deps/{name}/") to search within a dependency.
 - When a task involves cross-repo concerns (shared types, API consumed from a dep, \
 integration patterns), ALWAYS explore both the main repo AND the relevant deps first.
-- For sub-tasks that need to modify a dependency repo, set target_repo with the dep's \
-repo_url, name, default_branch, and git_provider_id.
+- For sub-tasks that need to modify a dependency repo, set target_repo to the \
+dependency name string (e.g. "auth-service"). The orchestrator resolves all repo metadata.
 
 ## Query Enrichment
 
@@ -160,7 +163,10 @@ Before creating your plan, proactively enrich the user's request:
 
 After exploring the codebase, output ONLY a JSON object (no markdown fences, no extra text):
 {"summary":"...", "sub_tasks":[{"title":"...", "description":"...", "agent_role":"...", \
-"execution_order":0, "depends_on":[], "review_loop":false, "target_repo":null}], "estimated_tokens":5000}
+"execution_order":0, "depends_on":[], "review_loop":false, "target_repo":"main", \
+"context":{"relevant_files":[], "current_state":"...", "what_to_change":"...", \
+"patterns_to_follow":"...", "related_code":"...", "integration_points":"..."}}], \
+"estimated_tokens":5000}
 
 Sub-task fields:
 - title: short descriptive title
@@ -169,15 +175,13 @@ Sub-task fields:
 - execution_order: 0 for parallel, sequential number for ordered execution
 - depends_on: list of 0-based indexes of sub-tasks this depends on
 - review_loop: true for critical code changes needing coder→reviewer→merge cycle
-- target_repo: null unless working on a different repo \
-(format: {"repo_url":"...", "name":"...", "default_branch":"main", "git_provider_id":null})
-"""
-
-REVIEW_SYSTEM_PROMPT = """\
-You are a work reviewer. Approve unless there are objective problems (broken logic, \
-missing critical requirements, security issues). Style nits are not blockers.
-
-Output JSON: {"approved": true/false, "issues": [...], "summary": "..."}
+- target_repo: REQUIRED — every sub-task MUST have this field set. Use "main" for work in \
+the main project repo. For dependency repo work, use the EXACT dependency name string from \
+the dependency repos list below (e.g. "auth-service"). This routes the agent to the correct \
+workspace — a wrong value means the agent codes in the wrong repo and the task fails.
+- context: exploration findings for the agent (REQUIRED for coder/debugger). Include \
+relevant_files, current_state, what_to_change, patterns_to_follow, related_code, \
+integration_points. This is the agent's primary reference — make it thorough.
 """
 
 
@@ -247,6 +251,46 @@ class AgentCoordinator:
         )
         return dict(row) if row else None
 
+    async def _resolve_git_provider(self, project: dict) -> tuple:
+        """Resolve git provider, owner, and repo from a project row.
+
+        Returns (git_provider_instance, owner, repo).
+        Raises ValueError if project has no repo_url.
+        """
+        from agents.orchestrator.git_providers.factory import (
+            create_git_provider,
+            parse_repo_url,
+        )
+        from agents.infra.crypto import decrypt
+
+        repo_url = project["repo_url"]
+        if not repo_url:
+            raise ValueError("No repo_url configured on project")
+
+        git_provider_id = str(project["git_provider_id"]) if project.get("git_provider_id") else None
+        token = None
+        provider_type = None
+        api_base_url = None
+        if git_provider_id:
+            gp_row = await self.db.fetchrow(
+                "SELECT provider_type, api_base_url, token_enc "
+                "FROM git_provider_configs WHERE id = $1",
+                git_provider_id,
+            )
+            if gp_row:
+                token = decrypt(gp_row["token_enc"]) if gp_row.get("token_enc") else None
+                provider_type = gp_row["provider_type"]
+                api_base_url = gp_row.get("api_base_url")
+
+        git = create_git_provider(
+            provider_type=provider_type,
+            api_base_url=api_base_url,
+            token=token,
+            repo_url=repo_url,
+        )
+        owner, repo = parse_repo_url(repo_url)
+        return git, owner, repo
+
     async def run(self) -> None:
         """Main coordinator loop for one task."""
         todo = await self._load_todo()
@@ -270,9 +314,26 @@ class AgentCoordinator:
                 logger.info("[%s] → entering _phase_planning", self.todo_id)
                 await self._phase_planning(todo, provider)
             case "plan_ready":
-                # Auto-approve if plan exists — minimal human gating
+                # Check if human approval is required
+                project = await self.db.fetchrow(
+                    "SELECT settings_json FROM projects WHERE id = $1",
+                    todo["project_id"],
+                )
+                pr_settings = project["settings_json"] or {} if project else {}
+                if isinstance(pr_settings, str):
+                    pr_settings = json.loads(pr_settings)
+                require_plan = pr_settings.get("require_plan_approval", False)
+
                 plan = todo.get("plan_json")
-                logger.info("[%s] → plan_ready: plan exists=%s", self.todo_id, plan is not None)
+                logger.info("[%s] → plan_ready: plan exists=%s require_plan_approval=%s",
+                            self.todo_id, plan is not None, require_plan)
+
+                if require_plan:
+                    # Wait for human — don't auto-approve
+                    logger.info("[%s] plan_ready: require_plan_approval=True, waiting for human",
+                                self.todo_id)
+                    return
+
                 if plan:
                     if isinstance(plan, str):
                         plan = json.loads(plan)
@@ -526,18 +587,13 @@ class AgentCoordinator:
             dep_dirs = context.get("dependency_dirs", {})
             deps_list = context.get("dependencies", [])
             if dep_dirs:
-                planner_prompt += "\n\nDependency repositories available for reference (read-only):"
-                planner_prompt += "\nAccess via ../deps/{name}/path relative to repo root."
+                planner_prompt += "\n\nDependency repositories (read-only at ../deps/{dir_name}/, writable via target_repo):"
+                planner_prompt += "\nTo modify a dep repo, set target_repo to the dep name string. The orchestrator resolves all metadata."
                 for dep in deps_list:
                     name = dep.get("name", "")
                     dir_name = dep_dirs.get(name, "")
                     if dir_name:
-                        line = f"\n  - ../deps/{dir_name}/"
-                        if dep.get("repo_url"):
-                            line += f" ({dep['repo_url']})"
-                        if dep.get("git_provider_id"):
-                            line += f" [git_provider_id: {dep['git_provider_id']}]"
-                        planner_prompt += line
+                        planner_prompt += f"\n  - \"{name}\" (browse at ../deps/{dir_name}/)"
 
             # Inject cross-repo integration links from project understanding
             understanding = context.get("project_understanding", {})
@@ -554,6 +610,25 @@ class AgentCoordinator:
                         planner_prompt += f" (main repo: {main_files})"
                     if interfaces:
                         planner_prompt += f" (interfaces: {interfaces})"
+
+            # Inject per-dependency understandings
+            dep_understandings = context.get("dep_understandings", {})
+            if dep_understandings and isinstance(dep_understandings, dict):
+                planner_prompt += "\n\nDependency repo understandings:"
+                for dep_name, dep_u in dep_understandings.items():
+                    if isinstance(dep_u, dict):
+                        purpose = dep_u.get("purpose", "")
+                        api = dep_u.get("api_surface", "")
+                        planner_prompt += f"\n  - {dep_name}: {purpose}"
+                        if api:
+                            planner_prompt += f"\n    API: {api[:300]}"
+
+            # Inject linking document overview
+            linking_doc = context.get("linking_document", {})
+            if linking_doc and isinstance(linking_doc, dict):
+                overview = linking_doc.get("overview", "")
+                if overview:
+                    planner_prompt += f"\n\nCross-repo architecture:\n{overview[:800]}"
 
             planner_prompt += build_tools_prompt_block("planner")
 
@@ -582,13 +657,28 @@ class AgentCoordinator:
 
             git_diff = previous_run.get("git_diff")
             if git_diff:
-                user_parts.append(f"\n## Existing Code Changes (git diff)\n{git_diff.get('stat', '')}")
+                user_parts.append(f"\n## Existing Code Changes — main repo (git diff)\n{git_diff.get('stat', '')}")
                 if git_diff.get("files"):
                     user_parts.append("\nChanged files:")
                     for f in git_diff["files"]:
                         user_parts.append(f"  {f['status']}\t{f['path']}")
                 if git_diff.get("diff"):
                     user_parts.append(f"\nFull diff:\n```\n{git_diff['diff']}\n```")
+
+            # Include diffs from dependency workspaces
+            dep_diffs = previous_run.get("dep_diffs")
+            if dep_diffs:
+                for dep_name, dep_diff in dep_diffs.items():
+                    user_parts.append(f"\n## Existing Code Changes — dependency `{dep_name}` (git diff)")
+                    user_parts.append(dep_diff.get("stat", ""))
+                    if dep_diff.get("files"):
+                        user_parts.append("\nChanged files:")
+                        for f in dep_diff["files"]:
+                            user_parts.append(f"  {f['status']}\t{f['path']}")
+                    if dep_diff.get("diff"):
+                        user_parts.append(f"\nFull diff:\n```\n{dep_diff['diff']}\n```")
+
+            if git_diff or dep_diffs:
                 user_parts.append(
                     "\nIMPORTANT: The above code changes already exist in the workspace. "
                     "Create sub-tasks that build on or fix these existing changes — "
@@ -618,9 +708,12 @@ class AgentCoordinator:
             planner_tools = self._get_builtin_tools(workspace_path, "planner")
             # Inject task-local index directory for semantic_search
             _plan_idx = os.path.join(workspace_path, ".agent_index")
+            _plan_dep_dirs = self._get_dep_index_dirs(workspace_path)
             for _bt in planner_tools:
                 if _bt["name"] == "semantic_search":
                     _bt["_index_dir"] = _plan_idx
+                    if _plan_dep_dirs:
+                        _bt["_dep_index_dirs"] = _plan_dep_dirs
 
             # Also include MCP tools if configured
             mcp_tools = await self.tools_registry.resolve_tools(
@@ -649,9 +742,16 @@ class AgentCoordinator:
                             "execution_order": {"type": "integer"},
                             "depends_on": {"type": "array", "items": {"type": "integer"}},
                             "review_loop": {"type": "boolean"},
-                            "target_repo": {},
+                            "target_repo": {
+                                "type": "string",
+                                "description": "REQUIRED. 'main' for main-repo work, or the dependency name (e.g. 'auth-service') for dep-repo work.",
+                            },
+                            "context": {
+                                "type": "object",
+                                "description": "Exploration findings for the agent. REQUIRED for coder/debugger roles.",
+                            },
                         },
-                        "required": ["title", "description", "agent_role"],
+                        "required": ["title", "description", "agent_role", "target_repo"],
                     },
                 },
                 "estimated_tokens": {"type": "integer"},
@@ -678,15 +778,20 @@ class AgentCoordinator:
                         name, args, planner_tools,
                     )
 
+                _plan_token_cb = self._build_token_streamer()
                 content, response = await run_tool_loop(
                     provider, messages,
                     tools=tools_with_submit,
                     tool_executor=_plan_tool_exec,
-                    max_rounds=8,
+                    max_rounds=70,
                     on_activity=lambda msg: self._report_planning_activity(msg),
+                    on_cancel_check=self._is_cancelled,
+                    on_token=_plan_token_cb,
                     temperature=0.1,
                     max_tokens=16384,
                 )
+                if hasattr(_plan_token_cb, "flush"):
+                    await _plan_token_cb.flush()
             else:
                 # No workspace — use submit_result with forced tool_choice
                 response = await provider.send_message(
@@ -764,7 +869,45 @@ class AgentCoordinator:
                 )
                 raise ValueError("Failed to parse execution plan from LLM after retries")
 
-        # Store plan as structured JSON for human review
+        # ── Plan review loop: LLM validates quality before proceeding ──
+        task_context = (
+            f"Task: {todo['title']}\n"
+            f"Description: {todo['description'] or 'N/A'}\n"
+            f"Type: {todo['task_type']}"
+        )
+        max_review_iterations = 2
+        for review_iter in range(max_review_iterations + 1):
+            review = await self._review_plan(plan, task_context, provider)
+
+            if review["approved"]:
+                logger.info("[%s] Plan review approved (iteration %d)", self.todo_id, review_iter)
+                break
+
+            if review_iter == max_review_iterations:
+                logger.warning(
+                    "[%s] Plan review: max iterations (%d) reached, proceeding with current plan",
+                    self.todo_id, max_review_iterations,
+                )
+                break
+
+            # Re-plan with feedback
+            feedback = review.get("feedback", "Plan needs improvement.")
+            await self._post_system_message(
+                f"**Plan review (iteration {review_iter + 1}):** Revising plan...\n\n{feedback}"
+            )
+            plan = await self._re_plan_with_feedback(
+                plan, feedback, provider, todo, context,
+                workspace_path=workspace_path,
+                planner_tools=planner_tools,
+            )
+
+            # Store updated plan
+            await self.db.execute(
+                "UPDATE todo_items SET plan_json = $2, updated_at = NOW() WHERE id = $1",
+                self.todo_id, plan,
+            )
+
+        # Store final plan as structured JSON for human review
         await self.db.execute(
             "UPDATE todo_items SET plan_json = $2, updated_at = NOW() WHERE id = $1",
             self.todo_id,
@@ -775,28 +918,287 @@ class AgentCoordinator:
             f"  {i+1}. [{st['agent_role']}] {st['title']}"
             for i, st in enumerate(plan.get("sub_tasks", []))
         )
-        await self._post_system_message(
-            f"**Execution Plan:**\n\n{plan.get('summary', 'No summary')}\n\n"
-            f"**Sub-tasks:** {len(plan.get('sub_tasks', []))}\n"
-            + sub_tasks_text
-            + "\n\nAuto-approved. Starting execution."
+
+        # Check if human approval is required:
+        # 1. Explicit project setting: require_plan_approval
+        # 2. Task linked to a chat session (user created it from chat — show plan for approval)
+        project_row = await self.db.fetchrow(
+            "SELECT settings_json FROM projects WHERE id = $1",
+            todo["project_id"],
+        )
+        project_settings = project_row["settings_json"] or {} if project_row else {}
+        if isinstance(project_settings, str):
+            project_settings = json.loads(project_settings)
+        require_plan_approval = project_settings.get("require_plan_approval", False)
+        has_chat_session = bool(getattr(self, "_chat_session_id", None))
+
+        if require_plan_approval or has_chat_session:
+            # Transition to plan_ready — wait for human approval
+            await self._transition_todo("plan_ready")
+
+            plan_message = (
+                f"**Plan ready for review** ({len(plan.get('sub_tasks', []))} sub-tasks)\n\n"
+                f"{plan.get('summary', 'No summary')}\n\n"
+                f"**Sub-tasks:**\n{sub_tasks_text}"
+            )
+
+            if has_chat_session:
+                # Post with metadata so chat UI can render approve/reject buttons
+                # Include full context so users can review all details before approving
+                plan_metadata = {
+                    "action": "task_plan_ready",
+                    "task_id": self.todo_id,
+                    "task_title": todo.get("title", ""),
+                    "plan_data": {
+                        "summary": plan.get("summary", ""),
+                        "sub_tasks": [
+                            {
+                                "title": st.get("title", ""),
+                                "agent_role": st.get("agent_role", ""),
+                                "description": st.get("description", ""),
+                                "execution_order": st.get("execution_order", 0),
+                                "depends_on": st.get("depends_on", []),
+                                "review_loop": st.get("review_loop", False),
+                                "target_repo": st.get("target_repo", "main"),
+                                "context": st.get("context", {}),
+                            }
+                            for st in plan.get("sub_tasks", [])
+                        ],
+                    },
+                }
+                await self._post_system_message(
+                    plan_message + "\n\nApprove or reject below.",
+                    metadata=plan_metadata,
+                )
+            else:
+                await self._post_system_message(
+                    plan_message + "\n\nApprove or reject from the task detail page.",
+                )
+        else:
+            # Auto-approve (default behavior)
+            await self._post_system_message(
+                f"**Execution Plan:**\n\n{plan.get('summary', 'No summary')}\n\n"
+                f"**Sub-tasks:** {len(plan.get('sub_tasks', []))}\n"
+                + sub_tasks_text
+                + "\n\nAuto-approved. Starting execution."
+            )
+            await self._auto_approve_plan(todo, plan)
+
+    async def _review_plan(self, plan: dict, task_context: str, provider: AIProvider) -> dict:
+        """LLM-based plan quality review. Returns {"approved": bool, "feedback": str}."""
+        from agents.orchestrator.structured_output import build_submit_tool, extract_submit_result
+
+        review_system = (
+            "You are a plan reviewer for an AI task orchestration system. "
+            "Your job is to evaluate whether the execution plan is high quality and ready to execute.\n\n"
+            "Review criteria:\n"
+            "1. Every coder/debugger sub-task has specific context — references actual file paths, not vague descriptions\n"
+            "2. Sub-task descriptions are actionable and clear about what needs to change\n"
+            "3. Dependencies are logical (no circular deps, no unnecessary sequential chains)\n"
+            "4. The plan covers the full scope of the original task\n"
+            "5. Agent roles are appropriate for the work described\n"
+            "6. Parallelism is maximized — flag plans that are unnecessarily sequential\n"
+            "7. Sub-tasks have populated context objects with relevant_files where applicable\n\n"
+            "If the plan is good enough to execute, approve it. Only reject if there are clear, "
+            "fixable issues. Be practical — don't reject for minor style preferences."
         )
 
-        # Auto-approve: create sub-tasks and transition to execution
-        await self._auto_approve_plan(todo, plan)
+        review_schema = {
+            "type": "object",
+            "properties": {
+                "approved": {"type": "boolean", "description": "Whether the plan passes review"},
+                "feedback": {"type": "string", "description": "Specific feedback if rejecting, or brief approval note"},
+            },
+            "required": ["approved", "feedback"],
+        }
+        review_submit_tool = build_submit_tool(review_schema, "review",
+            "Submit your plan review verdict.")
+
+        plan_text = json.dumps(plan, indent=2, default=str)
+        if len(plan_text) > 8000:
+            plan_text = plan_text[:8000] + "\n...(truncated)"
+
+        messages = [
+            LLMMessage(role="system", content=review_system),
+            LLMMessage(
+                role="user",
+                content=(
+                    f"{task_context}\n\n"
+                    f"## Execution Plan to Review\n```json\n{plan_text}\n```\n\n"
+                    "Review this plan against the criteria and submit your verdict."
+                ),
+            ),
+        ]
+
+        try:
+            response = await provider.send_message(
+                messages, temperature=0.1, max_tokens=2048,
+                tools=[review_submit_tool],
+                tool_choice={"name": "submit_result"},
+            )
+            await self._track_tokens(response)
+
+            result = extract_submit_result(response.tool_calls, response.content)
+            if result and isinstance(result.get("approved"), bool):
+                logger.info(
+                    "[%s] Plan review verdict: approved=%s feedback=%s",
+                    self.todo_id, result["approved"], result.get("feedback", "")[:200],
+                )
+                return result
+        except Exception:
+            logger.warning("[%s] Plan review call failed, auto-approving", self.todo_id, exc_info=True)
+
+        # Default to approved on failure
+        return {"approved": True, "feedback": "Review skipped (error)"}
+
+    async def _re_plan_with_feedback(
+        self,
+        previous_plan: dict,
+        feedback: str,
+        provider: AIProvider,
+        todo: dict,
+        context: dict,
+        *,
+        workspace_path: str | None = None,
+        planner_tools: list | None = None,
+    ) -> dict:
+        """Re-run the planner with review feedback injected. Returns updated plan."""
+        from agents.orchestrator.structured_output import build_submit_tool, extract_submit_result
+
+        plan_schema = {
+            "type": "object",
+            "properties": {
+                "summary": {"type": "string", "description": "Brief plan summary"},
+                "sub_tasks": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "title": {"type": "string"},
+                            "description": {"type": "string"},
+                            "agent_role": {"type": "string"},
+                            "execution_order": {"type": "integer"},
+                            "depends_on": {"type": "array", "items": {"type": "integer"}},
+                            "review_loop": {"type": "boolean"},
+                            "target_repo": {},
+                        },
+                        "required": ["title", "description", "agent_role"],
+                    },
+                },
+                "estimated_tokens": {"type": "integer"},
+            },
+            "required": ["summary", "sub_tasks"],
+        }
+        plan_submit_tool = build_submit_tool(plan_schema, "plan",
+            "Submit your revised execution plan.")
+
+        prev_plan_text = json.dumps(previous_plan, indent=2, default=str)
+        if len(prev_plan_text) > 6000:
+            prev_plan_text = prev_plan_text[:6000] + "\n...(truncated)"
+
+        messages = [
+            LLMMessage(role="system", content=PLANNER_SYSTEM_PROMPT),
+            LLMMessage(
+                role="user",
+                content=(
+                    f"Task: {todo['title']}\n"
+                    f"Description: {todo['description'] or 'N/A'}\n"
+                    f"Type: {todo['task_type']}\n\n"
+                    f"## Previous Plan\n```json\n{prev_plan_text}\n```\n\n"
+                    f"## Review Feedback\n{feedback}\n\n"
+                    "Revise the plan to address the review feedback. "
+                    "You already explored the codebase — focus on fixing the identified issues. "
+                    "Submit the complete revised plan via submit_result."
+                ),
+            ),
+        ]
+
+        tools_for_replan = [plan_submit_tool]
+        if planner_tools:
+            tools_for_replan = list(planner_tools) + [plan_submit_tool]
+
+        try:
+            if planner_tools:
+                from agents.providers.base import run_tool_loop
+
+                async def _replan_tool_exec(name: str, args: dict) -> str:
+                    if name == "submit_result":
+                        return json.dumps({"status": "received"})
+                    return await self.mcp_executor.execute_tool(
+                        name, args, planner_tools,
+                    )
+
+                _replan_token_cb = self._build_token_streamer()
+                content, response = await run_tool_loop(
+                    provider, messages,
+                    tools=tools_for_replan,
+                    tool_executor=_replan_tool_exec,
+                    max_rounds=30,
+                    on_activity=lambda msg: self._report_planning_activity(msg),
+                    on_cancel_check=self._is_cancelled,
+                    on_token=_replan_token_cb,
+                    temperature=0.1,
+                    max_tokens=16384,
+                )
+                if hasattr(_replan_token_cb, "flush"):
+                    await _replan_token_cb.flush()
+            else:
+                response = await provider.send_message(
+                    messages, temperature=0.1, max_tokens=16384,
+                    tools=[plan_submit_tool],
+                    tool_choice={"name": "submit_result"},
+                )
+                content = response.content
+
+            await self._track_tokens(response)
+
+            revised = extract_submit_result(response.tool_calls, content, messages=messages)
+            if revised is None:
+                revised = parse_llm_json(content)
+
+            if revised and revised.get("sub_tasks"):
+                logger.info(
+                    "[%s] Re-plan produced %d sub-tasks",
+                    self.todo_id, len(revised["sub_tasks"]),
+                )
+                return revised
+        except Exception:
+            logger.warning("[%s] Re-plan failed, keeping previous plan", self.todo_id, exc_info=True)
+
+        # Fallback: return previous plan if re-planning fails
+        return previous_plan
 
     async def _auto_approve_plan(self, todo: dict, plan: dict) -> None:
         """Create sub-tasks from plan and transition directly to execution."""
+        from agents.utils.repo_utils import resolve_target_repo
+
         logger.info("[%s] _auto_approve_plan: plan keys=%s, sub_tasks=%d",
                     self.todo_id, list(plan.keys()), len(plan.get("sub_tasks", [])))
         if not plan.get("sub_tasks"):
             logger.error("[%s] _auto_approve_plan: NO sub_tasks in plan! Plan: %.1000s",
                          self.todo_id, json.dumps(plan, default=str))
+
+        # Load context_docs for deterministic target_repo resolution
+        project = await self.db.fetchrow(
+            "SELECT context_docs FROM projects WHERE id = $1", todo["project_id"],
+        )
+        context_docs = []
+        if project and project.get("context_docs"):
+            context_docs = project["context_docs"]
+            if isinstance(context_docs, str):
+                context_docs = json.loads(context_docs)
+
         sub_task_ids = []
         plan_index_to_id: dict[int, str] = {}  # plan index → DB id for dependency resolution
         first_chain_id = None  # track chain for review_loop sub-tasks
         for i, st in enumerate(plan.get("sub_tasks", [])):
-            target_repo = st.get("target_repo")
+            # Resolve target_repo: "main" → None (default workspace), dep name → full metadata
+            raw_target = st.get("target_repo")
+            target_repo = resolve_target_repo(raw_target, context_docs)
+            if target_repo:
+                logger.info("[%s] Resolved target_repo '%s' → %s", self.todo_id, raw_target, target_repo.get("name"))
+            elif raw_target and str(raw_target).strip().lower() != "main":
+                logger.warning("[%s] Could not resolve target_repo '%s', falling back to main repo", self.todo_id, raw_target)
             logger.info("[%s] Inserting sub_task[%d]: role=%s title=%s order=%s deps=%s review_loop=%s",
                         self.todo_id, i, st.get("agent_role"), st.get("title"),
                         st.get("execution_order", 0), st.get("depends_on", []),
@@ -892,9 +1294,11 @@ class AgentCoordinator:
         )
         logger.info("[%s] Found %d sub-tasks in DB", self.todo_id, len(sub_tasks))
         for st in sub_tasks:
-            logger.info("[%s]   sub_task id=%s status=%s role=%s title=%s deps=%s",
+            tr = st.get("target_repo")
+            tr_label = (tr.get("name") if isinstance(tr, dict) else tr) if tr else "main"
+            logger.info("[%s]   sub_task id=%s status=%s role=%s title=%s deps=%s target_repo=%s",
                         self.todo_id, st["id"], st["status"], st["agent_role"],
-                        st["title"], st["depends_on"])
+                        st["title"], st["depends_on"], tr_label)
         if not sub_tasks:
             # No sub-tasks — skip to review
             logger.warning("[%s] No sub-tasks found in DB! Transitioning to review", self.todo_id)
@@ -1025,14 +1429,29 @@ class AgentCoordinator:
         for st in runnable:
             # Resolve per-subtask workspace (dep repos get their own)
             st_workspace = workspace_path
-            if st.get("target_repo"):
+            target_repo = st.get("target_repo")
+            if target_repo:
+                dep_label = target_repo.get("name") if isinstance(target_repo, dict) else target_repo
+                logger.info("[%s] Sub-task %s targets dep repo '%s'", self.todo_id, st["id"], dep_label)
                 try:
                     st_workspace = await self._setup_dependency_workspace(st)
                     logger.info("[%s] Dep workspace for %s: %s", self.todo_id, st["id"], st_workspace)
-                except Exception:
-                    logger.warning(
-                        "Failed to set up dep workspace for %s", st["id"], exc_info=True,
+                except Exception as e:
+                    logger.error(
+                        "[%s] Failed to set up dep workspace for %s (repo=%s): %s",
+                        self.todo_id, st["id"], dep_label, e, exc_info=True,
                     )
+                    # Fail the subtask instead of silently running against the wrong repo
+                    await self.db.execute(
+                        "UPDATE sub_tasks SET status = 'failed', error_message = $2 WHERE id = $1",
+                        st["id"],
+                        f"Could not set up dependency workspace for '{dep_label}': {e}",
+                    )
+                    await self._post_system_message(
+                        f"**Sub-task failed:** Could not clone dependency repo '{dep_label}'. "
+                        f"Check git credentials and repo URL. Error: {e}"
+                    )
+                    continue
             workspace_map[str(st["id"])] = st_workspace
 
             if st["agent_role"] == "merge_agent":
@@ -1041,6 +1460,12 @@ class AgentCoordinator:
             elif st["agent_role"] == "pr_creator":
                 logger.info("[%s] Sub-task %s: pr_creator path", self.todo_id, st["id"])
                 tasks.append(self._execute_pr_creator_subtask(st, provider, st_workspace))
+            elif st["agent_role"] == "release_build_watcher":
+                logger.info("[%s] Sub-task %s: release_build_watcher path", self.todo_id, st["id"])
+                tasks.append(self._execute_build_watcher_subtask(st, provider, st_workspace))
+            elif st["agent_role"] == "release_deployer":
+                logger.info("[%s] Sub-task %s: release_deployer path", self.todo_id, st["id"])
+                tasks.append(self._execute_release_deployer_subtask(st, provider, st_workspace))
             elif has_quality_rules:
                 logger.info("[%s] Sub-task %s: iteration path (role=%s)", self.todo_id, st["id"], st["agent_role"])
                 tasks.append(self._execute_subtask_with_iterations(
@@ -1133,6 +1558,10 @@ class AgentCoordinator:
                     next_tasks.append(self._execute_merge_subtask(st2, provider, st2_ws))
                 elif st2["agent_role"] == "pr_creator":
                     next_tasks.append(self._execute_pr_creator_subtask(st2, provider, st2_ws))
+                elif st2["agent_role"] == "release_build_watcher":
+                    next_tasks.append(self._execute_build_watcher_subtask(st2, provider, st2_ws))
+                elif st2["agent_role"] == "release_deployer":
+                    next_tasks.append(self._execute_release_deployer_subtask(st2, provider, st2_ws))
                 elif has_quality_rules:
                     next_tasks.append(self._execute_subtask_with_iterations(
                         st2, provider, workspace_path=st2_ws,
@@ -1172,11 +1601,22 @@ class AgentCoordinator:
                         if any(d["status"] != "completed" for d in dep_sts):
                             continue
                     gst_ws = workspace_path
-                    if gst.get("target_repo"):
+                    gst_target = gst.get("target_repo")
+                    if gst_target:
+                        gst_dep_label = gst_target.get("name") if isinstance(gst_target, dict) else gst_target
                         try:
                             gst_ws = await self._setup_dependency_workspace(gst)
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            logger.error(
+                                "[%s] Failed to set up dep workspace for guardrail %s: %s",
+                                self.todo_id, gst["id"], e, exc_info=True,
+                            )
+                            await self.db.execute(
+                                "UPDATE sub_tasks SET status = 'failed', error_message = $2 WHERE id = $1",
+                                gst["id"],
+                                f"Could not set up dependency workspace for '{gst_dep_label}': {e}",
+                            )
+                            continue
                     if has_quality_rules:
                         await self._execute_subtask_with_iterations(
                             dict(gst), provider,
@@ -1487,6 +1927,33 @@ class AgentCoordinator:
                 todo = await self._load_todo()
                 await self._phase_review(todo, provider)
 
+    async def _run_command_phase(
+        self,
+        repo_dir: str,
+        commands: list[str],
+        phase: str,
+        timeout: int,
+        steps: list[dict],
+    ) -> bool:
+        """Run a list of commands for a single testing phase.
+
+        Appends results to `steps` and returns False if any command failed.
+        """
+        all_passed = True
+        for cmd in commands:
+            try:
+                exit_code, output = await self.workspace_mgr.run_command(cmd, repo_dir, timeout=timeout)
+                passed = exit_code == 0
+                steps.append({"command": cmd, "passed": passed, "output": output[:2000], "phase": phase})
+                if not passed:
+                    all_passed = False
+                await self._publish_testing_progress(cmd, passed)
+            except Exception as e:
+                steps.append({"command": cmd, "passed": False, "output": str(e)[:500], "phase": phase})
+                all_passed = False
+                await self._publish_testing_progress(cmd, False)
+        return all_passed
+
     async def _run_testing_commands(
         self,
         repo_dir: str,
@@ -1501,62 +1968,16 @@ class AgentCoordinator:
         steps: list[dict] = []
         all_passed = True
 
-        # Phase 1: Install dependencies (auto-detect)
         dep_install_cmds = self._detect_dependency_install_commands(repo_dir)
-        for cmd in dep_install_cmds:
-            try:
-                exit_code, output = await self.workspace_mgr.run_command(cmd, repo_dir, timeout=180)
-                passed = exit_code == 0
-                steps.append({"command": cmd, "passed": passed, "output": output[:2000], "phase": "install"})
-                if not passed:
-                    all_passed = False
-                await self._publish_testing_progress(cmd, passed)
-            except Exception as e:
-                steps.append({"command": cmd, "passed": False, "output": str(e)[:500], "phase": "install"})
-                all_passed = False
-                await self._publish_testing_progress(cmd, False)
 
-        # Phase 2: Build commands (from project settings)
-        for cmd in build_commands:
-            try:
-                exit_code, output = await self.workspace_mgr.run_command(cmd, repo_dir, timeout=120)
-                passed = exit_code == 0
-                steps.append({"command": cmd, "passed": passed, "output": output[:2000], "phase": "build"})
-                if not passed:
-                    all_passed = False
-                await self._publish_testing_progress(cmd, passed)
-            except Exception as e:
-                steps.append({"command": cmd, "passed": False, "output": str(e)[:500], "phase": "build"})
+        for commands, phase, timeout in [
+            (dep_install_cmds, "install", 180),
+            (build_commands, "build", 120),
+            (quality_commands, "quality", 120),
+            (testing_rules, "test", 180),
+        ]:
+            if not await self._run_command_phase(repo_dir, commands, phase, timeout, steps):
                 all_passed = False
-                await self._publish_testing_progress(cmd, False)
-
-        # Phase 3: Quality checks (from work_rules.quality)
-        for cmd in quality_commands:
-            try:
-                exit_code, output = await self.workspace_mgr.run_command(cmd, repo_dir, timeout=120)
-                passed = exit_code == 0
-                steps.append({"command": cmd, "passed": passed, "output": output[:2000], "phase": "quality"})
-                if not passed:
-                    all_passed = False
-                await self._publish_testing_progress(cmd, passed)
-            except Exception as e:
-                steps.append({"command": cmd, "passed": False, "output": str(e)[:500], "phase": "quality"})
-                all_passed = False
-                await self._publish_testing_progress(cmd, False)
-
-        # Phase 4: Testing rules (from work_rules.testing)
-        for cmd in testing_rules:
-            try:
-                exit_code, output = await self.workspace_mgr.run_command(cmd, repo_dir, timeout=180)
-                passed = exit_code == 0
-                steps.append({"command": cmd, "passed": passed, "output": output[:2000], "phase": "test"})
-                if not passed:
-                    all_passed = False
-                await self._publish_testing_progress(cmd, passed)
-            except Exception as e:
-                steps.append({"command": cmd, "passed": False, "output": str(e)[:500], "phase": "test"})
-                all_passed = False
-                await self._publish_testing_progress(cmd, False)
 
         failed_steps = [s for s in steps if not s["passed"]]
         error_output = "\n".join(
@@ -1681,13 +2102,18 @@ class AgentCoordinator:
         last_content = ""
         for parse_attempt in range(max_parse_retries):
             try:
+                _test_token_cb = self._build_token_streamer()
                 content, response = await run_tool_loop(
                     provider, messages,
                     tools=tools_with_submit,
                     tool_executor=_test_tool_exec,
-                    max_rounds=10,
+                    max_rounds=70,
+                    on_cancel_check=self._is_cancelled,
+                    on_token=_test_token_cb,
                     temperature=0.1,
                 )
+                if hasattr(_test_token_cb, "flush"):
+                    await _test_token_cb.flush()
                 await self._track_tokens(response)
                 last_content = content
 
@@ -1991,7 +2417,6 @@ class AgentCoordinator:
 
         iteration_log: list[dict] = []
         _accumulated_events: list[dict] = []  # Collect tool events for persistence
-        unstuck_advice: str | None = None
         agent_signaled_done = False
         agent_done_summary: str | None = None
         qc_retries_after_done = 0
@@ -2039,9 +2464,12 @@ class AgentCoordinator:
         if workspace_path:
             builtin_tools = self._get_builtin_tools(workspace_path, role)
             _task_idx = os.path.join(workspace_path, ".agent_index")
+            _task_dep_dirs = self._get_dep_index_dirs(workspace_path)
             for bt in builtin_tools:
                 if bt["name"] == "semantic_search":
                     bt["_index_dir"] = _task_idx
+                    if _task_dep_dirs:
+                        bt["_dep_index_dirs"] = _task_dep_dirs
             if _cached_mcp_tools:
                 existing_names = {t["name"] for t in _cached_mcp_tools}
                 _cached_all_tools = list(_cached_mcp_tools) + [
@@ -2111,7 +2539,6 @@ class AgentCoordinator:
                     iteration_log=iteration_log,
                     workspace_path=workspace_path,
                     work_rules=role_rules,
-                    unstuck_advice=unstuck_advice,
                     agent_config=agent_config,
                     cached_repo_map=_cached_repo_map,
                 )
@@ -2220,16 +2647,21 @@ class AgentCoordinator:
                     async def _architect_tool_exec(name: str, args: dict) -> str:
                         return await self.mcp_executor.execute_tool(name, args, mcp_tools)
 
+                    _arch_token_cb = self._build_token_streamer(st_id)
                     architect_content, architect_response = await run_tool_loop(
                         provider, list(messages),
                         tools=architect_tools or None,
                         tool_executor=_architect_tool_exec,
-                        max_rounds=10,
+                        max_rounds=70,
                         on_activity=lambda msg, _i=iteration: self._report_activity(st_id, f"[iter {_i}] [Architect] {msg}"),
                         on_tool_event=_on_tool_event,
                         on_inject_check=_check_inject_iter,
+                        on_cancel_check=self._is_cancelled,
+                        on_token=_arch_token_cb,
                         **architect_kwargs,
                     )
+                    if hasattr(_arch_token_cb, "flush"):
+                        await _arch_token_cb.flush()
 
                     # Phase B: Editor — fast model with write tools, guided by architect's output
                     editor_tools = [t for t in (tools_arg or []) if t["name"] in WRITE_TOOLS]
@@ -2248,16 +2680,21 @@ class AgentCoordinator:
                     ]
                     editor_kwargs = {**send_kwargs, "model": editor_model}
 
+                    _edit_token_cb = self._build_token_streamer(st_id)
                     iter_content, response = await run_tool_loop(
                         provider, editor_messages,
                         tools=editor_tools or None,
                         tool_executor=_iter_tool_exec,
-                        max_rounds=10,
+                        max_rounds=70,
                         on_activity=lambda msg, _i=iteration: self._report_activity(st_id, f"[iter {_i}] [Editor] {msg}"),
                         on_tool_event=_on_tool_event,
                         on_inject_check=_check_inject_iter,
+                        on_cancel_check=self._is_cancelled,
+                        on_token=_edit_token_cb,
                         **editor_kwargs,
                     )
+                    if hasattr(_edit_token_cb, "flush"):
+                        await _edit_token_cb.flush()
 
                     # Combine token usage from both phases
                     response.tokens_input += architect_response.tokens_input
@@ -2266,16 +2703,21 @@ class AgentCoordinator:
                         response.cost_usd += architect_response.cost_usd
                 else:
                     # Standard single-model execution
+                    _std_token_cb = self._build_token_streamer(st_id)
                     iter_content, response = await run_tool_loop(
                         provider, messages,
                         tools=tools_arg,
                         tool_executor=_iter_tool_exec,
-                        max_rounds=10,
+                        max_rounds=70,
                         on_activity=lambda msg, _i=iteration: self._report_activity(st_id, f"[iter {_i}] {msg}"),
                         on_tool_event=_on_tool_event,
                         on_inject_check=_check_inject_iter,
+                        on_cancel_check=self._is_cancelled,
+                        on_token=_std_token_cb,
                         **send_kwargs,
                     )
+                    if hasattr(_std_token_cb, "flush"):
+                        await _std_token_cb.flush()
 
                 # Detect tool loop truncation — LLM wanted more tool calls but max_rounds hit
                 tool_loop_truncated = response.stop_reason == "max_tool_rounds"
@@ -2329,7 +2771,10 @@ class AgentCoordinator:
                 if has_quality_rules and workspace_path:
                     qc_result = await self._run_quality_checks(
                         workspace_path, role_rules, role,
+                        submit_data=_submit_result_data,
                     )
+                elif role == "debugger" and agent_signaled_done and _submit_result_data:
+                    qc_result = self._validate_debugger_output(_submit_result_data)
                 else:
                     qc_result = {"passed": True, "reason": "no quality rules", "learnings": []}
 
@@ -2342,11 +2787,11 @@ class AgentCoordinator:
                         await self._report_activity(st_id, f"[iter {iteration}] Quality check failed: {reason}")
 
                 # 4. Record iteration
-                action = "implement" if iteration == 1 else ("fix_with_advice" if unstuck_advice else "fix")
+                action = "implement" if iteration == 1 else "fix"
                 learnings = qc_result.get("learnings", [])
                 if tool_loop_truncated:
                     learnings.append(
-                        "Tool loop was truncated (hit max_rounds=10). "
+                        "Tool loop was truncated (hit max_rounds=70). "
                         "Agent may not have finished all intended tool calls."
                     )
                 entry = {
@@ -2510,31 +2955,6 @@ class AgentCoordinator:
                     await self._report_progress(st_id, 100, f"Completed: {sub_task['title']}")
                     return
 
-                # Clear advice after use
-                unstuck_advice = None
-
-                # 6. Stuck detection every 15 iterations
-                if iteration % 15 == 0 and iteration < max_iterations:
-                    stuck_result = await self._check_if_stuck(iteration_log, provider)
-                    entry["stuck_check"] = stuck_result
-                    # Update the entry in log
-                    iteration_log[-1] = entry
-                    await self.db.execute(
-                        "UPDATE sub_tasks SET iteration_log = $2 WHERE id = $1",
-                        sub_task["id"],
-                        iteration_log,
-                    )
-
-                    if stuck_result.get("stuck"):
-                        unstuck_advice = stuck_result.get("advice")
-                        await self._report_activity(
-                            st_id,
-                            f"[iter {iteration}] Stuck detected: {stuck_result.get('pattern', 'loop')} — injecting advice",
-                        )
-                        await self._post_system_message(
-                            f"**Stuck detection (iteration {iteration}):** {stuck_result.get('pattern', 'Loop detected')}\n\n"
-                            f"Injecting supervisor advice for next iteration."
-                        )
 
             except Exception as e:
                 import traceback as _tb
@@ -2602,7 +3022,6 @@ class AgentCoordinator:
         iteration_log: list[dict],
         workspace_path: str | None,
         work_rules: dict,
-        unstuck_advice: str | None = None,
         agent_config: dict | None = None,
         cached_repo_map: str | None = None,
     ) -> tuple[dict, str | None]:
@@ -2809,12 +3228,6 @@ class AgentCoordinator:
                         learnings_block += f"  Error: {err}\n"
                 system += learnings_block
 
-        # Unstuck advice injection
-        if unstuck_advice:
-            system += (
-                f"\n\n## STUCK DETECTED\n{unstuck_advice}\n"
-                "Try a fundamentally different approach.\n"
-            )
 
         # Previous results context (truncate to save tokens)
         prev_context = ""
@@ -2828,24 +3241,136 @@ class AgentCoordinator:
                 )
             prev_context = "\n\nCompleted sub-tasks:\n" + "\n".join(prev_items)
 
-        user_content = (
-            f"Task: {todo['title']}\n"
-            f"Sub-task: {sub_task['title']}\n"
-            f"Description: {sub_task['description'] or 'N/A'}\n"
-            f"Requirements: {json.dumps(intake, default=str)}\n"
-            f"Iteration: {iteration}\n"
-            f"{prev_context}"
-        )
+        # For debugger: extract structured error details from previous subtasks
+        debugger_error_context = ""
+        if role == "debugger" and previous_results:
+            error_details = []
+            for r in previous_results:
+                out = r.get("output_result", {})
+                if not isinstance(out, dict):
+                    continue
+                for f in (out.get("failures") or [])[:10]:
+                    error_details.append(
+                        f"- [{f.get('type','test')}] {f.get('file','?')}: {f.get('error','')}\n"
+                        f"  {f.get('details','')[:300]}"
+                    )
+                for iss in out.get("issues") or []:
+                    if iss.get("severity") in ("critical", "major"):
+                        error_details.append(
+                            f"- [review:{iss['severity']}] {iss.get('file','')}:{iss.get('line','')}: "
+                            f"{iss.get('description','')}"
+                        )
+            if error_details:
+                debugger_error_context = (
+                    "\n## Errors to Investigate\n"
+                    "These failures were found by previous agents. Start your investigation here:\n"
+                    + "\n".join(error_details)
+                )
+
+        # For debugger: inject recent git log
+        debugger_git_context = ""
+        if role == "debugger" and workspace_path:
+            repo_dir = os.path.join(workspace_path, "repo")
+            if os.path.isdir(repo_dir):
+                try:
+                    proc = await asyncio.create_subprocess_exec(
+                        "git", "log", "--oneline", "--no-decorate", "-20",
+                        cwd=repo_dir,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                    )
+                    stdout, _ = await proc.communicate()
+                    git_log = stdout.decode(errors="replace").strip()
+                    if git_log:
+                        debugger_git_context = (
+                            "\n## Recent Commits\n"
+                            "Scan for commits related to the bug area. Use "
+                            "`run_command` with `git diff <hash>~1..<hash>` to inspect suspicious ones.\n"
+                            f"```\n{git_log}\n```"
+                        )
+                except Exception:
+                    pass
+
+        # Build structured user prompt with exploration context
+        user_parts = [
+            f"# Task: {todo['title']}",
+        ]
+        if todo.get("description"):
+            user_parts.append(f"**Task description:** {todo['description']}")
+
+        user_parts.append(f"\n## Your Sub-task: {sub_task['title']}")
+        user_parts.append(f"**Instructions:** {sub_task['description'] or 'N/A'}")
+        user_parts.append(f"**Iteration:** {iteration}")
+
+        # Inject planner's exploration context (input_context from DB)
+        input_ctx = sub_task.get("input_context")
+        if isinstance(input_ctx, str):
+            try:
+                input_ctx = json.loads(input_ctx)
+            except (json.JSONDecodeError, TypeError):
+                input_ctx = None
+        if input_ctx and isinstance(input_ctx, dict):
+            ctx_parts = []
+            if input_ctx.get("relevant_files"):
+                files = input_ctx["relevant_files"]
+                if isinstance(files, list):
+                    ctx_parts.append("**Relevant files:** " + ", ".join(f"`{f}`" for f in files))
+            if input_ctx.get("current_state"):
+                ctx_parts.append(f"**Current state:** {input_ctx['current_state']}")
+            if input_ctx.get("what_to_change"):
+                ctx_parts.append(f"**What to change:** {input_ctx['what_to_change']}")
+            if input_ctx.get("patterns_to_follow"):
+                ctx_parts.append(f"**Patterns to follow:** {input_ctx['patterns_to_follow']}")
+            if input_ctx.get("related_code"):
+                ctx_parts.append(f"**Related code:**\n{input_ctx['related_code']}")
+            if input_ctx.get("integration_points"):
+                ctx_parts.append(f"**Integration points:** {input_ctx['integration_points']}")
+            if ctx_parts:
+                user_parts.append("\n## Exploration Context (from planning)")
+                user_parts.extend(ctx_parts)
+
+        # Explicit workspace info
+        target_repo = sub_task.get("target_repo")
+        if isinstance(target_repo, str):
+            try:
+                target_repo = json.loads(target_repo)
+            except (json.JSONDecodeError, TypeError):
+                target_repo = None
+        if target_repo and target_repo.get("repo_url"):
+            dep_name = target_repo.get("name", "dependency")
+            user_parts.append(
+                f"\n## Workspace: dependency repo `{dep_name}`"
+                f"\nYou are editing the `{dep_name}` dependency repo."
+            )
+        elif workspace_path:
+            user_parts.append("\n## Workspace: main project repo")
+
+        if intake and not isinstance(intake, str):
+            clean_intake = {k: v for k, v in intake.items() if k != "previous_run" and v}
+            if clean_intake:
+                user_parts.append(f"\n**Requirements:** {json.dumps(clean_intake, default=str)}")
+
+        if prev_context:
+            user_parts.append(prev_context)
+        if debugger_error_context:
+            user_parts.append(debugger_error_context)
+        if debugger_git_context:
+            user_parts.append(debugger_git_context)
+
+        user_content = "\n".join(user_parts)
 
         return {"system": system, "user": user_content}, repo_map_text
 
     async def _run_quality_checks(
         self, workspace_path: str, work_rules: dict, agent_role: str,
+        *, submit_data: dict | None = None,
     ) -> dict:
         """Run quality check commands in the workspace.
 
         Returns {"passed": bool, "reason": str, "error_output": str | None, "learnings": list}.
         """
+        if agent_role == "debugger":
+            return self._validate_debugger_output(submit_data)
         if agent_role not in ("coder", "tester"):
             return {"passed": True, "reason": "not applicable", "learnings": []}
 
@@ -2884,39 +3409,32 @@ class AgentCoordinator:
             "learnings": learnings,
         }
 
-    async def _check_if_stuck(
-        self, iteration_log: list[dict], provider: AIProvider,
-    ) -> dict:
-        """Use an isolated LLM call to analyze if the agent is stuck."""
-        last_5 = iteration_log[-5:]
-        condensed = [
-            {
-                "iteration": e["iteration"],
-                "outcome": e["outcome"],
-                "learnings": e.get("learnings", []),
-                "error_output": (e.get("error_output") or "")[:300],
-            }
-            for e in last_5
-        ]
+    @staticmethod
+    def _validate_debugger_output(submit_data: dict | None) -> dict:
+        """Validate that a debugger produced substantive findings."""
+        if not submit_data:
+            return {"passed": True, "reason": "no structured output", "learnings": []}
 
-        messages = [
-            LLMMessage(role="system", content=STUCK_DETECTOR_PROMPT),
-            LLMMessage(role="user", content=json.dumps(condensed, indent=2)),
-        ]
+        root_cause = (submit_data.get("root_cause") or "").strip()
+        evidence = submit_data.get("evidence") or []
 
-        try:
-            response = await provider.send_message(messages, temperature=0.0)
-            result = parse_llm_json(response.content)
-            if result is None:
-                return {"stuck": False, "advice": None, "pattern": None}
+        if len(root_cause) < 20:
             return {
-                "stuck": result.get("stuck", False),
-                "advice": result.get("advice"),
-                "pattern": result.get("pattern"),
+                "passed": False,
+                "reason": "Root cause too vague — investigate further with specific file paths and evidence.",
+                "error_output": "Root cause must describe the specific code/config issue.",
+                "learnings": ["Provide a detailed root cause referencing file paths and line numbers"],
             }
-        except Exception:
-            logger.warning("Stuck detection LLM call failed", exc_info=True)
-            return {"stuck": False, "advice": None, "pattern": None}
+
+        if not evidence:
+            return {
+                "passed": False,
+                "reason": "No evidence collected. Use tools to gather log lines, code paths, or query results.",
+                "error_output": "Evidence list is empty.",
+                "learnings": ["Collect at least one piece of evidence before concluding"],
+            }
+
+        return {"passed": True, "reason": "debugger output valid", "learnings": []}
 
     async def _append_progress_log(
         self,
@@ -3424,6 +3942,112 @@ class AgentCoordinator:
             "**Review loop:** Reviewer approved. Created merge sub-task."
         )
 
+    def _interpolate_template(self, template: str, variables: dict[str, str]) -> str:
+        """Replace {{key}} placeholders in template strings with variable values."""
+        import re
+
+        def replacer(match):
+            key = match.group(1).strip()
+            return variables.get(key, match.group(0))
+
+        return re.sub(r'\{\{(\w+)\}\}', replacer, template)
+
+    async def _create_release_subtasks(self, merge_subtask: dict, project_settings: dict) -> None:
+        """Create chained release pipeline subtasks after a successful merge.
+
+        Creates build_watcher → test deployer → prod deployer chain
+        based on the release pipeline configuration.
+        """
+        release_config = project_settings.get("release_config", {})
+        if not release_config:
+            logger.info("[%s] No release_config found, skipping release subtasks", self.todo_id)
+            return
+
+        merge_st_id = str(merge_subtask["id"])
+        target_repo_json = merge_subtask.get("target_repo")
+        if isinstance(target_repo_json, str):
+            target_repo_json = json.loads(target_repo_json)
+
+        max_order = await self.db.fetchval(
+            "SELECT COALESCE(MAX(execution_order), 0) FROM sub_tasks WHERE todo_id = $1",
+            self.todo_id,
+        )
+
+        # 1. Build watcher subtask (depends on merge)
+        build_row = await self.db.fetchrow(
+            """
+            INSERT INTO sub_tasks (
+                todo_id, title, description, agent_role,
+                execution_order, depends_on, target_repo
+            )
+            VALUES ($1, $2, $3, 'release_build_watcher', $4, $5, $6)
+            RETURNING id
+            """,
+            self.todo_id,
+            "Watch build pipeline",
+            "Monitor CI/CD build pipeline after merge and capture build artifact hash.",
+            max_order + 1,
+            [merge_st_id],
+            target_repo_json,
+        )
+        build_watcher_id = str(build_row["id"])
+        logger.info("[%s] Created release_build_watcher sub-task %s (depends on merge %s)",
+                     self.todo_id, build_watcher_id, merge_st_id)
+
+        last_dep_id = build_watcher_id
+        current_order = max_order + 2
+
+        # 2. Test/staging deployer (if enabled)
+        test_config = release_config.get("test_release", {})
+        if test_config.get("enabled"):
+            test_row = await self.db.fetchrow(
+                """
+                INSERT INTO sub_tasks (
+                    todo_id, title, description, agent_role,
+                    execution_order, depends_on, target_repo
+                )
+                VALUES ($1, $2, $3, 'release_deployer', $4, $5, $6)
+                RETURNING id
+                """,
+                self.todo_id,
+                "Deploy to test/staging",
+                "Deploy build artifact to test/staging environment. Environment: test",
+                current_order,
+                [last_dep_id],
+                target_repo_json,
+            )
+            last_dep_id = str(test_row["id"])
+            current_order += 1
+            logger.info("[%s] Created release_deployer (test) sub-task %s", self.todo_id, last_dep_id)
+
+        # 3. Prod deployer (if enabled)
+        prod_config = release_config.get("prod_release", {})
+        if prod_config.get("enabled"):
+            await self.db.fetchrow(
+                """
+                INSERT INTO sub_tasks (
+                    todo_id, title, description, agent_role,
+                    execution_order, depends_on, target_repo
+                )
+                VALUES ($1, $2, $3, 'release_deployer', $4, $5, $6)
+                RETURNING id
+                """,
+                self.todo_id,
+                "Deploy to production",
+                "Deploy build artifact to production environment. Environment: prod",
+                current_order,
+                [last_dep_id],
+                target_repo_json,
+            )
+            logger.info("[%s] Created release_deployer (prod) sub-task %s", self.todo_id, last_dep_id)
+
+        await self._post_system_message(
+            "**Release pipeline:** Created release sub-tasks (build watcher"
+            + (", test deploy" if test_config.get("enabled") else "")
+            + (", prod deploy" if prod_config.get("enabled") else "")
+            + ")."
+        )
+
     async def _create_pr_creator_subtask(self, approved_st: dict, chain_id=None) -> None:
         """Create a pr_creator sub-task after reviewer approval (review chain flow).
 
@@ -3763,15 +4387,19 @@ class AgentCoordinator:
                 )
 
             # Step 4: record deliverable
+            dep_repo_name = None
+            if target_repo and target_repo.get("name"):
+                dep_repo_name = target_repo["name"]
+
             if pr_info:
                 logger.info("[%s] PR created: %s", self.todo_id, pr_info.get("url"))
                 await self.db.execute(
                     """
                     INSERT INTO deliverables (
                         todo_id, sub_task_id, type, title,
-                        pr_url, pr_number, branch_name, status
+                        pr_url, pr_number, branch_name, status, target_repo_name
                     )
-                    VALUES ($1, $2, 'pull_request', $3, $4, $5, $6, 'pending')
+                    VALUES ($1, $2, 'pull_request', $3, $4, $5, $6, 'pending', $7)
                     """,
                     self.todo_id,
                     sub_task["id"],
@@ -3779,6 +4407,7 @@ class AgentCoordinator:
                     pr_info.get("url"),
                     pr_info.get("number"),
                     branch_name,
+                    dep_repo_name,
                 )
             else:
                 logger.warning("[%s] create_pr returned empty result", self.todo_id)
@@ -3855,6 +4484,27 @@ class AgentCoordinator:
                 f"**PR created:** {pr_url}. Creating merge sub-task."
             )
 
+            # Store head_sha for release pipeline
+            pr_number = pr_info.get("number")
+            if pr_number:
+                try:
+                    todo_pr = await self._load_todo()
+                    project_pr = await self.db.fetchrow(
+                        "SELECT * FROM projects WHERE id = $1", todo_pr["project_id"]
+                    )
+                    if project_pr and project_pr.get("repo_url"):
+                        pr_git, pr_owner, pr_repo = await self._resolve_git_provider(project_pr)
+                        pr_data = await pr_git.get_pull_request(pr_owner, pr_repo, pr_number)
+                        if pr_data and pr_data.get("head_sha"):
+                            await self.db.execute(
+                                "UPDATE deliverables SET head_sha = $2 "
+                                "WHERE todo_id = $1 AND type = 'pull_request' AND pr_number = $3",
+                                self.todo_id, pr_data["head_sha"], pr_number,
+                            )
+                            logger.info("[%s] Stored head_sha %s for PR #%s", self.todo_id, pr_data["head_sha"][:12], pr_number)
+                except Exception as e:
+                    logger.warning("[%s] Failed to store head_sha for PR: %s", self.todo_id, e)
+
             # Create a merge_agent subtask that depends on this pr_creator
             all_coder_ids = [str(sub_task["id"])]
             if coder_st:
@@ -3917,7 +4567,9 @@ class AgentCoordinator:
         await self._transition_subtask(st_id, "running")
 
         await self.db.execute(
-            "UPDATE todo_items SET sub_state = 'merging', updated_at = NOW() WHERE id = $1",
+            "UPDATE todo_items SET sub_state = CASE "
+            "WHEN sub_state = 'merge_approved' THEN 'merge_approved' "
+            "ELSE 'merging' END, updated_at = NOW() WHERE id = $1",
             self.todo_id,
         )
 
@@ -3944,35 +4596,7 @@ class AgentCoordinator:
                 return
 
             # Resolve git provider
-            from agents.orchestrator.git_providers.factory import (
-                create_git_provider,
-                parse_repo_url,
-            )
-            from agents.infra.crypto import decrypt
-
-            repo_url = project["repo_url"]
-            git_provider_id = str(project["git_provider_id"]) if project.get("git_provider_id") else None
-            token = None
-            provider_type = None
-            api_base_url = None
-            if git_provider_id:
-                gp_row = await self.db.fetchrow(
-                    "SELECT provider_type, api_base_url, token_enc "
-                    "FROM git_provider_configs WHERE id = $1",
-                    git_provider_id,
-                )
-                if gp_row:
-                    token = decrypt(gp_row["token_enc"]) if gp_row.get("token_enc") else None
-                    provider_type = gp_row["provider_type"]
-                    api_base_url = gp_row.get("api_base_url")
-
-            git = create_git_provider(
-                provider_type=provider_type,
-                api_base_url=api_base_url,
-                token=token,
-                repo_url=repo_url,
-            )
-            owner, repo = parse_repo_url(repo_url)
+            git, owner, repo = await self._resolve_git_provider(project)
             pr_number = pr_deliv["pr_number"]
 
             await self._report_progress(st_id, 20, "Checking PR status")
@@ -4048,6 +4672,12 @@ class AgentCoordinator:
             require_approval = project_settings.get("require_merge_approval", False)
             already_approved = todo.get("sub_state") == "merge_approved"
 
+            logger.info(
+                "Merge approval check: todo=%s pr=#%d require=%s approved=%s sub_state=%s",
+                self.todo_id[:8], pr_number, require_approval, already_approved,
+                todo.get("sub_state"),
+            )
+
             if require_approval and not already_approved:
                 await self.db.execute(
                     "UPDATE todo_items SET sub_state = 'awaiting_merge_approval', updated_at = NOW() WHERE id = $1",
@@ -4080,6 +4710,9 @@ class AgentCoordinator:
             # 5. Merge the PR
             await self._report_progress(st_id, 70, f"Merging PR #{pr_number}")
             merge_method = project_settings.get("merge_method", "squash")
+
+            # GUARD: deterministic re-check from DB before irreversible merge
+            await self._verify_merge_authorization(pr_number)
 
             merge_result = await git.merge_pull_request(
                 owner, repo, pr_number, method=merge_method,
@@ -4119,12 +4752,56 @@ class AgentCoordinator:
                 progress_pct=100, progress_message="Merged",
             )
 
+            # Trigger release pipeline if enabled
+            if project_settings.get("release_pipeline_enabled"):
+                try:
+                    await self._create_release_subtasks(sub_task, project_settings)
+                except Exception as e:
+                    logger.error("Failed to create release subtasks: %s", e, exc_info=True)
+                    await self._post_system_message(
+                        f"**Release pipeline:** Failed to create release sub-tasks: {str(e)[:300]}"
+                    )
+
         except Exception as e:
             logger.error("Merge agent failed: %s", e, exc_info=True)
             await self._transition_subtask(
                 st_id, "failed",
                 error_message=str(e)[:500],
             )
+
+    async def _verify_merge_authorization(self, pr_number: int) -> None:
+        """Final guard: re-verify approval from DB before irreversible merge.
+
+        Re-reads project settings and todo sub_state fresh from the database
+        so that even concurrent state changes are caught.  Raises RuntimeError
+        (handled by the caller's except block) if merge is not authorized.
+        """
+        row = await self.db.fetchrow(
+            "SELECT t.sub_state, p.settings_json "
+            "FROM todo_items t JOIN projects p ON t.project_id = p.id "
+            "WHERE t.id = $1",
+            self.todo_id,
+        )
+        settings = row["settings_json"] or {}
+        if isinstance(settings, str):
+            settings = json.loads(settings)
+
+        require = settings.get("require_merge_approval", False)
+        sub_state = row["sub_state"]
+
+        if require and sub_state not in ("merge_approved", "merging"):
+            logger.error(
+                "MERGE BLOCKED: todo=%s pr=#%d require_merge_approval=True sub_state=%s",
+                self.todo_id[:8], pr_number, sub_state,
+            )
+            raise RuntimeError(
+                f"Merge not authorized: approval required but sub_state is '{sub_state}'"
+            )
+
+        logger.info(
+            "Merge authorization passed: todo=%s pr=#%d require=%s sub_state=%s",
+            self.todo_id[:8], pr_number, require, sub_state,
+        )
 
     async def _run_post_merge_builds(
         self, todo: dict, build_commands: list[str], workspace_path: str,
@@ -4156,6 +4833,471 @@ class AgentCoordinator:
                 await self._post_system_message(
                     f"**Post-merge build error:** `{cmd}` — {str(e)[:200]}"
                 )
+
+    # ---- RELEASE PIPELINE: BUILD WATCHER ----
+
+    async def _execute_build_watcher_subtask(
+        self, sub_task: dict, provider: AIProvider, workspace_path: str | None,
+    ) -> None:
+        """Procedural build watcher: poll CI/CD for build completion and capture artifact hash.
+
+        No LLM needed — this is a polling/monitoring operation.
+        """
+        import httpx as _httpx
+
+        st_id = str(sub_task["id"])
+        await self._transition_subtask(st_id, "assigned")
+        await self._transition_subtask(st_id, "running")
+
+        await self.db.execute(
+            "UPDATE todo_items SET sub_state = 'build_watching', updated_at = NOW() WHERE id = $1",
+            self.todo_id,
+        )
+
+        try:
+            todo = await self._load_todo()
+            project = await self.db.fetchrow(
+                "SELECT * FROM projects WHERE id = $1", todo["project_id"]
+            )
+            if not project or not project.get("repo_url"):
+                raise ValueError("No repo configured for build watching")
+
+            project_settings = project.get("settings_json") or {}
+            if isinstance(project_settings, str):
+                project_settings = json.loads(project_settings)
+            release_config = project_settings.get("release_config", {})
+            build_config = release_config.get("build", {})
+
+            # Get the merged PR deliverable
+            pr_deliv = await self.db.fetchrow(
+                "SELECT * FROM deliverables WHERE todo_id = $1 AND type = 'pull_request' "
+                "AND pr_state = 'merged' ORDER BY created_at DESC LIMIT 1",
+                self.todo_id,
+            )
+            if not pr_deliv:
+                raise ValueError("No merged PR deliverable found for build watching")
+
+            # Send build_started notification
+            await self.notifier.notify(
+                str(todo["creator_id"]),
+                "build_started",
+                {
+                    "todo_id": self.todo_id,
+                    "title": todo["title"],
+                    "detail": "Build pipeline started after merge.",
+                },
+            )
+
+            await self._report_progress(st_id, 10, "Monitoring build pipeline")
+
+            # Resolve git provider
+            git, owner, repo = await self._resolve_git_provider(project)
+
+            build_provider = build_config.get("provider", "github_actions")
+            poll_interval = build_config.get("poll_interval_seconds", 30)
+            timeout_minutes = build_config.get("timeout_minutes", 30)
+            deadline = time.monotonic() + timeout_minutes * 60
+            image_hash = None
+
+            if build_provider == "github_actions":
+                workflow_name = build_config.get("workflow_name")
+                head_sha = pr_deliv.get("head_sha") or ""
+
+                while time.monotonic() < deadline:
+                    resp = await git.http.get(
+                        f"{git.api_base_url}/repos/{owner}/{repo}/actions/runs",
+                        params={"event": "push", "per_page": "5"},
+                    )
+                    resp.raise_for_status()
+                    runs = resp.json().get("workflow_runs", [])
+
+                    # Filter by workflow name if specified
+                    if workflow_name:
+                        runs = [r for r in runs if r.get("name") == workflow_name]
+
+                    # Find a run matching our merge
+                    target_run = None
+                    for run in runs:
+                        if head_sha and run.get("head_sha") == head_sha:
+                            target_run = run
+                            break
+                    if not target_run and runs:
+                        target_run = runs[0]
+
+                    if target_run:
+                        status = target_run.get("status")
+                        conclusion = target_run.get("conclusion")
+
+                        if status == "completed":
+                            if conclusion == "success":
+                                # Try to extract image hash from artifacts
+                                run_id = target_run["id"]
+                                try:
+                                    art_resp = await git.http.get(
+                                        f"{git.api_base_url}/repos/{owner}/{repo}/actions/runs/{run_id}/artifacts",
+                                    )
+                                    art_resp.raise_for_status()
+                                    artifacts = art_resp.json().get("artifacts", [])
+                                    for artifact in artifacts:
+                                        name = (artifact.get("name") or "").lower()
+                                        if "digest" in name or "hash" in name:
+                                            image_hash = artifact.get("name")
+                                            break
+                                except Exception:
+                                    logger.debug("Could not fetch artifacts for run %s", run_id)
+
+                                if not image_hash:
+                                    image_hash = target_run.get("head_sha", head_sha)
+
+                                logger.info("[%s] Build succeeded, image_hash=%s", self.todo_id, image_hash)
+                                break
+                            else:
+                                raise ValueError(
+                                    f"Build failed with conclusion '{conclusion}': {target_run.get('html_url', 'N/A')}"
+                                )
+
+                    await self._report_progress(
+                        st_id, 30, f"Build in progress... (polling every {poll_interval}s)"
+                    )
+                    await asyncio.sleep(poll_interval)
+                else:
+                    raise ValueError(f"Build timed out after {timeout_minutes} minutes")
+
+            elif build_provider == "jenkins":
+                job_url = build_config.get("job_url", "").rstrip("/")
+                jenkins_token = build_config.get("token")
+                if not job_url:
+                    raise ValueError("Jenkins job_url not configured in build config")
+
+                headers = {}
+                if jenkins_token:
+                    headers["Authorization"] = f"Bearer {jenkins_token}"
+
+                async with _httpx.AsyncClient(timeout=30, headers=headers) as client:
+                    # Get current last build number
+                    resp = await client.get(f"{job_url}/api/json")
+                    resp.raise_for_status()
+                    initial_last = resp.json().get("lastCompletedBuild", {}).get("number", 0)
+
+                    while time.monotonic() < deadline:
+                        resp = await client.get(f"{job_url}/api/json")
+                        resp.raise_for_status()
+                        data = resp.json()
+                        last_completed = data.get("lastCompletedBuild", {}).get("number", 0)
+
+                        if last_completed > initial_last:
+                            # New build completed — check result
+                            build_resp = await client.get(
+                                f"{job_url}/{last_completed}/api/json"
+                            )
+                            build_resp.raise_for_status()
+                            build_data = build_resp.json()
+                            result = build_data.get("result", "")
+
+                            if result == "SUCCESS":
+                                # Try to extract image hash from description
+                                desc = build_data.get("description") or ""
+                                if "sha256:" in desc:
+                                    image_hash = desc[desc.index("sha256:"):].split()[0]
+                                else:
+                                    image_hash = str(last_completed)
+                                logger.info("[%s] Jenkins build %d succeeded, hash=%s",
+                                            self.todo_id, last_completed, image_hash)
+                                break
+                            else:
+                                raise ValueError(
+                                    f"Jenkins build #{last_completed} failed with result: {result}"
+                                )
+
+                        await self._report_progress(
+                            st_id, 30, f"Waiting for Jenkins build... (polling every {poll_interval}s)"
+                        )
+                        await asyncio.sleep(poll_interval)
+                    else:
+                        raise ValueError(f"Jenkins build timed out after {timeout_minutes} minutes")
+
+            else:
+                raise ValueError(f"Unsupported build provider: {build_provider}")
+
+            # Store artifact in deliverables
+            artifact_json = json.dumps({"image_hash": image_hash, "build_provider": build_provider})
+            await self.db.execute(
+                "UPDATE deliverables SET release_artifact_json = $2::jsonb, head_sha = COALESCE(head_sha, $3) "
+                "WHERE id = $1",
+                pr_deliv["id"],
+                artifact_json,
+                image_hash,
+            )
+
+            # Send build_completed notification
+            await self.notifier.notify(
+                str(todo["creator_id"]),
+                "build_completed",
+                {
+                    "todo_id": self.todo_id,
+                    "title": todo["title"],
+                    "detail": f"Build completed successfully. Artifact: {image_hash}",
+                },
+            )
+
+            await self._report_progress(st_id, 100, "Build completed")
+            await self._transition_subtask(
+                st_id, "completed",
+                progress_pct=100, progress_message=f"Build complete: {image_hash}",
+                output_result={"image_hash": image_hash},
+            )
+
+        except Exception as e:
+            logger.error("[%s] Build watcher failed: %s", self.todo_id, e, exc_info=True)
+            try:
+                todo = await self._load_todo()
+                await self.notifier.notify(
+                    str(todo["creator_id"]),
+                    "build_failed",
+                    {
+                        "todo_id": self.todo_id,
+                        "title": todo["title"],
+                        "detail": f"Build failed: {str(e)[:300]}",
+                    },
+                )
+            except Exception:
+                pass
+            await self._post_system_message(
+                f"**Release pipeline:** Build failed: {str(e)[:500]}"
+            )
+            await self._transition_subtask(
+                st_id, "failed",
+                error_message=str(e)[:500],
+            )
+
+    # ---- RELEASE PIPELINE: DEPLOYER ----
+
+    async def _execute_release_deployer_subtask(
+        self, sub_task: dict, provider: AIProvider, workspace_path: str | None,
+    ) -> None:
+        """Procedural release deployer: trigger deployment via configured HTTP endpoint.
+
+        Handles both test/staging and production environments with optional approval gate.
+        """
+        import httpx as _httpx
+
+        st_id = str(sub_task["id"])
+        await self._transition_subtask(st_id, "assigned")
+        await self._transition_subtask(st_id, "running")
+
+        # Determine environment from description
+        description = (sub_task.get("description") or "").lower()
+        is_prod = "prod" in description
+        env_name = "prod" if is_prod else "test"
+
+        await self.db.execute(
+            "UPDATE todo_items SET sub_state = $2, updated_at = NOW() WHERE id = $1",
+            self.todo_id,
+            f"releasing_{env_name}",
+        )
+
+        try:
+            todo = await self._load_todo()
+            project = await self.db.fetchrow(
+                "SELECT * FROM projects WHERE id = $1", todo["project_id"]
+            )
+            if not project:
+                raise ValueError("Project not found")
+
+            project_settings = project.get("settings_json") or {}
+            if isinstance(project_settings, str):
+                project_settings = json.loads(project_settings)
+            release_config = project_settings.get("release_config", {})
+
+            # Get the environment config
+            config_key = "prod_release" if is_prod else "test_release"
+            env_config = release_config.get(config_key, {})
+            if not env_config.get("enabled"):
+                logger.info("[%s] Release %s not enabled, skipping", self.todo_id, env_name)
+                await self._transition_subtask(
+                    st_id, "completed",
+                    progress_pct=100, progress_message=f"{env_name} release skipped (not enabled)",
+                )
+                return
+
+            # Approval gate for production
+            if is_prod and env_config.get("require_approval"):
+                current_sub_state = todo.get("sub_state")
+                if current_sub_state != "release_prod_approved":
+                    await self.db.execute(
+                        "UPDATE todo_items SET sub_state = 'awaiting_release_approval', updated_at = NOW() WHERE id = $1",
+                        self.todo_id,
+                    )
+                    await self._post_system_message(
+                        f"**Release pipeline:** Production deployment is ready. Awaiting your approval to deploy to production."
+                    )
+                    await self._transition_subtask(
+                        st_id, "pending",
+                        progress_message="Awaiting production release approval",
+                    )
+                    await self.redis.publish(
+                        f"task:{self.todo_id}:events",
+                        json.dumps({
+                            "type": "state_change",
+                            "state": "in_progress",
+                            "sub_state": "awaiting_release_approval",
+                        }),
+                    )
+                    return
+                else:
+                    # Already approved
+                    await self.db.execute(
+                        "UPDATE todo_items SET sub_state = 'releasing_prod', updated_at = NOW() WHERE id = $1",
+                        self.todo_id,
+                    )
+
+            await self._report_progress(st_id, 20, f"Preparing {env_name} deployment")
+
+            # Get image_hash from build_watcher's output_result
+            build_st = await self.db.fetchrow(
+                "SELECT output_result FROM sub_tasks WHERE todo_id = $1 "
+                "AND agent_role = 'release_build_watcher' AND status = 'completed' "
+                "ORDER BY created_at DESC LIMIT 1",
+                self.todo_id,
+            )
+            if not build_st:
+                raise ValueError("No completed build_watcher subtask found")
+
+            build_output = build_st.get("output_result") or {}
+            if isinstance(build_output, str):
+                build_output = json.loads(build_output)
+            image_hash = build_output.get("image_hash", "")
+
+            # Get commit_sha from deliverable
+            pr_deliv = await self.db.fetchrow(
+                "SELECT head_sha FROM deliverables WHERE todo_id = $1 AND type = 'pull_request' "
+                "ORDER BY created_at DESC LIMIT 1",
+                self.todo_id,
+            )
+            commit_sha = (pr_deliv["head_sha"] if pr_deliv and pr_deliv.get("head_sha") else "")
+
+            # Build template variables
+            project_name = project.get("name", "")
+            variables = {
+                "image_hash": image_hash,
+                "commit_sha": commit_sha,
+                "env": env_name,
+                "project_name": project_name,
+                "todo_id": self.todo_id,
+            }
+
+            # Interpolate deploy config
+            api_url = self._interpolate_template(env_config.get("api_url", ""), variables)
+            method = env_config.get("http_method", "POST").upper()
+
+            raw_headers = env_config.get("headers", {})
+            headers = {}
+            for k, v in raw_headers.items():
+                headers[k] = self._interpolate_template(str(v), variables)
+
+            body_template = env_config.get("body_template", "")
+            body_str = self._interpolate_template(body_template, variables)
+
+            success_codes = env_config.get("success_status_codes", [200, 201, 202])
+
+            await self._report_progress(st_id, 50, f"Triggering {env_name} deployment")
+
+            # Make the deployment HTTP request
+            async with _httpx.AsyncClient(timeout=60) as client:
+                resp = await client.request(
+                    method=method,
+                    url=api_url,
+                    headers=headers,
+                    content=body_str,
+                )
+
+                if resp.status_code not in success_codes:
+                    raise ValueError(
+                        f"Deployment request failed with status {resp.status_code}: {resp.text[:500]}"
+                    )
+
+                deploy_response = {}
+                try:
+                    deploy_response = resp.json()
+                except Exception:
+                    deploy_response = {"raw": resp.text[:1000]}
+
+                logger.info("[%s] %s deployment triggered successfully: %s",
+                            self.todo_id, env_name, resp.status_code)
+
+                # Poll status URL if configured
+                poll_url = env_config.get("poll_status_url")
+                if poll_url:
+                    release_id = str(deploy_response.get("release_id", deploy_response.get("id", "")))
+                    poll_variables = {**variables, "release_id": release_id}
+                    resolved_poll_url = self._interpolate_template(poll_url, poll_variables)
+                    poll_success = env_config.get("poll_success_value", "succeeded")
+                    poll_interval = env_config.get("poll_interval_seconds", 15)
+                    poll_timeout = env_config.get("poll_timeout_minutes", 15)
+                    poll_deadline = time.monotonic() + poll_timeout * 60
+
+                    await self._report_progress(st_id, 70, f"Waiting for {env_name} deployment to complete")
+
+                    while time.monotonic() < poll_deadline:
+                        poll_resp = await client.get(resolved_poll_url, headers=headers)
+                        if poll_resp.status_code == 200:
+                            try:
+                                poll_data = poll_resp.json()
+                                status_val = str(poll_data.get("status", "")).lower()
+                                if status_val == poll_success.lower():
+                                    logger.info("[%s] %s deployment poll: succeeded", self.todo_id, env_name)
+                                    break
+                                if status_val in ("failed", "error", "cancelled"):
+                                    raise ValueError(
+                                        f"Deployment failed during polling: status={status_val}"
+                                    )
+                            except ValueError:
+                                raise
+                            except Exception:
+                                pass
+                        await asyncio.sleep(poll_interval)
+                    else:
+                        raise ValueError(f"Deployment status poll timed out after {poll_timeout} minutes")
+
+            # Send success notification
+            await self.notifier.notify(
+                str(todo["creator_id"]),
+                f"release_{env_name}_completed",
+                {
+                    "todo_id": self.todo_id,
+                    "title": todo["title"],
+                    "detail": f"Successfully deployed to {env_name}. Image: {image_hash}",
+                },
+            )
+
+            await self._report_progress(st_id, 100, f"{env_name} deployment complete")
+            await self._transition_subtask(
+                st_id, "completed",
+                progress_pct=100, progress_message=f"Deployed to {env_name}",
+            )
+
+        except Exception as e:
+            logger.error("[%s] Release deployer (%s) failed: %s", self.todo_id, env_name, e, exc_info=True)
+            try:
+                todo = await self._load_todo()
+                await self.notifier.notify(
+                    str(todo["creator_id"]),
+                    f"release_{env_name}_failed",
+                    {
+                        "todo_id": self.todo_id,
+                        "title": todo["title"],
+                        "detail": f"Deployment to {env_name} failed: {str(e)[:300]}",
+                    },
+                )
+            except Exception:
+                pass
+            await self._post_system_message(
+                f"**Release pipeline:** {env_name} deployment failed: {str(e)[:500]}"
+            )
+            await self._transition_subtask(
+                st_id, "failed",
+                error_message=str(e)[:500],
+            )
 
     async def _execute_subtask(self, sub_task: dict, provider: AIProvider, *, workspace_path: str | None = None) -> None:
         """Execute a single sub-task using the appropriate specialist agent."""
@@ -4224,9 +5366,12 @@ class AgentCoordinator:
             builtin_tools = self._get_builtin_tools(workspace_path, sub_task["agent_role"])
             # Inject task-local index directory for semantic_search
             _exec_idx = os.path.join(workspace_path, ".agent_index")
+            _exec_dep_dirs = self._get_dep_index_dirs(workspace_path)
             for _bt in builtin_tools:
                 if _bt["name"] == "semantic_search":
                     _bt["_index_dir"] = _exec_idx
+                    if _exec_dep_dirs:
+                        _bt["_dep_index_dirs"] = _exec_dep_dirs
             if mcp_tools:
                 existing_names = {t["name"] for t in mcp_tools}
                 mcp_tools.extend(t for t in builtin_tools if t["name"] not in existing_names)
@@ -4289,6 +5434,18 @@ class AgentCoordinator:
                     )
                 return await self.mcp_executor.execute_tool(name, args, mcp_tools)
 
+            # Structured tool event streaming (same pattern as iterative path)
+            async def _on_tool_event(event: dict) -> None:
+                try:
+                    event["sub_task_id"] = st_id
+                    event["ts"] = time.time()
+                    await self.redis.publish(
+                        f"task:{self.todo_id}:events",
+                        json.dumps(event),
+                    )
+                except Exception:
+                    logger.debug("Failed to publish tool event", exc_info=True)
+
             # Allow users to inject guidance into this subtask's tool loop
             _inject_key = f"subtask:{st_id}:inject"
 
@@ -4297,16 +5454,22 @@ class AgentCoordinator:
                     return await self.redis.lpop(_inject_key)
                 return None
 
+            _exec_token_cb = self._build_token_streamer(st_id)
             content, response = await run_tool_loop(
                 provider, messages,
                 tools=tools_arg,
                 tool_executor=_tool_exec,
-                max_rounds=10,
+                max_rounds=70,
                 on_tool_round=_on_tool_round,
                 on_activity=lambda msg: self._report_activity(st_id, msg),
+                on_tool_event=_on_tool_event,
                 on_inject_check=_check_inject,
+                on_cancel_check=self._is_cancelled,
+                on_token=_exec_token_cb,
                 **send_kwargs,
             )
+            if hasattr(_exec_token_cb, "flush"):
+                await _exec_token_cb.flush()
             logger.info("[%s] st=%s Tool loop done: content_len=%d stop=%s",
                         self.todo_id, st_id, len(content) if content else 0, response.stop_reason)
 
@@ -4317,12 +5480,10 @@ class AgentCoordinator:
 
             await self._report_progress(st_id, 80, f"Processing output: {sub_task['title']}")
 
-            # ── Structured output validation + retry ──
+            # ── Structured output validation ──
             from agents.orchestrator.output_validator import (
                 validate_agent_output,
                 validate_agent_output_dict,
-                build_correction_prompt,
-                MAX_VALIDATION_RETRIES,
             )
 
             validated_output = None
@@ -4335,33 +5496,23 @@ class AgentCoordinator:
                 )
                 if validated_output is None:
                     logger.warning(
-                        "submit_result validation failed for %s (%s): %s — falling through to text parse",
+                        "submit_result validation failed for %s (%s): %s — using raw dict",
                         st_id, sub_task["agent_role"], val_errors,
                     )
+                    # Use the raw submit_result data rather than burning tokens on retries
+                    validated_output = dict(_submit_result_data)
+                    validated_output.setdefault("content", raw_content)
 
-            # Fallback: text-based extraction + Pydantic validation with retry
+            # Fallback: single text-based extraction attempt (no retry loop)
             if validated_output is None:
-                for val_attempt in range(MAX_VALIDATION_RETRIES + 1):
-                    validated_output, val_errors = validate_agent_output(
-                        sub_task["agent_role"], response.content,
-                    )
-                    if validated_output is not None:
-                        break
-                    if val_attempt < MAX_VALIDATION_RETRIES:
-                        correction = build_correction_prompt(
-                            sub_task["agent_role"], val_errors, response.content,
-                        )
-                        messages.append(LLMMessage(role="assistant", content=response.content))
-                        messages.append(LLMMessage(role="user", content=correction))
-                        response = await provider.send_message(
-                            messages, temperature=0.1, tools=tools_arg,
-                            **({"model": model_override} if model_override else {}),
-                        )
+                validated_output, val_errors = validate_agent_output(
+                    sub_task["agent_role"], response.content,
+                )
 
             if validated_output is None:
                 logger.warning(
-                    "Subtask %s (%s) failed output validation after %d retries: %s",
-                    st_id, sub_task["agent_role"], MAX_VALIDATION_RETRIES, val_errors,
+                    "Subtask %s (%s) output validation failed: %s — using raw content",
+                    st_id, sub_task["agent_role"], val_errors,
                 )
                 validated_output = {"content": response.content, "raw_content": response.content}
 
@@ -4437,7 +5588,7 @@ class AgentCoordinator:
     # ---- REVIEW PHASE ----
 
     async def _phase_review(self, todo: dict, provider: AIProvider) -> None:
-        """Auto-review deliverables. Only notify human if issues found."""
+        """Finalize task: build deterministic summary, create PR if needed, complete."""
         # Re-read current state to avoid stale transitions (e.g. concurrent dispatch)
         current = await self.db.fetchval(
             "SELECT state FROM todo_items WHERE id = $1", self.todo_id,
@@ -4450,92 +5601,103 @@ class AgentCoordinator:
             logger.warning("[%s] Cannot enter review from state=%s, skipping review phase", self.todo_id, current)
             return
 
-        # Gather all results
+        # Gather all results and build deterministic summary
         results = await self._get_completed_results()
+        summary_parts = []
+        for r in results:
+            role = r.get("agent_role", "?")
+            title = r.get("title", "?")
+            out = r.get("output_result", {})
+            approach = out.get("approach", "") or out.get("summary", "") if isinstance(out, dict) else ""
+            summary_parts.append(f"- [{role}] {title}: {approach[:200]}" if approach else f"- [{role}] {title}")
+        summary = f"Completed {len(results)} sub-task(s):\n" + "\n".join(summary_parts)
 
-        messages = [
-            LLMMessage(role="system", content=REVIEW_SYSTEM_PROMPT),
-            LLMMessage(
-                role="user",
-                content=(
-                    f"Original task: {todo['title']}\n"
-                    f"Description: {todo['description']}\n"
-                    f"Requirements: {json.dumps(safe_json(todo.get('intake_data')), default=str)}\n\n"
-                    f"Completed sub-task results:\n"
-                    + "\n---\n".join(
-                        f"[{r.get('agent_role', '?')}] {r.get('title', '?')}: "
-                        f"{json.dumps(r.get('output_result', {}), default=str)[:2000]}"
-                        for r in results
-                    )
-                ),
-            ),
-        ]
+        # Collect all PRs: main repo + dependency repos
+        all_pr_urls = []
 
-        response = await provider.send_message(
-            messages, model=provider.get_model(use_fast=True), temperature=0.1
+        # Check for existing PRs (from review-chain flow)
+        existing_prs = await self.db.fetch(
+            "SELECT pr_url, branch_name FROM deliverables WHERE todo_id = $1 AND type = 'pull_request'",
+            self.todo_id,
         )
-        await self._track_tokens(response)
+        for ep in existing_prs:
+            if ep.get("pr_url"):
+                all_pr_urls.append(ep["pr_url"])
 
-        review = parse_llm_json(response.content)
-        if review is None:
-            review = {"approved": True, "summary": response.content}
+        # Create main repo PR only if one doesn't already exist for the main branch
+        short_id = str(self.todo_id)[:8]
+        main_branch = f"task/{short_id}"
+        has_main_pr = any(ep.get("branch_name") == main_branch for ep in existing_prs)
+        if not has_main_pr:
+            pr_info = await self._finalize_workspace(todo, summary)
+            if pr_info and pr_info.get("url"):
+                all_pr_urls.append(pr_info["url"])
 
-        # Try to commit, push, and create PR if workspace exists
-        pr_info = await self._finalize_workspace(todo, review.get("summary", ""))
+        # Dep repo PRs: find subtasks with target_repo and finalize each unique dep workspace
+        dep_subtasks = await self.db.fetch(
+            "SELECT * FROM sub_tasks WHERE todo_id = $1 AND target_repo IS NOT NULL "
+            "AND status = 'completed'",
+            self.todo_id,
+        )
+        finalized_deps = set()  # track by dep name to avoid duplicate PRs
+        for dst in dep_subtasks:
+            target_repo = dst.get("target_repo")
+            if isinstance(target_repo, str):
+                target_repo = json.loads(target_repo)
+            if not target_repo or not target_repo.get("repo_url"):
+                continue
+            dep_name = (target_repo.get("name") or "dep").replace("/", "_").replace(" ", "_")
+            if dep_name in finalized_deps:
+                continue
+            finalized_deps.add(dep_name)
+            # Check if PR already exists for this dep branch
+            short_id = str(self.todo_id)[:8]
+            dep_branch = f"task/{short_id}-{dep_name}"
+            existing_dep_pr = await self.db.fetchrow(
+                "SELECT pr_url FROM deliverables WHERE todo_id = $1 AND type = 'pull_request' "
+                "AND branch_name = $2",
+                self.todo_id, dep_branch,
+            )
+            if existing_dep_pr:
+                if existing_dep_pr.get("pr_url"):
+                    all_pr_urls.append(existing_dep_pr["pr_url"])
+                continue
+            # Finalize the dep workspace
+            try:
+                project_dir = os.path.join(settings.workspace_root, str(todo["project_id"]))
+                dep_task_dir = os.path.join(project_dir, "tasks", str(self.todo_id), f"dep_{dep_name}")
+                if os.path.isdir(dep_task_dir):
+                    dep_pr = await self._finalize_subtask_workspace(dict(dst), dep_task_dir)
+                    if dep_pr and dep_pr.get("url"):
+                        all_pr_urls.append(dep_pr["url"])
+            except Exception:
+                logger.warning("[%s] Failed to finalize dep workspace for %s", self.todo_id, dep_name, exc_info=True)
 
-        summary = review.get("summary", "Completed successfully")
-        if pr_info:
-            summary += f"\n\nPR created: {pr_info.get('url', 'N/A')}"
+        # Build summary with all PR URLs
+        if all_pr_urls:
+            summary += "\n\nPRs created:\n" + "\n".join(f"  - {url}" for url in all_pr_urls)
 
-        approved = review.get("approved", True)
-        issues = review.get("issues", [])
+        pr_note = ""
+        if all_pr_urls:
+            pr_note = "**PRs:**\n" + "\n".join(f"- {url}" for url in all_pr_urls) + "\n\n"
 
-        if approved:
-            issue_note = ""
-            if issues:
-                issue_note = "\n\n**Minor notes:**\n" + "\n".join(f"- {i}" for i in issues)
-            await self._post_system_message(
-                f"**Review passed.** {review.get('summary', '')}\n\n"
-                + (f"**PR:** {pr_info['url']}\n\n" if pr_info else "")
-                + "Task completed."
-                + issue_note
-            )
-            await self._transition_todo(
-                "completed",
-                result_summary=summary,
-            )
-            await self.notifier.notify(
-                str(todo["creator_id"]),
-                "completed",
-                {
-                    "todo_id": self.todo_id,
-                    "title": todo["title"],
-                    "detail": summary,
-                },
-            )
-        else:
-            # Review found real issues — still complete but flag them
-            issue_text = "\n".join(f"- {i}" for i in issues) if issues else "No specific issues."
-            await self._post_system_message(
-                f"**Review complete with issues:**\n\n"
-                f"{review.get('summary', '')}\n\n"
-                f"**Issues found:**\n{issue_text}\n\n"
-                + (f"**PR:** {pr_info['url']}\n\n" if pr_info else "")
-                + "Task completed. Review the issues above and create follow-up tasks if needed."
-            )
-            await self._transition_todo(
-                "completed",
-                result_summary=f"{summary}\n\nIssues: {issue_text}",
-            )
-            await self.notifier.notify(
-                str(todo["creator_id"]),
-                "completed",
-                {
-                    "todo_id": self.todo_id,
-                    "title": todo["title"],
-                    "detail": f"Completed with issues: {review.get('summary', '')}",
-                },
-            )
+        await self._post_system_message(
+            f"**Task completed.**\n\n{pr_note}"
+            f"{len(results)} sub-task(s) finished successfully."
+        )
+        await self._transition_todo(
+            "completed",
+            result_summary=summary,
+        )
+        await self.notifier.notify(
+            str(todo["creator_id"]),
+            "completed",
+            {
+                "todo_id": self.todo_id,
+                "title": todo["title"],
+                "detail": summary,
+            },
+        )
 
         # Extract and store persistent memories from completed task
         try:
@@ -4680,19 +5842,23 @@ class AgentCoordinator:
 
         os.makedirs(dep_task_dir, exist_ok=True)
 
-        # Resolve credentials
+        # Resolve credentials using the same utilities as workspace.py
+        from agents.utils.git_utils import resolve_git_credentials, run_git_command
+        from agents.orchestrator.git_providers.factory import build_clone_url
+
         git_provider_id = target_repo.get("git_provider_id")
-        token, provider_type = await self.workspace_mgr._resolve_git_credentials(
-            git_provider_id, target_repo["repo_url"],
+        if git_provider_id:
+            git_provider_id = str(git_provider_id)
+        token, provider_type, _ = await resolve_git_credentials(
+            self.db, git_provider_id, target_repo["repo_url"],
         )
 
-        from agents.orchestrator.git_providers.factory import build_clone_url
         clone_url = build_clone_url(target_repo["repo_url"], token, provider_type)
         branch = target_repo.get("default_branch") or "main"
 
-        rc, out = await self.workspace_mgr._run_git(
+        rc, out = await run_git_command(
             "clone", "--depth", "1", "--branch", branch, clone_url, dep_repo_dir,
-            cwd=self.workspace_mgr.workspace_root,
+            cwd=settings.workspace_root,
         )
         if rc != 0:
             raise RuntimeError(f"Failed to clone dependency repo: {out}")
@@ -4700,7 +5866,7 @@ class AgentCoordinator:
         # Create task branch
         short_id = str(self.todo_id)[:8]
         task_branch = f"task/{short_id}-{dep_name}"
-        await self.workspace_mgr._run_git(
+        await run_git_command(
             "checkout", "-b", task_branch, cwd=dep_repo_dir,
         )
 
@@ -4721,6 +5887,16 @@ class AgentCoordinator:
                 os.symlink(main_repo_dir, main_repo_link)
             except OSError:
                 logger.debug("Could not symlink main repo into dep workspace")
+
+        # Copy .context/ docs so dep agents can self-serve project context
+        project_context = os.path.join(project_dir, ".context")
+        dep_context = os.path.join(dep_task_dir, ".context")
+        if os.path.isdir(project_context) and not os.path.exists(dep_context):
+            try:
+                import shutil
+                shutil.copytree(project_context, dep_context)
+            except Exception:
+                logger.debug("Could not copy .context/ into dep workspace")
 
         return dep_task_dir
 
@@ -4765,6 +5941,13 @@ class AgentCoordinator:
             understanding = settings.get("project_understanding")
             if understanding:
                 context["project_understanding"] = understanding
+            # Include per-dep understandings and linking document
+            dep_understandings = settings.get("dep_understandings")
+            if dep_understandings:
+                context["dep_understandings"] = dep_understandings
+            linking_doc = settings.get("linking_document")
+            if linking_doc:
+                context["linking_document"] = linking_doc
             # Include debug context so the planner knows debugging capabilities
             debug_ctx = settings.get("debug_context")
             if debug_ctx:
@@ -4817,23 +6000,31 @@ class AgentCoordinator:
 
         await self._post_assistant_message(response.content)
 
-    async def _post_system_message(self, content: str) -> None:
-        await self._post_chat_message("system", content)
+    async def _post_system_message(self, content: str, metadata: dict | None = None) -> None:
+        await self._post_chat_message("system", content, metadata=metadata)
 
-    async def _post_assistant_message(self, content: str) -> None:
-        await self._post_chat_message("assistant", content)
+    async def _post_assistant_message(self, content: str, metadata: dict | None = None) -> None:
+        await self._post_chat_message("assistant", content, metadata=metadata)
 
-    async def _post_chat_message(self, role: str, content: str) -> None:
+    async def _post_chat_message(self, role: str, content: str, *, metadata: dict | None = None) -> None:
         """Write a chat message to the correct table and publish to relevant channels."""
         session_id = getattr(self, "_chat_session_id", None)
 
         if session_id:
             # Linked session: write to project_chat_messages
-            await self.db.execute(
-                "INSERT INTO project_chat_messages (project_id, user_id, role, content, session_id) "
-                "VALUES ($1, $2, $3, $4, $5)",
-                self._chat_project_id, self._chat_user_id, role, content, session_id,
-            )
+            if metadata:
+                await self.db.execute(
+                    "INSERT INTO project_chat_messages (project_id, user_id, role, content, metadata_json, session_id) "
+                    "VALUES ($1, $2, $3, $4, $5::jsonb, $6)",
+                    self._chat_project_id, self._chat_user_id, role, content,
+                    json.dumps(metadata), session_id,
+                )
+            else:
+                await self.db.execute(
+                    "INSERT INTO project_chat_messages (project_id, user_id, role, content, session_id) "
+                    "VALUES ($1, $2, $3, $4, $5)",
+                    self._chat_project_id, self._chat_user_id, role, content, session_id,
+                )
         else:
             # Standard: write to chat_messages
             await self.db.execute(
@@ -4842,9 +6033,12 @@ class AgentCoordinator:
             )
 
         # Always publish to the task events channel for the todo detail WS
+        msg_payload = {"role": role, "content": content}
+        if metadata:
+            msg_payload["metadata_json"] = metadata
         event_data = json.dumps({
             "type": "chat_message",
-            "message": {"role": role, "content": content},
+            "message": msg_payload,
         })
         await self.redis.publish(f"task:{self.todo_id}:events", event_data)
         # Also publish to session channel if linked
@@ -4911,14 +6105,64 @@ class AgentCoordinator:
             return
         self._last_activity_publish["_planning"] = now
 
-        await self.redis.publish(
-            f"task:{self.todo_id}:progress",
-            json.dumps({
-                "type": "activity",
-                "phase": "planning",
-                "activity": activity,
-            }),
-        )
+        event_data = json.dumps({
+            "type": "activity",
+            "phase": "planning",
+            "activity": activity,
+        })
+        await self.redis.publish(f"task:{self.todo_id}:progress", event_data)
+        # Also publish to session channel so chat UI can show planning activity
+        session_id = getattr(self, "_chat_session_id", None)
+        if session_id:
+            await self.redis.publish(f"chat:session:{session_id}:activity", event_data)
+
+    def _build_token_streamer(self, subtask_id: str | None = None):
+        """Build a buffered on_token callback for streaming LLM text deltas.
+
+        Publishes batched token chunks to ``task:{todo_id}:progress`` (and
+        the linked chat session channel, if any) so the UI can render text
+        in real-time.  Batches every 20+ chars to avoid flooding Redis.
+        """
+        channel = f"task:{self.todo_id}:progress"
+        session_id = getattr(self, "_chat_session_id", None)
+        session_channel = f"chat:session:{session_id}:activity" if session_id else None
+        _buf: list[str] = []
+        _buf_len = 0
+
+        async def on_token(delta: str) -> None:
+            nonlocal _buf_len
+            _buf.append(delta)
+            _buf_len += len(delta)
+            if _buf_len >= 20:
+                text = "".join(_buf)
+                _buf.clear()
+                _buf_len = 0
+                payload = json.dumps({
+                    "type": "token",
+                    "token": text,
+                    **({"sub_task_id": subtask_id} if subtask_id else {}),
+                })
+                await self.redis.publish(channel, payload)
+                if session_channel:
+                    await self.redis.publish(session_channel, payload)
+
+        async def flush() -> None:
+            nonlocal _buf_len
+            if _buf:
+                text = "".join(_buf)
+                _buf.clear()
+                _buf_len = 0
+                payload = json.dumps({
+                    "type": "token",
+                    "token": text,
+                    **({"sub_task_id": subtask_id} if subtask_id else {}),
+                })
+                await self.redis.publish(channel, payload)
+                if session_channel:
+                    await self.redis.publish(session_channel, payload)
+
+        on_token.flush = flush  # type: ignore[attr-defined]
+        return on_token
 
     async def _get_completed_results(self) -> list[dict]:
         rows = await self.db.fetch(
@@ -4936,6 +6180,25 @@ class AgentCoordinator:
         rather than going through an external MCP server.
         """
         return get_builtin_tool_schemas(workspace_path, role)
+
+    def _get_dep_index_dirs(self, workspace_path: str) -> dict[str, str]:
+        """Build a mapping of dep_name -> index_dir for dependency repos.
+
+        Scans the .agent_index_deps/ directory in the workspace for
+        pre-built dependency indexes.
+        """
+        deps_index_root = os.path.join(workspace_path, ".agent_index_deps")
+        if not os.path.isdir(deps_index_root):
+            return {}
+        result: dict[str, str] = {}
+        try:
+            for entry in os.listdir(deps_index_root):
+                idx_dir = os.path.join(deps_index_root, entry)
+                if os.path.isdir(idx_dir):
+                    result[entry] = idx_dir
+        except OSError:
+            pass
+        return result
 
     async def _track_tokens(self, response: LLMResponse) -> None:
         await self.db.execute(
@@ -5004,12 +6267,22 @@ class AgentCoordinator:
                 except Exception:
                     logger.warning("Failed to capture git diff for deliverable", exc_info=True)
 
+            # Resolve target_repo_name for dependency deliverables
+            dep_repo_name = None
+            target_repo = sub_task.get("target_repo")
+            if target_repo:
+                if isinstance(target_repo, str):
+                    target_repo = json.loads(target_repo) if target_repo else None
+                if isinstance(target_repo, dict) and target_repo.get("name"):
+                    dep_repo_name = target_repo["name"]
+
             await self.db.execute(
                 """
                 INSERT INTO deliverables (
-                    todo_id, agent_run_id, sub_task_id, type, title, content_md, content_json
+                    todo_id, agent_run_id, sub_task_id, type, title, content_md, content_json,
+                    target_repo_name
                 )
-                VALUES ($1, $2, $3, $4, $5, $6, $7)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
                 """,
                 self.todo_id,
                 run["id"],
@@ -5018,6 +6291,7 @@ class AgentCoordinator:
                 f"{d_type}: {sub_task['title']}",
                 response.content,
                 diff_json,
+                dep_repo_name,
             )
 
     async def _build_agent_prompt(
@@ -5081,6 +6355,29 @@ class AgentCoordinator:
                         if os.path.isdir(full):
                             workspace_context += f"  - ../deps/{d}/\n"
 
+        # Point agents to .context/ files instead of injecting inline.
+        # Tools resolve paths relative to repo/, so agents use ../.context/ to reach them.
+        cross_repo_ctx = ""
+        context_dir = os.path.join(workspace_path, ".context") if workspace_path else None
+        if context_dir and os.path.isdir(context_dir):
+            ctx_files = []
+            if os.path.isfile(os.path.join(context_dir, "UNDERSTANDING.md")):
+                ctx_files.append("- ../.context/UNDERSTANDING.md — main repo architecture, patterns, tech stack")
+            if os.path.isfile(os.path.join(context_dir, "LINKING.md")):
+                ctx_files.append("- ../.context/LINKING.md — how repos relate, data flow, integration patterns")
+            deps_ctx = os.path.join(context_dir, "deps")
+            if os.path.isdir(deps_ctx):
+                dep_files = sorted(f for f in os.listdir(deps_ctx) if f.endswith(".md"))
+                for df in dep_files:
+                    name = df.removesuffix(".md")
+                    ctx_files.append(f"- ../.context/deps/{df} — {name} dependency architecture and API")
+            if ctx_files:
+                cross_repo_ctx = (
+                    "\n\nProject context docs available (read with read_file when needed):\n"
+                    + "\n".join(ctx_files)
+                    + "\n"
+                )
+
         # Work rules injection
         rules_block = ""
         if work_rules:
@@ -5089,9 +6386,9 @@ class AgentCoordinator:
 
         # Use custom agent prompt if available, otherwise default
         if agent_config and agent_config.get("system_prompt"):
-            system = agent_config["system_prompt"] + workspace_context
+            system = agent_config["system_prompt"] + workspace_context + cross_repo_ctx
         else:
-            system = get_default_system_prompt(role) + workspace_context
+            system = get_default_system_prompt(role) + workspace_context + cross_repo_ctx
 
         system += rules_block
 
@@ -5125,6 +6422,56 @@ class AgentCoordinator:
                 )
             prev_context = "\n\nCompleted sub-tasks:\n" + "\n".join(prev_items)
 
+        # For debugger: extract structured error details from previous subtasks
+        debugger_error_context = ""
+        if role == "debugger" and previous_results:
+            error_details = []
+            for r in previous_results:
+                out = r.get("output_result", {})
+                if not isinstance(out, dict):
+                    continue
+                for f in (out.get("failures") or [])[:10]:
+                    error_details.append(
+                        f"- [{f.get('type','test')}] {f.get('file','?')}: {f.get('error','')}\n"
+                        f"  {f.get('details','')[:300]}"
+                    )
+                for iss in out.get("issues") or []:
+                    if iss.get("severity") in ("critical", "major"):
+                        error_details.append(
+                            f"- [review:{iss['severity']}] {iss.get('file','')}:{iss.get('line','')}: "
+                            f"{iss.get('description','')}"
+                        )
+            if error_details:
+                debugger_error_context = (
+                    "\n## Errors to Investigate\n"
+                    "These failures were found by previous agents. Start your investigation here:\n"
+                    + "\n".join(error_details)
+                )
+
+        # For debugger: inject recent git log
+        debugger_git_context = ""
+        if role == "debugger" and workspace_path:
+            repo_dir = os.path.join(workspace_path, "repo")
+            if os.path.isdir(repo_dir):
+                try:
+                    proc = await asyncio.create_subprocess_exec(
+                        "git", "log", "--oneline", "--no-decorate", "-20",
+                        cwd=repo_dir,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                    )
+                    stdout, _ = await proc.communicate()
+                    git_log = stdout.decode(errors="replace").strip()
+                    if git_log:
+                        debugger_git_context = (
+                            "\n## Recent Commits\n"
+                            "Scan for commits related to the bug area. Use "
+                            "`run_command` with `git diff <hash>~1..<hash>` to inspect suspicious ones.\n"
+                            f"```\n{git_log}\n```"
+                        )
+                except Exception:
+                    pass
+
         # Inject previous run context if this is a retry-with-context
         previous_run = intake.get("previous_run")
         if previous_run:
@@ -5138,15 +6485,71 @@ class AgentCoordinator:
                 prev_run_ctx += "\n"
             prev_context += prev_run_ctx
 
+        # Build structured user prompt with all available context
+        user_parts = [
+            f"# Task: {todo['title']}",
+        ]
+        if todo.get("description"):
+            user_parts.append(f"**Task description:** {todo['description']}")
+
+        user_parts.append(f"\n## Your Sub-task: {sub_task['title']}")
+        user_parts.append(f"**Instructions:** {sub_task['description'] or 'N/A'}")
+
+        # Inject planner's exploration context (input_context from DB)
+        input_ctx = sub_task.get("input_context")
+        if isinstance(input_ctx, str):
+            try:
+                input_ctx = json.loads(input_ctx)
+            except (json.JSONDecodeError, TypeError):
+                input_ctx = None
+        if input_ctx and isinstance(input_ctx, dict):
+            ctx_parts = []
+            if input_ctx.get("relevant_files"):
+                files = input_ctx["relevant_files"]
+                if isinstance(files, list):
+                    ctx_parts.append("**Relevant files:** " + ", ".join(f"`{f}`" for f in files))
+            if input_ctx.get("current_state"):
+                ctx_parts.append(f"**Current state:** {input_ctx['current_state']}")
+            if input_ctx.get("what_to_change"):
+                ctx_parts.append(f"**What to change:** {input_ctx['what_to_change']}")
+            if input_ctx.get("patterns_to_follow"):
+                ctx_parts.append(f"**Patterns to follow:** {input_ctx['patterns_to_follow']}")
+            if input_ctx.get("related_code"):
+                ctx_parts.append(f"**Related code:**\n{input_ctx['related_code']}")
+            if input_ctx.get("integration_points"):
+                ctx_parts.append(f"**Integration points:** {input_ctx['integration_points']}")
+            if ctx_parts:
+                user_parts.append("\n## Exploration Context (from planning)")
+                user_parts.extend(ctx_parts)
+
+        # Explicit workspace info
+        if is_dep_workspace and target_repo:
+            dep_name = target_repo.get("name", "dependency")
+            user_parts.append(
+                f"\n## Workspace: dependency repo `{dep_name}`"
+                f"\nYou are editing the `{dep_name}` dependency repo. "
+                f"Your changes will create a PR on this repo's repository."
+                f"\nMain project is available read-only at `../main_repo/`."
+            )
+        elif workspace_path:
+            user_parts.append("\n## Workspace: main project repo")
+
+        if intake and not isinstance(intake, str):
+            # Only include intake if it has meaningful content beyond previous_run
+            clean_intake = {k: v for k, v in intake.items() if k != "previous_run" and v}
+            if clean_intake:
+                user_parts.append(f"\n**Requirements:** {json.dumps(clean_intake, default=str)}")
+
+        if prev_context:
+            user_parts.append(prev_context)
+        if debugger_error_context:
+            user_parts.append(debugger_error_context)
+        if debugger_git_context:
+            user_parts.append(debugger_git_context)
+
         return {
             "system": system,
-            "user": (
-                f"Task: {todo['title']}\n"
-                f"Sub-task: {sub_task['title']}\n"
-                f"Description: {sub_task['description'] or 'N/A'}\n"
-                f"Requirements: {json.dumps(intake, default=str)}\n"
-                f"{prev_context}"
-            ),
+            "user": "\n".join(user_parts),
         }
 
     # ---- DEBUG CONTEXT ----

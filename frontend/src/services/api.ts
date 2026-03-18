@@ -10,7 +10,7 @@ import type {
   NotificationChannelPayload, AgentCreatePayload, AgentUpdatePayload,
   ProjectMember, DebugContext, ProjectMemory,
   FileTreeNode, FileContent, GitStatus,
-  ProviderRepos,
+  ProviderRepos, ReleaseConfig,
 } from '../types'
 
 const API_BASE = '/api'
@@ -95,12 +95,23 @@ export const projects = {
   },
   buildSettings: {
     get: (projectId: string) =>
-      request<{ build_commands: string[]; merge_method: string; require_merge_approval: boolean }>(
+      request<{ build_commands: string[]; merge_method: string; require_merge_approval: boolean; require_plan_approval: boolean }>(
         `/projects/${projectId}/build-settings`,
       ),
-    update: (projectId: string, data: { build_commands?: string[]; merge_method?: string; require_merge_approval?: boolean }) =>
-      request<{ build_commands: string[]; merge_method: string; require_merge_approval: boolean }>(
+    update: (projectId: string, data: { build_commands?: string[]; merge_method?: string; require_merge_approval?: boolean; require_plan_approval?: boolean }) =>
+      request<{ build_commands: string[]; merge_method: string; require_merge_approval: boolean; require_plan_approval: boolean }>(
         `/projects/${projectId}/build-settings`,
+        { method: 'PUT', body: JSON.stringify(data) },
+      ),
+  },
+  releaseSettings: {
+    get: (projectId: string) =>
+      request<{ release_pipeline_enabled: boolean; release_config: ReleaseConfig }>(
+        `/projects/${projectId}/release-settings`,
+      ),
+    update: (projectId: string, data: { release_pipeline_enabled?: boolean; release_config?: ReleaseConfig }) =>
+      request<{ release_pipeline_enabled: boolean; release_config: ReleaseConfig }>(
+        `/projects/${projectId}/release-settings`,
         { method: 'PUT', body: JSON.stringify(data) },
       ),
   },
@@ -181,40 +192,62 @@ export const todos = {
       method: 'POST',
       body: JSON.stringify({ feedback }),
     }),
+  approveRelease: (id: string) =>
+    request<{ status: string }>(`/todos/${id}/approve-release`, { method: 'POST' }),
+  rejectRelease: (id: string, feedback: string) =>
+    request<{ status: string }>(`/todos/${id}/reject-release`, {
+      method: 'POST',
+      body: JSON.stringify({ feedback }),
+    }),
   resume: (id: string) =>
     request<{ status: string }>(`/todos/${id}/resume`, { method: 'POST' }),
   workspace: {
-    tree: (todoId: string) =>
-      request<FileTreeNode[]>(`/todos/${todoId}/workspace/tree`),
-    file: (todoId: string, path: string) =>
-      request<FileContent>(`/todos/${todoId}/workspace/file?path=${encodeURIComponent(path)}`),
-    saveFile: (todoId: string, path: string, content: string) =>
+    repos: (todoId: string) =>
+      request<Array<{ name: string; label: string }>>(`/todos/${todoId}/workspace/repos`),
+    tree: (todoId: string, repo?: string) => {
+      const params = new URLSearchParams()
+      if (repo) params.set('repo', repo)
+      const qs = params.toString()
+      return request<FileTreeNode[]>(`/todos/${todoId}/workspace/tree${qs ? `?${qs}` : ''}`)
+    },
+    file: (todoId: string, path: string, repo?: string) => {
+      const params = new URLSearchParams({ path })
+      if (repo) params.set('repo', repo)
+      return request<FileContent>(`/todos/${todoId}/workspace/file?${params}`)
+    },
+    saveFile: (todoId: string, path: string, content: string, repo?: string) =>
       request<{ path: string; size: number; saved: boolean }>(`/todos/${todoId}/workspace/file`, {
         method: 'PUT',
-        body: JSON.stringify({ path, content }),
+        body: JSON.stringify({ path, content, repo: repo || undefined }),
       }),
-    gitStatus: (todoId: string) =>
-      request<GitStatus>(`/todos/${todoId}/workspace/git/status`),
-    gitDiff: (todoId: string, staged?: boolean, path?: string) => {
+    gitStatus: (todoId: string, repo?: string) => {
+      const params = new URLSearchParams()
+      if (repo) params.set('repo', repo)
+      const qs = params.toString()
+      return request<GitStatus>(`/todos/${todoId}/workspace/git/status${qs ? `?${qs}` : ''}`)
+    },
+    gitDiff: (todoId: string, staged?: boolean, path?: string, repo?: string) => {
       const params = new URLSearchParams()
       if (staged) params.set('staged', 'true')
       if (path) params.set('path', path)
+      if (repo) params.set('repo', repo)
       const qs = params.toString()
       return request<{ diff: string; stats: string }>(`/todos/${todoId}/workspace/git/diff${qs ? `?${qs}` : ''}`)
     },
-    gitAdd: (todoId: string, paths: string[]) =>
+    gitAdd: (todoId: string, paths: string[], repo?: string) =>
       request<GitStatus>(`/todos/${todoId}/workspace/git/add`, {
         method: 'POST',
-        body: JSON.stringify({ paths }),
+        body: JSON.stringify({ paths, repo: repo || undefined }),
       }),
-    gitCommit: (todoId: string, message: string) =>
+    gitCommit: (todoId: string, message: string, repo?: string) =>
       request<{ hash: string; message: string; success: boolean }>(`/todos/${todoId}/workspace/git/commit`, {
         method: 'POST',
-        body: JSON.stringify({ message }),
+        body: JSON.stringify({ message, repo: repo || undefined }),
       }),
-    gitPush: (todoId: string) =>
+    gitPush: (todoId: string, repo?: string) =>
       request<{ success: boolean; output: string; branch: string }>(`/todos/${todoId}/workspace/git/push`, {
         method: 'POST',
+        body: JSON.stringify({ repo: repo || undefined }),
       }),
   },
 }
@@ -281,7 +314,7 @@ export const projectChat = {
       ),
   },
   sendInSession: (projectId: string, sessionId: string, content: string, intent?: string, model?: string) =>
-    request<{ user_message: ProjectChatMessage; assistant_message: ProjectChatMessage }>(
+    request<{ user_message: ProjectChatMessage; assistant_message: ProjectChatMessage; routing_mode?: string; mode_auto_switched?: boolean }>(
       `/projects/${projectId}/chat/sessions/${sessionId}/messages`,
       { method: 'POST', body: JSON.stringify({ content, intent, model: model || undefined }) },
     ),

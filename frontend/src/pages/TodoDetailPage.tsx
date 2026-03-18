@@ -38,6 +38,8 @@ const ROLE_LABELS: Record<string, string> = {
   pr_creator: 'PR',
   report_writer: 'Report',
   merge_agent: 'Merge',
+  release_build_watcher: 'Build',
+  release_deployer: 'Deploy',
 }
 
 const VERDICT_COLORS: Record<string, string> = {
@@ -79,6 +81,8 @@ export default function TodoDetailPage() {
   const [showRejectForm, setShowRejectForm] = useState(false)
   const [rejectMergeFeedback, setRejectMergeFeedback] = useState('')
   const [showRejectMergeForm, setShowRejectMergeForm] = useState(false)
+  const [rejectReleaseFeedback, setRejectReleaseFeedback] = useState('')
+  const [showRejectReleaseForm, setShowRejectReleaseForm] = useState(false)
   const [expandedSubTasks, setExpandedSubTasks] = useState<Set<string>>(new Set())
   const [expandedActivity, setExpandedActivity] = useState<Set<string>>(new Set())
   const [expandedLlmResponse, setExpandedLlmResponse] = useState<Set<string>>(new Set())
@@ -333,6 +337,73 @@ export default function TodoDetailPage() {
           )
         })()}
 
+        {/* Release Approval Panel */}
+        {todo.sub_state === 'awaiting_release_approval' && (
+          <div className="mb-5 bg-gray-900 border border-amber-500/20 rounded-lg overflow-hidden">
+            <div className="px-4 py-3 border-b border-gray-800 flex items-center gap-2">
+              <span className="w-2 h-2 rounded-full bg-amber-400 animate-pulse" />
+              <h2 className="text-sm font-medium text-white">Production Release Approval</h2>
+            </div>
+            <div className="px-4 py-3">
+              <p className="text-sm text-gray-400">
+                Staging deployment succeeded. Approve to deploy to production.
+              </p>
+            </div>
+            <div className="px-4 py-3 border-t border-gray-800 flex items-center gap-2">
+              <button
+                onClick={() => todoId && todosApi.approveRelease(todoId).then(() => fetchTodo(todoId))}
+                className="px-4 py-1.5 bg-emerald-600 hover:bg-emerald-500 rounded-lg text-sm font-medium text-white transition-colors"
+              >
+                Approve Production Release
+              </button>
+              {showRejectReleaseForm ? (
+                <div className="flex-1 flex items-center gap-2">
+                  <input
+                    className="flex-1 px-3 py-1.5 bg-gray-950 border border-gray-800 rounded-lg text-sm text-white placeholder-gray-600 focus:outline-none focus:border-indigo-500 transition-colors"
+                    placeholder="Why reject this release?"
+                    value={rejectReleaseFeedback}
+                    onChange={(e) => setRejectReleaseFeedback(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter' && rejectReleaseFeedback.trim() && todoId) {
+                        todosApi.rejectRelease(todoId, rejectReleaseFeedback.trim()).then(() => fetchTodo(todoId))
+                        setRejectReleaseFeedback('')
+                        setShowRejectReleaseForm(false)
+                      }
+                    }}
+                    autoFocus
+                  />
+                  <button
+                    onClick={() => {
+                      if (rejectReleaseFeedback.trim() && todoId) {
+                        todosApi.rejectRelease(todoId, rejectReleaseFeedback.trim()).then(() => fetchTodo(todoId))
+                        setRejectReleaseFeedback('')
+                        setShowRejectReleaseForm(false)
+                      }
+                    }}
+                    disabled={!rejectReleaseFeedback.trim()}
+                    className="px-3 py-1.5 bg-gray-800 hover:bg-gray-700 disabled:opacity-40 rounded-lg text-sm text-gray-300 transition-colors"
+                  >
+                    Send
+                  </button>
+                  <button
+                    onClick={() => setShowRejectReleaseForm(false)}
+                    className="text-xs text-gray-600 hover:text-gray-400 transition-colors"
+                  >
+                    Cancel
+                  </button>
+                </div>
+              ) : (
+                <button
+                  onClick={() => setShowRejectReleaseForm(true)}
+                  className="px-4 py-1.5 bg-gray-800 hover:bg-gray-700 rounded-lg text-sm text-gray-400 transition-colors"
+                >
+                  Reject Release
+                </button>
+              )}
+            </div>
+          </div>
+        )}
+
         {/* Plan Review Panel */}
         {todo.state === 'plan_ready' && todo.plan_json && (
           <div className="mb-5 bg-gray-900 border border-gray-800 rounded-lg overflow-hidden">
@@ -353,27 +424,84 @@ export default function TodoDetailPage() {
 
             <div className="divide-y divide-gray-800">
               {todo.plan_json.sub_tasks.map((st: PlanSubTask, i: number) => (
-                <div key={i} className="px-4 py-3 flex items-start gap-3">
-                  <span className="text-[11px] text-gray-600 font-mono mt-0.5 w-5 text-right shrink-0">{i + 1}</span>
-                  <div className="flex-1 min-w-0">
-                    <div className="flex items-center gap-2 mb-0.5">
-                      <span className="text-sm text-gray-200">{st.title}</span>
-                      <span className="text-[11px] px-1.5 py-0.5 bg-gray-800 rounded text-gray-500">
-                        {ROLE_LABELS[st.agent_role] || st.agent_role}
-                      </span>
+                <div key={i} className="px-4 py-3">
+                  <div className="flex items-start gap-3">
+                    <span className="text-[11px] text-gray-600 font-mono mt-0.5 w-5 text-right shrink-0">{i + 1}</span>
+                    <div className="flex-1 min-w-0">
+                      <div className="flex items-center gap-2 mb-0.5 flex-wrap">
+                        <span className="text-sm text-gray-200">{st.title}</span>
+                        <span className="text-[11px] px-1.5 py-0.5 bg-gray-800 rounded text-gray-500">
+                          {ROLE_LABELS[st.agent_role] || st.agent_role}
+                        </span>
+                        {st.review_loop && (
+                          <span className="px-1.5 py-0.5 bg-cyan-500/10 border border-cyan-500/20 rounded text-[10px] text-cyan-400/80">review loop</span>
+                        )}
+                        {st.target_repo && st.target_repo !== 'main' && (
+                          <span className="px-1.5 py-0.5 bg-purple-500/10 border border-purple-500/20 rounded text-[10px] text-purple-400/80 font-mono">
+                            {st.target_repo}
+                          </span>
+                        )}
+                        {st.depends_on && st.depends_on.length > 0 && (
+                          <span className="text-[11px] text-gray-700 font-mono">
+                            depends on: {st.depends_on.map((d) => `#${d + 1}`).join(', ')}
+                          </span>
+                        )}
+                      </div>
+                      {st.description && (
+                        <p className="text-[11px] text-gray-500 leading-relaxed mt-1">{st.description}</p>
+                      )}
+                      {/* Context details */}
+                      {st.context && Object.keys(st.context).length > 0 && (
+                        <div className="mt-2 space-y-1.5 pl-0.5">
+                          {st.context.relevant_files && st.context.relevant_files.length > 0 && (
+                            <div>
+                              <span className="text-[10px] text-gray-600 uppercase tracking-wider">Files</span>
+                              <div className="mt-0.5 flex flex-wrap gap-1">
+                                {st.context.relevant_files.map((f, fi) => (
+                                  <span key={fi} className="text-[11px] font-mono text-indigo-400/70 bg-indigo-500/5 px-1.5 py-0.5 rounded">
+                                    {f}
+                                  </span>
+                                ))}
+                              </div>
+                            </div>
+                          )}
+                          {st.context.what_to_change && (
+                            <div>
+                              <span className="text-[10px] text-gray-600 uppercase tracking-wider">What to change</span>
+                              <p className="text-[11px] text-gray-500 mt-0.5 leading-relaxed">{st.context.what_to_change}</p>
+                            </div>
+                          )}
+                          {st.context.current_state && (
+                            <div>
+                              <span className="text-[10px] text-gray-600 uppercase tracking-wider">Current state</span>
+                              <p className="text-[11px] text-gray-500 mt-0.5 leading-relaxed">{st.context.current_state}</p>
+                            </div>
+                          )}
+                          {st.context.patterns_to_follow && (
+                            <div>
+                              <span className="text-[10px] text-gray-600 uppercase tracking-wider">Patterns to follow</span>
+                              <p className="text-[11px] text-gray-500 mt-0.5 leading-relaxed">{st.context.patterns_to_follow}</p>
+                            </div>
+                          )}
+                          {st.context.related_code && (
+                            <div>
+                              <span className="text-[10px] text-gray-600 uppercase tracking-wider">Related code</span>
+                              <pre className="text-[11px] text-gray-500 mt-0.5 font-mono whitespace-pre-wrap leading-relaxed bg-gray-950 rounded px-2 py-1.5 border border-gray-800/50 max-h-32 overflow-y-auto">{st.context.related_code}</pre>
+                            </div>
+                          )}
+                          {st.context.integration_points && (
+                            <div>
+                              <span className="text-[10px] text-gray-600 uppercase tracking-wider">Integration points</span>
+                              <p className="text-[11px] text-gray-500 mt-0.5 leading-relaxed">{st.context.integration_points}</p>
+                            </div>
+                          )}
+                        </div>
+                      )}
                     </div>
-                    {st.description && (
-                      <p className="text-[11px] text-gray-600 leading-relaxed">{st.description}</p>
-                    )}
-                    {st.depends_on.length > 0 && (
-                      <span className="text-[11px] text-gray-700 font-mono">
-                        depends on: {st.depends_on.map((d) => `#${d + 1}`).join(', ')}
-                      </span>
-                    )}
+                    <span className="text-[11px] text-gray-700 font-mono shrink-0">
+                      order {st.execution_order}
+                    </span>
                   </div>
-                  <span className="text-[11px] text-gray-700 font-mono shrink-0">
-                    order {st.execution_order}
-                  </span>
                 </div>
               ))}
             </div>

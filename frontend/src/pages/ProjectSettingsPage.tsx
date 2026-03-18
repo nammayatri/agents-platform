@@ -1,7 +1,7 @@
 import { useEffect, useState, useCallback } from 'react'
 import { useParams, useNavigate, useSearchParams } from 'react-router-dom'
 import { projects as projectsApi, providers as providersApi, gitProviders as gitProvidersApi, skills as skillsApi, mcpServers as mcpApi, projectConfig as projectConfigApi } from '../services/api'
-import type { Project, ProjectDependency, ProjectMember, ProviderConfig, GitProviderConfig, Skill, McpServer, WorkRules, ProjectMemory } from '../types'
+import type { Project, ProjectDependency, ProjectMember, ProviderConfig, GitProviderConfig, Skill, McpServer, WorkRules, ProjectMemory, ReleaseConfig } from '../types'
 
 import ProjectWizard from '../components/project/ProjectWizard'
 import ProjectGeneralTab from '../components/project/ProjectGeneralTab'
@@ -14,6 +14,7 @@ import ProjectMembersTab from '../components/project/ProjectMembersTab'
 import ProjectUnderstandingTab from '../components/project/ProjectUnderstandingTab'
 import ProjectAgentsTab from '../components/project/ProjectAgentsTab'
 import ProjectDebugTab from '../components/project/ProjectDebugTab'
+import ProjectReleaseTab from '../components/project/ProjectReleaseTab'
 
 interface ProjectUnderstanding {
   summary?: string
@@ -60,14 +61,17 @@ export default function ProjectSettingsPage() {
   const [buildCommands, setBuildCommands] = useState<string[]>([])
   const [mergeMethod, setMergeMethod] = useState<'merge' | 'squash' | 'rebase'>('squash')
   const [requireMergeApproval, setRequireMergeApproval] = useState(false)
+  const [requirePlanApproval, setRequirePlanApproval] = useState(false)
   const [memories, setMemories] = useState<ProjectMemory[]>([])
   const [memoriesLoading, setMemoriesLoading] = useState(false)
+  const [releaseEnabled, setReleaseEnabled] = useState(false)
+  const [releaseConfig, setReleaseConfig] = useState<ReleaseConfig>({ build_provider: 'github_actions' })
   const [architectEditorEnabled, setArchitectEditorEnabled] = useState(false)
   const [architectModel, setArchitectModel] = useState('')
   const [editorModel, setEditorModel] = useState('')
   const [providerModels, setProviderModels] = useState<{id: string; name: string}[]>([])
 
-  const editTabs = ['General', 'Repository', 'Dependencies', 'Rules', 'Build & Merge', 'Debug', 'Capabilities', 'Members', 'Understanding', 'Agents', 'Memories']
+  const editTabs = ['General', 'Repository', 'Dependencies', 'Rules', 'Build & Merge', 'Release', 'Debug', 'Capabilities', 'Members', 'Understanding', 'Agents', 'Memories']
   const activeTab = searchParams.get('tab') || editTabs[0]
   const setActiveTab = (t: string) => setSearchParams({ tab: t })
 
@@ -92,6 +96,9 @@ export default function ProjectSettingsPage() {
       setBuildCommands((settings?.build_commands as string[]) || [])
       setMergeMethod((settings?.merge_method as 'merge' | 'squash' | 'rebase') || 'squash')
       setRequireMergeApproval(!!settings?.require_merge_approval)
+      setRequirePlanApproval(!!settings?.require_plan_approval)
+      setReleaseEnabled(!!settings?.release_pipeline_enabled)
+      setReleaseConfig(settings?.release_config as ReleaseConfig || { build_provider: 'github_actions' })
       setArchitectEditorEnabled(!!p.architect_editor_enabled)
       setArchitectModel(p.architect_model || '')
       setEditorModel(p.editor_model || '')
@@ -265,6 +272,16 @@ export default function ProjectSettingsPage() {
             buildCommands={buildCommands} setBuildCommands={setBuildCommands}
             mergeMethod={mergeMethod} setMergeMethod={setMergeMethod}
             requireMergeApproval={requireMergeApproval} setRequireMergeApproval={setRequireMergeApproval}
+            requirePlanApproval={requirePlanApproval} setRequirePlanApproval={setRequirePlanApproval}
+            setError={setError}
+          />
+        )}
+
+        {activeTab === 'Release' && (
+          <ProjectReleaseTab
+            projectId={projectId!}
+            releaseEnabled={releaseEnabled} setReleaseEnabled={setReleaseEnabled}
+            releaseConfig={releaseConfig} setReleaseConfig={setReleaseConfig}
             setError={setError}
           />
         )}
@@ -419,7 +436,7 @@ export default function ProjectSettingsPage() {
         )}
 
         {/* Actions */}
-        {activeTab !== 'Understanding' && activeTab !== 'Agents' && activeTab !== 'Members' && activeTab !== 'Rules' && activeTab !== 'Build & Merge' && activeTab !== 'Debug' && (
+        {activeTab !== 'Understanding' && activeTab !== 'Agents' && activeTab !== 'Members' && activeTab !== 'Rules' && activeTab !== 'Build & Merge' && activeTab !== 'Release' && activeTab !== 'Debug' && (
           <div className="flex items-center gap-3 pt-2 flex-wrap">
             {userRole === 'owner' && (
               <button onClick={handleSave} disabled={saving} className="px-5 py-2 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 rounded-lg text-sm font-medium text-white transition-colors">

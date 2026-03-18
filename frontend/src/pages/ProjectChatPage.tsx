@@ -1,11 +1,12 @@
 import { useEffect, useRef, useState } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
-import { projectChat, projects as projectsApi, providers as providersApi } from '../services/api'
+import { projectChat, projects as projectsApi, providers as providersApi, todos as todosApi } from '../services/api'
 import PlanReviewCard from '../components/chat/PlanReviewCard'
 import { useChatSessionWebSocket } from '../hooks/useChatSessionWebSocket'
 import type { Project, ChatSession, ProjectChatMessage, ModelInfo, ChatMode, ChatExecutionInfo } from '../types'
 
 const chatModes: { key: ChatMode; label: string; hint: string }[] = [
+  { key: 'auto', label: 'Auto', hint: 'Automatically detects your intent' },
   { key: 'chat', label: 'General Chat', hint: 'Ask questions, discuss the project' },
   { key: 'plan', label: 'Plan', hint: 'Build a structured execution plan' },
   { key: 'debug', label: 'Debug', hint: 'Investigate bugs and issues' },
@@ -13,13 +14,29 @@ const chatModes: { key: ChatMode; label: string; hint: string }[] = [
 ]
 
 const modeStyles: Record<ChatMode, string> = {
+  auto: 'text-blue-400 bg-blue-500/10 border border-blue-500/20',
   chat: 'text-gray-400 hover:text-gray-300 bg-gray-900 border border-gray-800',
   plan: 'text-amber-400 bg-amber-500/10 border border-amber-500/20',
   debug: 'text-red-400 bg-red-500/10 border border-red-500/20',
   create_task: 'text-indigo-400 bg-indigo-500/10 border border-indigo-500/20',
 }
 
+const routingModeLabels: Record<string, string> = {
+  chat: 'Chat',
+  plan: 'Plan',
+  debug: 'Debug',
+  create_task: 'Task',
+}
+
+const routingModeColors: Record<string, string> = {
+  chat: 'text-gray-400 bg-gray-800',
+  plan: 'text-amber-400 bg-amber-500/10',
+  debug: 'text-red-400 bg-red-500/10',
+  create_task: 'text-indigo-400 bg-indigo-500/10',
+}
+
 const sendButtonStyles: Record<ChatMode, string> = {
+  auto: 'bg-blue-600 hover:bg-blue-500 disabled:bg-gray-800 disabled:text-gray-600',
   chat: 'bg-indigo-600 hover:bg-indigo-500 disabled:bg-gray-800 disabled:text-gray-600',
   plan: 'bg-amber-600 hover:bg-amber-500 disabled:bg-gray-800 disabled:text-gray-600',
   debug: 'bg-red-600 hover:bg-red-500 disabled:bg-gray-800 disabled:text-gray-600',
@@ -27,6 +44,7 @@ const sendButtonStyles: Record<ChatMode, string> = {
 }
 
 const sessionDotColors: Record<ChatMode, string> = {
+  auto: 'bg-blue-500',
   chat: 'bg-gray-600',
   plan: 'bg-amber-500',
   debug: 'bg-red-500',
@@ -91,6 +109,31 @@ function ExecutionDetails({ execution }: { execution: ChatExecutionInfo }) {
   )
 }
 
+function RawOutputToggle({ content }: { content: string }) {
+  const [open, setOpen] = useState(false)
+  return (
+    <div className="mt-1.5 border-t border-gray-800/50 pt-1.5">
+      <button
+        onClick={() => setOpen(!open)}
+        className="flex items-center gap-1 text-[11px] text-gray-600 hover:text-gray-400 transition-colors"
+      >
+        <svg
+          className={`w-3 h-3 transition-transform ${open ? 'rotate-90' : ''}`}
+          fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}
+        >
+          <path strokeLinecap="round" strokeLinejoin="round" d="M9 5l7 7-7 7" />
+        </svg>
+        <span>Tool loop output</span>
+      </button>
+      {open && (
+        <div className="mt-1.5 max-h-80 overflow-y-auto bg-gray-950 border border-gray-800/50 rounded-lg px-3 py-2 text-[11px] text-gray-500 whitespace-pre-wrap font-mono">
+          {content}
+        </div>
+      )}
+    </div>
+  )
+}
+
 export default function ProjectChatPage() {
   const { projectId } = useParams<{ projectId: string }>()
   const navigate = useNavigate()
@@ -105,11 +148,14 @@ export default function ProjectChatPage() {
   const [creatingSession, setCreatingSession] = useState(false)
   const messagesEnd = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLTextAreaElement>(null)
-  const { activity, clearActivity } = useChatSessionWebSocket(activeSessionId)
+  const { activity, streamingText, clearActivity } = useChatSessionWebSocket(activeSessionId)
   const [showFeedbackFor, setShowFeedbackFor] = useState<string | null>(null)
   const [feedbackInput, setFeedbackInput] = useState('')
   const [chatModels, setChatModels] = useState<ModelInfo[]>([])
   const [selectedModel, setSelectedModel] = useState('')
+  const [approvedTaskPlans, setApprovedTaskPlans] = useState<Set<string>>(new Set())
+  const [taskPlanFeedbackFor, setTaskPlanFeedbackFor] = useState<string | null>(null)
+  const [taskPlanFeedback, setTaskPlanFeedback] = useState('')
 
   useEffect(() => {
     if (!projectId) return
@@ -131,7 +177,7 @@ export default function ProjectChatPage() {
 
   useEffect(() => {
     messagesEnd.current?.scrollIntoView({ behavior: 'smooth' })
-  }, [messages])
+  }, [messages, streamingText])
 
   async function loadSessions() {
     if (!projectId) return
@@ -223,7 +269,8 @@ export default function ProjectChatPage() {
   }
 
   const activeSession = sessions.find((s) => s.id === activeSessionId)
-  const chatMode: ChatMode = (activeSession?.chat_mode as ChatMode) || (activeSession?.plan_mode ? 'plan' : 'chat')
+  const chatMode: ChatMode = (activeSession?.chat_mode as ChatMode) || (activeSession?.plan_mode ? 'plan' : 'auto')
+  const [lastRoutingMode, setLastRoutingMode] = useState<string>('chat')
 
   const handleSend = async (overrideContent?: string) => {
     const content = overrideContent || input.trim()
@@ -275,10 +322,29 @@ export default function ProjectChatPage() {
         )
       }
 
+      // Track auto-detected routing mode
+      if (result.routing_mode) {
+        setLastRoutingMode(result.routing_mode)
+      }
+
+      // Attach routing_mode to assistant message metadata for display
+      const assistantMsg = result.routing_mode
+        ? {
+            ...result.assistant_message,
+            metadata_json: {
+              ...(typeof result.assistant_message.metadata_json === 'string'
+                ? (() => { try { return JSON.parse(result.assistant_message.metadata_json) } catch { return {} } })()
+                : result.assistant_message.metadata_json || {}),
+              routing_mode: result.routing_mode,
+              mode_auto_switched: result.mode_auto_switched,
+            },
+          }
+        : result.assistant_message
+
       setMessages((prev) => [
         ...prev.filter((m) => m.id !== tempUserMsg.id),
         result.user_message,
-        result.assistant_message,
+        assistantMsg,
       ])
 
       // Refresh sessions list to pick up title changes
@@ -326,6 +392,67 @@ export default function ProjectChatPage() {
       setMessages((prev) => [...prev, errorMsg])
     } finally {
       setSending(false)
+    }
+  }
+
+  const handleApproveTaskPlan = async (taskId: string) => {
+    if (sending) return
+    setSending(true)
+    try {
+      await todosApi.approvePlan(taskId)
+      setApprovedTaskPlans((prev) => new Set(prev).add(taskId))
+      const confirmMsg: ProjectChatMessage = {
+        id: `plan-approved-${Date.now()}`,
+        project_id: projectId!,
+        user_id: '',
+        role: 'system',
+        content: 'Plan approved. Starting execution.',
+        created_at: new Date().toISOString(),
+      }
+      setMessages((prev) => [...prev, confirmMsg])
+    } catch (err) {
+      const errorMsg: ProjectChatMessage = {
+        id: `error-${Date.now()}`,
+        project_id: projectId!,
+        user_id: '',
+        role: 'system',
+        content: `Error: ${err instanceof Error ? err.message : 'Failed to approve plan'}`,
+        created_at: new Date().toISOString(),
+      }
+      setMessages((prev) => [...prev, errorMsg])
+    } finally {
+      setSending(false)
+    }
+  }
+
+  const handleRejectTaskPlan = async (taskId: string, feedback: string) => {
+    if (sending || !feedback.trim()) return
+    setSending(true)
+    try {
+      await todosApi.rejectPlan(taskId, feedback.trim())
+      const confirmMsg: ProjectChatMessage = {
+        id: `plan-rejected-${Date.now()}`,
+        project_id: projectId!,
+        user_id: '',
+        role: 'system',
+        content: `Plan rejected with feedback: "${feedback.trim()}". Re-planning...`,
+        created_at: new Date().toISOString(),
+      }
+      setMessages((prev) => [...prev, confirmMsg])
+    } catch (err) {
+      const errorMsg: ProjectChatMessage = {
+        id: `error-${Date.now()}`,
+        project_id: projectId!,
+        user_id: '',
+        role: 'system',
+        content: `Error: ${err instanceof Error ? err.message : 'Failed to reject plan'}`,
+        created_at: new Date().toISOString(),
+      }
+      setMessages((prev) => [...prev, errorMsg])
+    } finally {
+      setSending(false)
+      setTaskPlanFeedbackFor(null)
+      setTaskPlanFeedback('')
     }
   }
 
@@ -488,11 +615,14 @@ export default function ProjectChatPage() {
                 <h1 className="text-sm font-medium text-white">{project.name}</h1>
                 {chatMode !== 'chat' && (
                   <span className={`px-1.5 py-0.5 rounded text-[10px] ${
-                    chatMode === 'plan' ? 'bg-amber-500/10 text-amber-400'
+                    chatMode === 'auto' ? 'bg-blue-500/10 text-blue-400'
+                    : chatMode === 'plan' ? 'bg-amber-500/10 text-amber-400'
                     : chatMode === 'debug' ? 'bg-red-500/10 text-red-400'
                     : 'bg-indigo-500/10 text-indigo-400'
                   }`}>
-                    {chatModes.find(m => m.key === chatMode)?.label}
+                    {chatMode === 'auto'
+                      ? `Auto${lastRoutingMode !== 'chat' ? ` \u2192 ${routingModeLabels[lastRoutingMode] || lastRoutingMode}` : ''}`
+                      : chatModes.find(m => m.key === chatMode)?.label}
                   </span>
                 )}
               </div>
@@ -532,13 +662,16 @@ export default function ProjectChatPage() {
             <div className="flex flex-col items-center justify-center h-full px-6">
               <div className="max-w-md text-center mb-8">
                 <h2 className="text-lg font-medium text-white mb-2">
-                  {chatMode === 'plan' ? 'Plan your project'
+                  {chatMode === 'auto' ? 'What would you like to do?'
+                    : chatMode === 'plan' ? 'Plan your project'
                     : chatMode === 'debug' ? 'Debug an issue'
                     : chatMode === 'create_task' ? 'Create a task'
                     : 'What would you like to do?'}
                 </h2>
                 <p className="text-sm text-gray-500">
-                  {chatMode === 'plan'
+                  {chatMode === 'auto'
+                    ? `Ask anything — I'll automatically detect whether to chat, plan, debug, or create tasks for ${project.name}.`
+                    : chatMode === 'plan'
                     ? 'Discuss scope and requirements. When ready, I\'ll generate a structured plan with tasks and subtasks.'
                     : chatMode === 'debug'
                     ? 'Describe the bug or issue and I\'ll help investigate using code search, logs, and available tools.'
@@ -549,7 +682,11 @@ export default function ProjectChatPage() {
               </div>
 
               <div className="space-y-2 w-full max-w-md">
-                {(chatMode === 'plan' ? [
+                {(chatMode === 'auto' ? [
+                  'I want to build a new feature — let\'s plan it out',
+                  'There\'s a bug in the login flow — help me debug it',
+                  'What does this project do?',
+                ] : chatMode === 'plan' ? [
                   'I want to build a new feature — let\'s plan it out',
                   'Help me plan the next sprint for this project',
                   'I need to refactor the authentication module',
@@ -602,6 +739,11 @@ export default function ProjectChatPage() {
                     </div>
                     {msg.role === 'assistant' ? (
                       <div className="space-y-2">
+                        {chatMode === 'auto' && meta?.routing_mode && (
+                          <span className={`inline-block px-1.5 py-0.5 rounded text-[10px] font-medium mb-1 ${routingModeColors[meta.routing_mode] || 'text-gray-400 bg-gray-800'} ${meta.mode_auto_switched ? 'animate-pulse' : ''}`}>
+                            {routingModeLabels[meta.routing_mode] || meta.routing_mode}
+                          </span>
+                        )}
                         <RenderMarkdown content={msg.content} />
                         {/* Task created badge */}
                         {meta?.action === 'task_created' && meta.task_id && (
@@ -660,6 +802,94 @@ export default function ProjectChatPage() {
                             <span className="text-xs text-emerald-400">
                               Plan accepted — {String(meta?.tasks_created ?? 0)} tasks created
                             </span>
+                          </div>
+                        )}
+                        {/* Task plan ready — orchestrator generated plan, needs user approval */}
+                        {meta?.action === 'task_plan_ready' && meta.task_id && !approvedTaskPlans.has(meta.task_id) && (
+                          <div className="mt-2 bg-gray-950 border border-cyan-500/20 rounded-lg overflow-hidden">
+                            <div className="px-3 py-2 border-b border-gray-800/50 flex items-center gap-2">
+                              <svg className="w-3.5 h-3.5 text-cyan-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                                <path strokeLinecap="round" strokeLinejoin="round" d="M9 12h3.75M9 15h3.75M9 18h3.75m3 .75H18a2.25 2.25 0 002.25-2.25V6.108c0-1.135-.845-2.098-1.976-2.192a48.424 48.424 0 00-1.123-.08m-5.801 0c-.065.21-.1.433-.1.664 0 .414.336.75.75.75h4.5a.75.75 0 00.75-.75 2.25 2.25 0 00-.1-.664m-5.8 0A2.251 2.251 0 0113.5 2.25H15c1.012 0 1.867.668 2.15 1.586m-5.8 0c-.376.023-.75.05-1.124.08C9.095 4.01 8.25 4.973 8.25 6.108V8.25m0 0H4.875c-.621 0-1.125.504-1.125 1.125v11.25c0 .621.504 1.125 1.125 1.125h9.75c.621 0 1.125-.504 1.125-1.125V9.375c0-.621-.504-1.125-1.125-1.125H8.25z" />
+                              </svg>
+                              <span className="text-xs font-medium text-cyan-400">Execution Plan</span>
+                              <span className="text-[10px] text-gray-600">
+                                {meta.plan_data?.sub_tasks?.length ?? 0} sub-tasks
+                              </span>
+                            </div>
+                            {meta.plan_data?.sub_tasks && (
+                              <div className="px-3 py-2 space-y-1">
+                                {meta.plan_data.sub_tasks.map((st: { title: string; agent_role: string; description?: string }, i: number) => (
+                                  <div key={i} className="flex items-start gap-2 text-xs">
+                                    <span className="px-1.5 py-0.5 bg-gray-800 rounded text-[10px] text-gray-500 font-mono shrink-0">
+                                      {st.agent_role}
+                                    </span>
+                                    <span className="text-gray-400">{st.title}</span>
+                                  </div>
+                                ))}
+                              </div>
+                            )}
+                            <div className="px-3 py-2 border-t border-gray-800/50">
+                              {taskPlanFeedbackFor === meta.task_id ? (
+                                <div className="flex items-center gap-2">
+                                  <input
+                                    type="text"
+                                    value={taskPlanFeedback}
+                                    onChange={(e) => setTaskPlanFeedback(e.target.value)}
+                                    onKeyDown={(e) => {
+                                      if (e.key === 'Enter' && taskPlanFeedback.trim()) {
+                                        handleRejectTaskPlan(meta.task_id!, taskPlanFeedback)
+                                      }
+                                      if (e.key === 'Escape') {
+                                        setTaskPlanFeedbackFor(null)
+                                        setTaskPlanFeedback('')
+                                      }
+                                    }}
+                                    placeholder="What should change?"
+                                    className="flex-1 px-3 py-1.5 bg-gray-900 border border-gray-800 rounded-lg text-xs text-white focus:outline-none focus:border-cyan-500/50 transition-colors"
+                                    autoFocus
+                                  />
+                                  <button
+                                    onClick={() => handleRejectTaskPlan(meta.task_id!, taskPlanFeedback)}
+                                    disabled={!taskPlanFeedback.trim() || sending}
+                                    className="px-2.5 py-1.5 bg-gray-800 hover:bg-gray-700 disabled:opacity-40 rounded-lg text-xs text-gray-300 transition-colors"
+                                  >
+                                    Send
+                                  </button>
+                                  <button
+                                    onClick={() => { setTaskPlanFeedbackFor(null); setTaskPlanFeedback('') }}
+                                    className="text-[11px] text-gray-600 hover:text-gray-400 transition-colors"
+                                  >
+                                    Cancel
+                                  </button>
+                                </div>
+                              ) : (
+                                <div className="flex items-center gap-2">
+                                  <button
+                                    onClick={() => handleApproveTaskPlan(meta.task_id!)}
+                                    disabled={sending}
+                                    className="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 rounded-lg text-xs font-medium text-white transition-colors"
+                                  >
+                                    Approve Plan
+                                  </button>
+                                  <button
+                                    onClick={() => setTaskPlanFeedbackFor(meta.task_id!)}
+                                    disabled={sending}
+                                    className="px-3 py-1.5 bg-gray-800 hover:bg-gray-700 disabled:opacity-50 rounded-lg text-xs text-gray-400 transition-colors"
+                                  >
+                                    Reject with Feedback
+                                  </button>
+                                </div>
+                              )}
+                            </div>
+                          </div>
+                        )}
+                        {/* Task plan approved badge */}
+                        {meta?.action === 'task_plan_ready' && meta.task_id && approvedTaskPlans.has(meta.task_id) && (
+                          <div className="flex items-center gap-2 px-3 py-1.5 bg-emerald-500/5 border border-emerald-500/20 rounded-lg mt-1">
+                            <svg className="w-3.5 h-3.5 text-emerald-400 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                              <path strokeLinecap="round" strokeLinejoin="round" d="M4.5 12.75l6 6 9-13.5" />
+                            </svg>
+                            <span className="text-xs text-emerald-400">Plan approved — executing</span>
                           </div>
                         )}
                         {/* Quick-action buttons: only show when there's a pending plan_proposed that hasn't been accepted */}
@@ -735,6 +965,10 @@ export default function ProjectChatPage() {
                         {meta?.execution && (
                           <ExecutionDetails execution={meta.execution} />
                         )}
+                        {/* Raw tool loop output (collapsible) */}
+                        {meta?.raw_output && (
+                          <RawOutputToggle content={meta.raw_output} />
+                        )}
                       </div>
                     ) : (
                       <div className="whitespace-pre-wrap">{msg.content}</div>
@@ -744,9 +978,14 @@ export default function ProjectChatPage() {
               )})}
               {sending && (
                 <div className="flex justify-start">
-                  <div className="bg-gray-900 border border-gray-800 rounded-xl px-4 py-2.5 text-sm text-gray-500">
-                    {activity ? (
-                      <span className="inline-flex items-center gap-2">
+                  <div className={`bg-gray-900 border border-gray-800 rounded-xl px-4 py-2.5 text-sm ${streamingText ? 'max-w-[80%]' : ''}`}>
+                    {streamingText ? (
+                      <div className="text-gray-300 whitespace-pre-wrap max-h-60 overflow-y-auto">
+                        {streamingText}
+                        <span className="inline-block w-1.5 h-4 bg-indigo-400 animate-pulse ml-0.5 align-text-bottom rounded-sm" />
+                      </div>
+                    ) : activity ? (
+                      <span className="inline-flex items-center gap-2 text-gray-500">
                         <svg className="w-3 h-3 animate-spin text-indigo-400" fill="none" viewBox="0 0 24 24">
                           <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
                           <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
@@ -754,7 +993,7 @@ export default function ProjectChatPage() {
                         <span className="text-gray-400">{activity}</span>
                       </span>
                     ) : (
-                      <span className="inline-flex gap-1">
+                      <span className="inline-flex gap-1 text-gray-500">
                         <span className="animate-pulse">Thinking</span>
                         <span className="animate-bounce" style={{ animationDelay: '0.1s' }}>.</span>
                         <span className="animate-bounce" style={{ animationDelay: '0.2s' }}>.</span>
@@ -821,6 +1060,7 @@ export default function ProjectChatPage() {
                 onKeyDown={handleKeyDown}
                 placeholder={
                   sending ? 'Inject guidance into the running agent...'
+                  : chatMode === 'auto' ? 'Ask anything — intent auto-detected...'
                   : chatMode === 'plan' ? 'Describe what you want to plan...'
                   : chatMode === 'debug' ? 'Describe the bug or issue...'
                   : chatMode === 'create_task' ? 'Describe the task to create...'
@@ -872,6 +1112,7 @@ export default function ProjectChatPage() {
 /** Mode icon for the dropdown */
 function ModeIcon({ mode }: { mode: ChatMode }) {
   const paths: Record<ChatMode, string> = {
+    auto: 'M9.813 15.904L9 18.75l-.813-2.846a4.5 4.5 0 00-3.09-3.09L2.25 12l2.846-.813a4.5 4.5 0 003.09-3.09L9 5.25l.813 2.846a4.5 4.5 0 003.09 3.09L15.75 12l-2.846.813a4.5 4.5 0 00-3.09 3.09zM18.259 8.715L18 9.75l-.259-1.035a3.375 3.375 0 00-2.455-2.456L14.25 6l1.036-.259a3.375 3.375 0 002.455-2.456L18 2.25l.259 1.035a3.375 3.375 0 002.455 2.456L21.75 6l-1.036.259a3.375 3.375 0 00-2.455 2.456z',
     chat: 'M7.5 8.25h9m-9 3H12m-9.75 1.51c0 1.6 1.123 2.994 2.707 3.227 1.129.166 2.27.293 3.423.379.35.026.67.21.865.501L12 21l2.755-4.133a1.14 1.14 0 01.865-.501 48.172 48.172 0 003.423-.379c1.584-.233 2.707-1.626 2.707-3.228V6.741c0-1.602-1.123-2.995-2.707-3.228A48.394 48.394 0 0012 3c-2.392 0-4.744.175-7.043.513C3.373 3.746 2.25 5.14 2.25 6.741v6.018z',
     plan: 'M9 12h3.75M9 15h3.75M9 18h3.75m3 .75H18a2.25 2.25 0 002.25-2.25V6.108c0-1.135-.845-2.098-1.976-2.192a48.424 48.424 0 00-1.123-.08m-5.801 0c-.065.21-.1.433-.1.664 0 .414.336.75.75.75h4.5a.75.75 0 00.75-.75 2.25 2.25 0 00-.1-.664m-5.8 0A2.251 2.251 0 0113.5 2.25H15c1.012 0 1.867.668 2.15 1.586m-5.8 0c-.376.023-.75.05-1.124.08C9.095 4.01 8.25 4.973 8.25 6.108V8.25m0 0H4.875c-.621 0-1.125.504-1.125 1.125v11.25c0 .621.504 1.125 1.125 1.125h9.75c.621 0 1.125-.504 1.125-1.125V9.375c0-.621-.504-1.125-1.125-1.125H8.25z',
     debug: 'M12 12.75c1.148 0 2.278.08 3.383.237 1.037.146 1.866.966 1.866 2.013 0 3.728-2.35 6.75-5.25 6.75S6.75 18.728 6.75 15c0-1.046.83-1.867 1.866-2.013A24.204 24.204 0 0112 12.75zm0 0c2.883 0 5.647.508 8.207 1.44a23.91 23.91 0 01-1.152-6.135c-.078-.759-.633-1.38-1.398-1.43A22.38 22.38 0 0012 6.375c-1.94 0-3.84.158-5.657.46-.764.05-1.32.671-1.398 1.43a23.91 23.91 0 01-1.152 6.135A24.084 24.084 0 0112 12.75zM9.75 8.625a.375.375 0 11-.75 0 .375.375 0 01.75 0zm4.5 0a.375.375 0 11-.75 0 .375.375 0 01.75 0z',

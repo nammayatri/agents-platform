@@ -102,6 +102,53 @@ Output a JSON object with these keys:
 - "summary": string (1 paragraph executive summary)
 """
 
+DEP_ANALYZER_SYSTEM_PROMPT = """\
+You are a dependency analyst. Given a dependency repository's directory structure, \
+documentation, configuration, and sampled source code, produce a structured understanding \
+focused on how a consumer would integrate with this project.
+
+Your analysis should cover:
+1. **Purpose**: What this dependency does, its core value proposition
+2. **Architecture**: High-level structure, key modules/components
+3. **Tech stack**: Languages, frameworks
+4. **Key patterns**: Coding conventions, API design patterns
+5. **API surface**: Key exports, public interfaces, endpoints, or entry points that \
+consumers use — be specific about function signatures, class names, route paths
+6. **Exports**: List of main exported modules, classes, functions, or types
+7. **Important context**: Anything an AI agent should know when working with code \
+that depends on this project
+
+Output a JSON object with these keys:
+- "purpose": string (2-3 sentences)
+- "architecture": string (paragraph describing structure)
+- "tech_stack": list of strings
+- "key_patterns": list of strings (important conventions)
+- "api_surface": string (detailed description of key public interfaces)
+- "exports": list of strings (main exported modules/classes/functions)
+- "important_context": list of strings (things an agent must know)
+- "summary": string (1 paragraph executive summary)
+"""
+
+LINKING_SYSTEM_PROMPT = """\
+You are a cross-repo integration analyst. Given the understanding of a main project and \
+its dependency repos, plus cross-repo integration points found in the code, produce a \
+document describing how all the repositories work together.
+
+Your analysis should cover:
+1. **Overview**: How the repos relate to each other at a high level
+2. **Integrations**: Specific integration points between repos — API calls, shared \
+packages, imports, configuration references, data flow
+3. **Shared types**: Types, interfaces, or schemas shared across repos
+4. **Ownership**: Which repo owns what responsibility
+
+Output a JSON object with these keys:
+- "overview": string (2-3 paragraphs describing how repos work together)
+- "integrations": list of {"source_repo": string, "target_repo": string, \
+"pattern": string, "shared_interfaces": list of strings, "data_flow": string}
+- "shared_types": list of strings (shared type/interface names)
+- "architecture_diagram_text": string (ASCII or text description of how repos connect)
+"""
+
 
 class ProjectAnalyzer:
     def __init__(self, db: asyncpg.Pool, redis=None):
@@ -136,7 +183,7 @@ class ProjectAnalyzer:
 
         # Mark as analyzing
         await self._update_settings(project_id, {"analysis_status": "analyzing"})
-        await self._publish_progress(project_id, "cloning", "Cloning repository...")
+        await self._publish_progress(project_id, "cloning", "Fetching latest code from all repos...")
 
         try:
             # Clone/pull the repo into workspace (deps cloned in parallel internally)
@@ -240,6 +287,127 @@ class ProjectAnalyzer:
                     logger.info("Project %s: code indexes built at %s", project_id, project_index_dir)
                 except Exception:
                     logger.warning("Project %s: code indexing failed (non-fatal)", project_id, exc_info=True)
+
+                # Per-dependency LLM analysis
+                dep_understandings: dict[str, dict] = {}
+                if context_docs and dep_summaries:
+                    total_deps = len(dep_summaries)
+                    for idx, ds in enumerate(dep_summaries, 1):
+                        dep_name = ds["name"]
+                        dep_dir_name = dep_name.replace("/", "_").replace(" ", "_")
+                        dep_dir = os.path.join(deps_dir, dep_dir_name)
+                        if not os.path.isdir(dep_dir):
+                            continue
+                        await self._publish_progress(
+                            project_id, "dep_analysis",
+                            f"Analyzing dependency: {dep_name} ({idx}/{total_deps})",
+                        )
+                        try:
+                            dep_config = next(
+                                (d for d in context_docs if d.get("name") == dep_name), {}
+                            )
+                            dep_u = await self._analyze_single_dependency(
+                                dep_name, dep_dir, dep_config, provider,
+                            )
+                            if dep_u:
+                                dep_understandings[dep_name] = dep_u
+                        except Exception:
+                            logger.warning(
+                                "Project %s: dep analysis failed for %s (non-fatal)",
+                                project_id, dep_name, exc_info=True,
+                            )
+
+                # Generate cross-repo linking document
+                linking_document = None
+                if dep_understandings:
+                    await self._publish_progress(
+                        project_id, "linking", "Building cross-repo linking document...",
+                    )
+                    try:
+                        linking_document = await self._generate_linking_document(
+                            project_name=project["name"],
+                            main_understanding=analysis,
+                            dep_understandings=dep_understandings,
+                            integration_points=integration_points or {},
+                            provider=provider,
+                        )
+                    except Exception:
+                        logger.warning(
+                            "Project %s: linking document generation failed (non-fatal)",
+                            project_id, exc_info=True,
+                        )
+                    # If LLM-based linking failed, build a deterministic fallback
+                    if not linking_document or linking_document.get("raw"):
+                        linking_document = self._build_deterministic_linking(
+                            project_name=project["name"],
+                            dep_understandings=dep_understandings,
+                            integration_points=integration_points or {},
+                        )
+
+                # Per-dependency code indexing
+                index_metadata: dict = {"main": {}, "deps": {}}
+                if context_docs:
+                    await self._publish_progress(
+                        project_id, "dep_indexing", "Indexing dependency repos...",
+                    )
+                    for dep in context_docs:
+                        dep_name = dep.get("name", "")
+                        dep_dir_name = dep_name.replace("/", "_").replace(" ", "_")
+                        dep_dir = os.path.join(deps_dir, dep_dir_name)
+                        if not dep_dir_name or not os.path.isdir(dep_dir):
+                            continue
+                        await self._publish_progress(
+                            project_id, "dep_indexing",
+                            f"Indexing: {dep_name}",
+                        )
+                        try:
+                            dep_index_dir = os.path.join(
+                                workspace_path, ".agent_index_deps", dep_dir_name,
+                            )
+                            dep_repo_map = await asyncio.to_thread(
+                                build_indexes_and_repo_map,
+                                dep_dir,
+                                cache_dir=dep_index_dir,
+                            )
+                            logger.info(
+                                "Project %s: dep index built for %s at %s",
+                                project_id, dep_name, dep_index_dir,
+                            )
+                            index_metadata["deps"][dep_name] = {
+                                "indexed": True,
+                                "has_repo_map": bool(dep_repo_map),
+                            }
+                        except Exception:
+                            logger.warning(
+                                "Project %s: dep indexing failed for %s (non-fatal)",
+                                project_id, dep_name, exc_info=True,
+                            )
+
+                # Store all new data
+                extra_settings: dict = {}
+                if dep_understandings:
+                    extra_settings["dep_understandings"] = dep_understandings
+                if linking_document:
+                    extra_settings["linking_document"] = linking_document
+                if index_metadata.get("deps"):
+                    extra_settings["index_metadata"] = index_metadata
+                if extra_settings:
+                    await self._update_settings(project_id, extra_settings)
+
+                # Write context files to workspace for agent self-serve reads
+                try:
+                    self.write_context_files(
+                        workspace_path=workspace_path,
+                        project_name=project["name"],
+                        understanding=analysis,
+                        dep_understandings=dep_understandings or None,
+                        linking_document=linking_document,
+                    )
+                    logger.info("Project %s: context files written to %s/.context/",
+                                project_id, workspace_path)
+                except Exception:
+                    logger.warning("Project %s: failed to write context files (non-fatal)",
+                                   project_id, exc_info=True)
 
                 await self._publish_progress(project_id, "complete", "Analysis complete")
                 return analysis
@@ -628,8 +796,144 @@ class ProjectAnalyzer:
             logger.warning("LLM analysis timed out for project")
             return None
 
+        return self._parse_json_response(response.content)
+
+    async def _analyze_single_dependency(
+        self, dep_name: str, dep_dir: str, dep_config: dict, provider,
+    ) -> dict | None:
+        """Run a full LLM analysis on a single dependency repo."""
+        sampled = self._smart_sample(dep_dir)
+        if not sampled["files"]:
+            return None
+
+        files_text = ""
+        for f in sampled["files"]:
+            files_text += f"\n--- [{f['category']}] {f['path']} ---\n{f['content']}\n"
+
+        desc = dep_config.get("description", "")
+        messages = [
+            LLMMessage(role="system", content=DEP_ANALYZER_SYSTEM_PROMPT),
+            LLMMessage(
+                role="user",
+                content=(
+                    f"Dependency: {dep_name}\n"
+                    f"Description: {desc or 'N/A'}\n"
+                    f"Repo URL: {dep_config.get('repo_url', 'N/A')}\n\n"
+                    f"Directory structure:\n{sampled['tree']}\n\n"
+                    f"Sampled files ({len(sampled['files'])} files):\n"
+                    f"{files_text}"
+                ),
+            ),
+        ]
+
         try:
-            text = response.content.strip()
+            response = await asyncio.wait_for(
+                provider.send_message(messages, temperature=0.1),
+                timeout=120,
+            )
+        except asyncio.TimeoutError:
+            logger.warning("Dep analysis timed out for %s", dep_name)
+            return None
+
+        return self._parse_json_response(response.content)
+
+    async def _generate_linking_document(
+        self,
+        project_name: str,
+        main_understanding: dict,
+        dep_understandings: dict[str, dict],
+        integration_points: dict[str, list[str]],
+        provider,
+    ) -> dict | None:
+        """Generate a cross-repo linking document describing how repos work together."""
+        # Build context from understandings
+        main_summary = main_understanding.get("summary", "")
+        main_purpose = main_understanding.get("purpose", "")
+
+        deps_context = ""
+        for dep_name, dep_u in dep_understandings.items():
+            deps_context += f"\n--- {dep_name} ---\n"
+            deps_context += f"Purpose: {dep_u.get('purpose', 'N/A')}\n"
+            deps_context += f"API surface: {dep_u.get('api_surface', 'N/A')}\n"
+            exports = dep_u.get("exports", [])
+            if exports:
+                deps_context += f"Exports: {', '.join(exports[:20])}\n"
+            deps_context += f"Summary: {dep_u.get('summary', 'N/A')}\n"
+
+        integration_text = ""
+        if integration_points:
+            integration_text = "\n\nCross-repo references found in main repo:\n"
+            for dep_name, hits in integration_points.items():
+                if hits:
+                    integration_text += f"\n{dep_name} ({len(hits)} references):\n"
+                    for hit in hits[:10]:
+                        integration_text += f"  {hit}\n"
+
+        messages = [
+            LLMMessage(role="system", content=LINKING_SYSTEM_PROMPT),
+            LLMMessage(
+                role="user",
+                content=(
+                    f"Main project: {project_name}\n"
+                    f"Purpose: {main_purpose}\n"
+                    f"Summary: {main_summary}\n\n"
+                    f"Dependency repos:\n{deps_context}"
+                    f"{integration_text}"
+                ),
+            ),
+        ]
+
+        try:
+            response = await asyncio.wait_for(
+                provider.send_message(messages, temperature=0.1),
+                timeout=180,
+            )
+        except asyncio.TimeoutError:
+            logger.warning("Linking document generation timed out")
+            return None
+
+        return self._parse_json_response(response.content)
+
+    @staticmethod
+    def _build_deterministic_linking(
+        project_name: str,
+        dep_understandings: dict[str, dict],
+        integration_points: dict[str, list[str]],
+    ) -> dict:
+        """Build a deterministic linking document from available data (no LLM)."""
+        dep_names = list(dep_understandings.keys())
+        overview_parts = [
+            f"{project_name} integrates with {len(dep_names)} "
+            f"dependency repo{'s' if len(dep_names) != 1 else ''}: "
+            f"{', '.join(dep_names)}."
+        ]
+        for dn, du in dep_understandings.items():
+            purpose = du.get("purpose", "")
+            if purpose:
+                overview_parts.append(f"  - {dn}: {purpose}")
+
+        integrations = []
+        for dep_name, hits in integration_points.items():
+            if hits:
+                files = list({h.split(":")[0] for h in hits[:10]})
+                integrations.append({
+                    "source_repo": project_name,
+                    "target_repo": dep_name,
+                    "pattern": f"Referenced in {len(hits)} location(s)",
+                    "shared_interfaces": files[:5],
+                    "data_flow": "",
+                })
+
+        return {
+            "overview": "\n".join(overview_parts),
+            "integrations": integrations,
+            "shared_types": [],
+        }
+
+    def _parse_json_response(self, content: str) -> dict | None:
+        """Parse a JSON response from LLM, handling markdown fences."""
+        try:
+            text = content.strip()
             # Strip markdown code fences
             if text.startswith("```"):
                 lines = text.split("\n")
@@ -640,23 +944,56 @@ class ProjectAnalyzer:
                 else:
                     text = "\n".join(lines[start:])
 
-            # Extract JSON object
+            # Try direct parse first (handles clean JSON)
+            try:
+                return json.loads(text)
+            except (json.JSONDecodeError, ValueError):
+                pass
+
+            # Extract JSON using string-aware brace matching
             brace_start = text.find("{")
             if brace_start >= 0:
                 depth = 0
+                in_string = False
+                escape_next = False
                 for i in range(brace_start, len(text)):
-                    if text[i] == "{":
+                    c = text[i]
+                    if escape_next:
+                        escape_next = False
+                        continue
+                    if c == "\\":
+                        escape_next = True
+                        continue
+                    if c == '"' and not escape_next:
+                        in_string = not in_string
+                        continue
+                    if in_string:
+                        continue
+                    if c == "{":
                         depth += 1
-                    elif text[i] == "}":
+                    elif c == "}":
                         depth -= 1
                         if depth == 0:
-                            text = text[brace_start:i + 1]
-                            break
+                            candidate = text[brace_start:i + 1]
+                            try:
+                                return json.loads(candidate)
+                            except (json.JSONDecodeError, ValueError):
+                                break
 
-            return json.loads(text)
-        except (json.JSONDecodeError, ValueError):
-            logger.warning("Failed to parse analysis JSON, storing raw response")
-            return {"summary": response.content, "raw": True}
+            # Last resort: find any JSON object in the text
+            import re
+            json_match = re.search(r'\{[\s\S]*\}', text)
+            if json_match:
+                try:
+                    return json.loads(json_match.group())
+                except (json.JSONDecodeError, ValueError):
+                    pass
+
+            logger.warning("Failed to parse JSON response, storing raw")
+            return {"summary": content, "raw": True}
+        except Exception:
+            logger.warning("Failed to parse JSON response", exc_info=True)
+            return {"summary": content, "raw": True}
 
     async def _update_settings(self, project_id: str, updates: dict) -> None:
         """Merge keys into the project's settings_json."""
@@ -674,3 +1011,193 @@ class ProjectAnalyzer:
             project_id,
             current_settings,
         )
+
+    # ---- Context files (written to workspace for agent self-serve) ----
+
+    @staticmethod
+    def write_context_files(
+        workspace_path: str,
+        project_name: str,
+        understanding: dict | None,
+        dep_understandings: dict[str, dict] | None,
+        linking_document: dict | None,
+    ) -> None:
+        """Write understanding data as readable markdown files in .context/.
+
+        These files let agents self-serve project context via read_file()
+        instead of having it injected into every system prompt.
+        """
+        context_dir = os.path.join(workspace_path, ".context")
+        os.makedirs(context_dir, exist_ok=True)
+
+        # Main repo understanding
+        if understanding and isinstance(understanding, dict):
+            md = _format_understanding_md(project_name, understanding)
+            with open(os.path.join(context_dir, "UNDERSTANDING.md"), "w") as f:
+                f.write(md)
+
+        # Per-dep understandings
+        if dep_understandings and isinstance(dep_understandings, dict):
+            deps_dir = os.path.join(context_dir, "deps")
+            os.makedirs(deps_dir, exist_ok=True)
+            for dep_name, dep_u in dep_understandings.items():
+                if not isinstance(dep_u, dict):
+                    continue
+                safe_name = dep_name.replace("/", "_").replace(" ", "_")
+                md = _format_dep_understanding_md(dep_name, dep_u)
+                with open(os.path.join(deps_dir, f"{safe_name}.md"), "w") as f:
+                    f.write(md)
+
+        # Linking document
+        if linking_document and isinstance(linking_document, dict):
+            md = _format_linking_md(project_name, linking_document)
+            with open(os.path.join(context_dir, "LINKING.md"), "w") as f:
+                f.write(md)
+
+
+# ---- Markdown formatting helpers (module-level) ----
+
+def _format_understanding_md(project_name: str, u: dict) -> str:
+    """Format a project understanding dict as readable markdown."""
+    lines = [f"# {project_name}\n"]
+
+    summary = u.get("summary", "")
+    if summary:
+        lines.append(f"## Summary\n{summary}\n")
+
+    tech = u.get("tech_stack")
+    if tech:
+        if isinstance(tech, list):
+            lines.append("## Tech Stack\n" + "\n".join(f"- {t}" for t in tech) + "\n")
+        elif isinstance(tech, str):
+            lines.append(f"## Tech Stack\n{tech}\n")
+
+    arch = u.get("architecture", "")
+    if arch:
+        lines.append(f"## Architecture\n{arch}\n")
+
+    patterns = u.get("key_patterns")
+    if patterns:
+        if isinstance(patterns, list):
+            lines.append("## Key Patterns\n" + "\n".join(f"- {p}" for p in patterns) + "\n")
+        elif isinstance(patterns, str):
+            lines.append(f"## Key Patterns\n{patterns}\n")
+
+    deps_map = u.get("dependency_map")
+    if deps_map and isinstance(deps_map, list):
+        lines.append("## Dependencies\n")
+        for d in deps_map:
+            if isinstance(d, dict):
+                name = d.get("name", "?")
+                role = d.get("role", "")
+                lines.append(f"- **{name}**: {role}")
+        lines.append("")
+
+    cross_links = u.get("cross_repo_links")
+    if cross_links and isinstance(cross_links, list):
+        lines.append("## Cross-Repo Integration Points\n")
+        for link in cross_links:
+            if isinstance(link, dict):
+                dep = link.get("dep_name", "?")
+                pattern = link.get("integration_pattern", "")
+                lines.append(f"- **{dep}**: {pattern}")
+                main_files = link.get("main_repo_files", [])
+                if main_files:
+                    lines.append(f"  Files: {', '.join(main_files[:5])}")
+        lines.append("")
+
+    important = u.get("important_context")
+    if important:
+        if isinstance(important, list):
+            lines.append("## Important Context\n" + "\n".join(f"- {c}" for c in important) + "\n")
+        elif isinstance(important, str):
+            lines.append(f"## Important Context\n{important}\n")
+
+    return "\n".join(lines)
+
+
+def _format_dep_understanding_md(dep_name: str, u: dict) -> str:
+    """Format a dependency understanding dict as readable markdown."""
+    lines = [f"# {dep_name}\n"]
+
+    purpose = u.get("purpose", "")
+    if purpose:
+        lines.append(f"## Purpose\n{purpose}\n")
+
+    summary = u.get("summary", "")
+    if summary and summary != purpose:
+        lines.append(f"## Summary\n{summary}\n")
+
+    tech = u.get("tech_stack")
+    if tech:
+        if isinstance(tech, list):
+            lines.append("## Tech Stack\n" + "\n".join(f"- {t}" for t in tech) + "\n")
+        elif isinstance(tech, str):
+            lines.append(f"## Tech Stack\n{tech}\n")
+
+    arch = u.get("architecture", "")
+    if arch:
+        lines.append(f"## Architecture\n{arch}\n")
+
+    api = u.get("api_surface", "")
+    if api:
+        lines.append(f"## API Surface\n{api}\n")
+
+    exports = u.get("exports")
+    if exports and isinstance(exports, list):
+        lines.append("## Key Exports\n" + "\n".join(f"- `{e}`" for e in exports) + "\n")
+
+    patterns = u.get("key_patterns")
+    if patterns:
+        if isinstance(patterns, list):
+            lines.append("## Key Patterns\n" + "\n".join(f"- {p}" for p in patterns) + "\n")
+        elif isinstance(patterns, str):
+            lines.append(f"## Key Patterns\n{patterns}\n")
+
+    important = u.get("important_context")
+    if important:
+        if isinstance(important, list):
+            lines.append("## Important Context\n" + "\n".join(f"- {c}" for c in important) + "\n")
+        elif isinstance(important, str):
+            lines.append(f"## Important Context\n{important}\n")
+
+    return "\n".join(lines)
+
+
+def _format_linking_md(project_name: str, ld: dict) -> str:
+    """Format a linking document dict as readable markdown."""
+    lines = [f"# Cross-Repo Architecture: {project_name}\n"]
+
+    overview = ld.get("overview", "")
+    if overview:
+        lines.append(f"## Overview\n{overview}\n")
+
+    integrations = ld.get("integrations")
+    if integrations and isinstance(integrations, list):
+        lines.append("## Integrations\n")
+        for intg in integrations:
+            if not isinstance(intg, dict):
+                continue
+            src = intg.get("source_repo", "?")
+            tgt = intg.get("target_repo", "?")
+            pattern = intg.get("pattern", "")
+            lines.append(f"### {src} -> {tgt}")
+            if pattern:
+                lines.append(f"**Pattern:** {pattern}")
+            shared = intg.get("shared_interfaces", [])
+            if shared:
+                lines.append(f"**Shared interfaces:** {', '.join(shared)}")
+            data_flow = intg.get("data_flow", "")
+            if data_flow:
+                lines.append(f"**Data flow:** {data_flow}")
+            lines.append("")
+
+    shared_types = ld.get("shared_types")
+    if shared_types and isinstance(shared_types, list):
+        lines.append("## Shared Types\n" + "\n".join(f"- `{t}`" for t in shared_types) + "\n")
+
+    diagram = ld.get("architecture_diagram_text", "")
+    if diagram:
+        lines.append(f"## Architecture\n```\n{diagram}\n```\n")
+
+    return "\n".join(lines)
