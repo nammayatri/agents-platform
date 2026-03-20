@@ -380,6 +380,156 @@ async def accept_session_plan(
     }
 
 
+@router.post("/projects/{project_id}/chat/sessions/{session_id}/accept-task-plan")
+async def accept_task_plan(
+    project_id: str, session_id: str, user: CurrentUser, db: DB, event_bus: EventBusDep,
+):
+    """Accept a task plan from create_task mode and create the task in DB."""
+    session = await _load_session(session_id, project_id, user, db)
+    task_plan = session.get("task_plan_json")
+    if not task_plan:
+        raise HTTPException(status_code=400, detail="No task plan to accept")
+
+    task_plan = safe_json(task_plan) if isinstance(task_plan, str) else task_plan
+
+    plan_json = task_plan.get("plan_json", {})
+    intake_data = task_plan.get("intake_data", {})
+
+    # Create the task in DB
+    todo = await db.fetchrow(
+        """
+        INSERT INTO todo_items (
+            project_id, creator_id, title, description, priority, task_type,
+            state, plan_json, intake_data, chat_session_id
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, 'plan_ready', $7::jsonb, $8::jsonb, $9)
+        RETURNING *
+        """,
+        project_id,
+        user["id"],
+        task_plan.get("title", "Untitled"),
+        task_plan.get("description", ""),
+        task_plan.get("priority", "medium"),
+        task_plan.get("task_type", "general"),
+        json.dumps(plan_json),
+        json.dumps(intake_data),
+        session_id,
+    )
+    todo_id = str(todo["id"])
+
+    # Link session and clear stored plan
+    await db.execute(
+        "UPDATE project_chat_sessions SET linked_todo_id = $1, task_plan_json = NULL, updated_at = NOW() WHERE id = $2",
+        todo_id, session_id,
+    )
+
+    # Insert sub-tasks from plan_json and approve (transition to in_progress)
+    from agents.utils.repo_utils import resolve_target_repo
+
+    project_row = await db.fetchrow("SELECT context_docs FROM projects WHERE id = $1", project_id)
+    context_docs = []
+    if project_row and project_row.get("context_docs"):
+        raw = project_row["context_docs"]
+        context_docs = safe_json(raw) if isinstance(raw, str) else raw
+        if not isinstance(context_docs, list):
+            context_docs = []
+
+    sub_task_ids = []
+    sub_tasks = plan_json.get("sub_tasks", [])
+    for st in sub_tasks:
+        review_loop = bool(st.get("review_loop", False))
+        target_repo = resolve_target_repo(st.get("target_repo"), context_docs)
+        row = await db.fetchrow(
+            """
+            INSERT INTO sub_tasks (
+                todo_id, title, description, agent_role,
+                execution_order, input_context, review_loop, target_repo
+            )
+            VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8::jsonb)
+            RETURNING id
+            """,
+            todo_id,
+            st.get("title", ""),
+            st.get("description", ""),
+            st.get("agent_role", "coder"),
+            st.get("execution_order", 0),
+            json.dumps(st.get("context", {})),
+            review_loop,
+            json.dumps(target_repo) if target_repo else None,
+        )
+        sub_task_ids.append(str(row["id"]))
+
+    # Set depends_on relationships
+    for i, st in enumerate(sub_tasks):
+        deps = st.get("depends_on", [])
+        if deps:
+            dep_ids = [sub_task_ids[j] for j in deps if j < len(sub_task_ids)]
+            if dep_ids:
+                await db.execute(
+                    "UPDATE sub_tasks SET depends_on = $2 WHERE id = $1",
+                    sub_task_ids[i], dep_ids,
+                )
+
+    # Transition to in_progress and emit event
+    from agents.orchestrator.state_machine import transition_todo
+    from agents.orchestrator.events import TaskEvent
+
+    await transition_todo(db, todo_id, "in_progress", sub_state="executing", event_bus=event_bus)
+    await event_bus.publish(TaskEvent(event_type="task_activated", todo_id=todo_id, state="in_progress"))
+
+    # Store confirmation messages
+    task_title = task_plan.get("title", "Untitled")
+    content = f"**Task created and execution started:** {task_title}"
+    metadata = {
+        "action": "task_created",
+        "task_id": todo_id,
+        "task_title": task_title,
+    }
+
+    user_msg = await db.fetchrow(
+        """
+        INSERT INTO project_chat_messages (project_id, user_id, role, content, session_id)
+        VALUES ($1, $2, 'user', 'approve task plan', $3) RETURNING *
+        """,
+        project_id, user["id"], session_id,
+    )
+    assistant_msg = await db.fetchrow(
+        """
+        INSERT INTO project_chat_messages (project_id, user_id, role, content, metadata_json, session_id)
+        VALUES ($1, $2, 'assistant', $3, $4::jsonb, $5) RETURNING *
+        """,
+        project_id, user["id"], content, json.dumps(metadata), session_id,
+    )
+
+    return {
+        "user_message": dict(user_msg),
+        "assistant_message": dict(assistant_msg),
+        "task_id": todo_id,
+    }
+
+
+class DiscardTaskPlanInput(BaseModel):
+    feedback: str = ""
+
+
+@router.post("/projects/{project_id}/chat/sessions/{session_id}/discard-task-plan")
+async def discard_task_plan(
+    project_id: str, session_id: str, body: DiscardTaskPlanInput,
+    user: CurrentUser, db: DB,
+):
+    """Discard the current task plan and allow re-planning with feedback."""
+    session = await _load_session(session_id, project_id, user, db)
+    if not session.get("task_plan_json"):
+        raise HTTPException(status_code=400, detail="No task plan to discard")
+
+    await db.execute(
+        "UPDATE project_chat_sessions SET task_plan_json = NULL, updated_at = NOW() WHERE id = $1",
+        session_id,
+    )
+
+    return {"status": "discarded"}
+
+
 @router.delete("/projects/{project_id}/chat/sessions/{session_id}/messages/{message_id}")
 async def delete_session_message(
     project_id: str, session_id: str, message_id: str, user: CurrentUser, db: DB

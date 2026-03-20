@@ -209,12 +209,12 @@ class ReviewPhase:
             base_branch = project.get("default_branch") or "main"
 
             # Commit and push
-            pushed = await coord.workspace_mgr.commit_and_push(
+            commit_result = await coord.workspace_mgr.commit_and_push(
                 task_dir,
                 message=f"[agents] {todo['title']}\n\n{summary}",
                 branch=branch_name,
             )
-            if not pushed:
+            if not commit_result["success"]:
                 return None
 
             # Create PR

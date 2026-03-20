@@ -70,22 +70,46 @@ class ExecutionPhase:
 
         # Set up task workspace if project has a repo
         workspace_path = None
-        try:
-            project = await coord.db.fetchrow(
-                "SELECT repo_url FROM projects WHERE id = $1", todo["project_id"]
-            )
-            if project and project.get("repo_url"):
-                logger.info("[%s] Setting up workspace for repo %s", coord.todo_id, project["repo_url"])
+        project = await coord.db.fetchrow(
+            "SELECT repo_url FROM projects WHERE id = $1", todo["project_id"]
+        )
+        if project and project.get("repo_url"):
+            logger.info("[%s] Setting up workspace for repo %s", coord.todo_id, project["repo_url"])
+            try:
                 workspace_path = await coord.workspace_mgr.setup_task_workspace(coord.todo_id)
                 logger.info("[%s] Task workspace ready at %s", coord.todo_id, workspace_path)
-            else:
-                logger.info("[%s] No repo_url on project, skipping workspace setup", coord.todo_id)
-        except Exception:
-            logger.warning("Could not set up task workspace for %s", coord.todo_id, exc_info=True)
+            except Exception:
+                logger.exception("[%s] Workspace setup FAILED for %s — task cannot proceed without workspace",
+                                 coord.todo_id, project["repo_url"])
+                await coord._post_system_message(
+                    "**Workspace setup failed** — could not clone the repository. "
+                    "Check that the repo URL and git credentials are correct."
+                )
+                await coord._transition_todo("failed")
+                return
+        else:
+            logger.info("[%s] No repo_url on project, skipping workspace setup", coord.todo_id)
 
         # Find runnable sub-tasks (pending + all dependencies completed)
         runnable = []
         all_st_ids = {str(s["id"]) for s in sub_tasks}
+
+        # Batch: collect ALL dep IDs and fetch statuses in one query
+        all_dep_ids: set = set()
+        for st in sub_tasks:
+            if st["status"] == "pending":
+                for dep_id in (st["depends_on"] or []):
+                    dep_str = str(dep_id)
+                    if dep_str in all_st_ids:
+                        all_dep_ids.add(dep_id)
+        dep_status_map: dict[str, dict] = {}
+        if all_dep_ids:
+            dep_rows = await coord.db.fetch(
+                "SELECT id, status, title FROM sub_tasks WHERE id = ANY($1)",
+                list(all_dep_ids),
+            )
+            dep_status_map = {str(r["id"]): dict(r) for r in dep_rows}
+
         for st in sub_tasks:
             if st["status"] != "pending":
                 logger.info("[%s] Sub-task %s status=%s, skipping", coord.todo_id, st["id"], st["status"])
@@ -109,11 +133,8 @@ class ExecutionPhase:
                     deps = valid_deps
 
                 if deps:
-                    dep_statuses = await coord.db.fetch(
-                        "SELECT id, status, title FROM sub_tasks WHERE id = ANY($1)",
-                        deps,
-                    )
-                    unmet = [d for d in dep_statuses if d["status"] != "completed"]
+                    unmet = [dep_status_map[str(d)] for d in deps
+                             if str(d) in dep_status_map and dep_status_map[str(d)]["status"] != "completed"]
                     if unmet:
                         unmet_detail = [(str(d["id"])[:8], d["status"], d["title"]) for d in unmet]
                         logger.info(
@@ -259,16 +280,28 @@ class ExecutionPhase:
                 "SELECT * FROM sub_tasks WHERE todo_id = $1 ORDER BY execution_order",
                 coord.todo_id,
             )
+
+            # Batch dep status lookup for all pending subtasks
+            rescan_dep_ids: set = set()
+            for st2 in fresh_sub_tasks:
+                if st2["status"] == "pending":
+                    for d in (st2["depends_on"] or []):
+                        rescan_dep_ids.add(d)
+            rescan_dep_map: dict[str, str] = {}
+            if rescan_dep_ids:
+                _dep_rows = await coord.db.fetch(
+                    "SELECT id, status FROM sub_tasks WHERE id = ANY($1)",
+                    list(rescan_dep_ids),
+                )
+                rescan_dep_map = {str(r["id"]): r["status"] for r in _dep_rows}
+
             next_runnable = []
             for st2 in fresh_sub_tasks:
                 if st2["status"] != "pending":
                     continue
                 deps2 = st2["depends_on"] or []
                 if deps2:
-                    dep_sts = await coord.db.fetch(
-                        "SELECT id, status FROM sub_tasks WHERE id = ANY($1)", deps2,
-                    )
-                    if any(d["status"] != "completed" for d in dep_sts):
+                    if any(rescan_dep_map.get(str(d)) != "completed" for d in deps2):
                         continue
                 next_runnable.append(dict(st2))
 
@@ -320,13 +353,23 @@ class ExecutionPhase:
                     "ORDER BY execution_order, created_at",
                     coord.todo_id,
                 )
+                # Batch dep lookup for guardrail subtasks
+                g_dep_ids: set = set()
+                for gst in guardrail_tasks:
+                    for d in (gst["depends_on"] or []):
+                        g_dep_ids.add(d)
+                g_dep_map: dict[str, str] = {}
+                if g_dep_ids:
+                    _g_rows = await coord.db.fetch(
+                        "SELECT id, status FROM sub_tasks WHERE id = ANY($1)",
+                        list(g_dep_ids),
+                    )
+                    g_dep_map = {str(r["id"]): r["status"] for r in _g_rows}
+
                 for gst in guardrail_tasks:
                     deps = gst["depends_on"] or []
                     if deps:
-                        dep_sts = await coord.db.fetch(
-                            "SELECT id, status FROM sub_tasks WHERE id = ANY($1)", deps,
-                        )
-                        if any(d["status"] != "completed" for d in dep_sts):
+                        if any(g_dep_map.get(str(d)) != "completed" for d in deps):
                             continue
                     gst_ws = workspace_path
                     gst_target = gst.get("target_repo")
@@ -359,14 +402,24 @@ class ExecutionPhase:
                         "ORDER BY execution_order, created_at",
                         coord.todo_id,
                     )
+                    # Batch dep lookup for guardrail re-scan
+                    gr_dep_ids: set = set()
+                    for gst2 in gr_fresh:
+                        for d in (gst2["depends_on"] or []):
+                            gr_dep_ids.add(d)
+                    gr_dep_map: dict[str, str] = {}
+                    if gr_dep_ids:
+                        _gr_rows = await coord.db.fetch(
+                            "SELECT id, status FROM sub_tasks WHERE id = ANY($1)",
+                            list(gr_dep_ids),
+                        )
+                        gr_dep_map = {str(r["id"]): r["status"] for r in _gr_rows}
+
                     gr_runnable = []
                     for gst2 in gr_fresh:
                         deps2 = gst2["depends_on"] or []
                         if deps2:
-                            dep_sts2 = await coord.db.fetch(
-                                "SELECT id, status FROM sub_tasks WHERE id = ANY($1)", deps2,
-                            )
-                            if any(d["status"] != "completed" for d in dep_sts2):
+                            if any(gr_dep_map.get(str(d)) != "completed" for d in deps2):
                                 continue
                         gr_runnable.append(dict(gst2))
                     if not gr_runnable:
@@ -543,7 +596,7 @@ class ExecutionPhase:
             "**Code push:** Creating PR sub-task for completed code changes..."
         )
 
-        await coord.db.fetchrow(
+        pr_row = await coord.db.fetchrow(
             """
             INSERT INTO sub_tasks (
                 todo_id, title, description, agent_role,
@@ -559,5 +612,10 @@ class ExecutionPhase:
             all_coder_ids,
             target_repo_json,
         )
+
+        # Propagate: tasks depending on any coder should also wait for PR creation
+        pr_id = str(pr_row["id"])
+        for coder_id in all_coder_ids:
+            await coord._lifecycle._propagate_dependencies(coder_id, [pr_id])
 
         return True

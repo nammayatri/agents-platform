@@ -388,6 +388,51 @@ class McpToolExecutor:
         """Check if a resolved path falls within any allowed directory."""
         return any(real_path.startswith(d + os.sep) or real_path == d for d in allowed_dirs)
 
+    @staticmethod
+    def _identify_repo(workspace_path: str, real_path: str) -> str:
+        """Identify which repository a resolved file path belongs to.
+
+        Returns a label like 'main', 'ny-react-native', or 'context-docs'.
+        Handles both project workspaces (repo/ = main) and dep workspaces
+        (repo/ = dep, main_repo/ = main).
+        """
+        if not workspace_path:
+            return "main"
+
+        real_ws = os.path.realpath(workspace_path)
+
+        # Check deps/{name}/ first (most specific)
+        deps_dir = os.path.join(real_ws, "deps")
+        real_deps = os.path.realpath(deps_dir) if os.path.exists(deps_dir) else None
+        if real_deps and (real_path.startswith(real_deps + os.sep) or real_path == real_deps):
+            # Extract dep name from path: deps/{name}/...
+            rel = real_path[len(real_deps):].lstrip(os.sep)
+            dep_name = rel.split(os.sep, 1)[0] if rel else ""
+            return dep_name or "dependency"
+
+        # Check main_repo/ (for dep workspaces referencing the main project)
+        main_repo_dir = os.path.join(real_ws, "main_repo")
+        real_main = os.path.realpath(main_repo_dir) if os.path.exists(main_repo_dir) else None
+        if real_main and (real_path.startswith(real_main + os.sep) or real_path == real_main):
+            return "main"
+
+        # Check .context/
+        ctx_dir = os.path.join(real_ws, ".context")
+        real_ctx = os.path.realpath(ctx_dir) if os.path.exists(ctx_dir) else None
+        if real_ctx and (real_path.startswith(real_ctx + os.sep) or real_path == real_ctx):
+            return "context-docs"
+
+        # For dep workspaces, repo/ is the dep repo (indicated by main_repo/ existing).
+        # Extract the dep name from the workspace dir name (format: dep_{name}).
+        if os.path.exists(os.path.join(real_ws, "main_repo")):
+            ws_basename = os.path.basename(real_ws)
+            if ws_basename.startswith("dep_"):
+                return ws_basename[4:]  # strip "dep_" prefix
+            return ws_basename  # fallback to full dirname
+
+        # Default: repo/ directory = main repo
+        return "main"
+
     async def _execute_builtin(self, tool_meta: dict, tool_input: dict) -> str:
         """Execute a built-in workspace tool directly (no MCP server)."""
         workspace_path = tool_meta.get("_workspace_path", "")
@@ -410,11 +455,13 @@ class McpToolExecutor:
                     logger.info("builtin[read_file]: file not found: %s (resolved: %s)", path, real_path)
                     return json.dumps({"error": f"File not found: {path}"})
 
+                repo_label = self._identify_repo(workspace_path, real_path)
+
                 # Try cache first (validates mtime freshness automatically)
                 content = self.file_cache.get(real_path)
                 if content is not None:
-                    logger.info("builtin[read_file]: %s → %d chars (cache hit)", path, len(content))
-                    return content
+                    logger.info("builtin[read_file]: %s → %d chars (cache hit, repo=%s)", path, len(content), repo_label)
+                    return f"[Repository: {repo_label}] {path}\n{content}"
 
                 # Cache miss — read from disk
                 with open(real_path, "r", errors="replace") as f:
@@ -426,8 +473,8 @@ class McpToolExecutor:
                 else:
                     # Cache the full (non-truncated) content
                     self.file_cache.put(real_path, content)
-                logger.info("builtin[read_file]: %s → %d chars (disk)", path, len(content))
-                return content
+                logger.info("builtin[read_file]: %s → %d chars (disk, repo=%s)", path, len(content), repo_label)
+                return f"[Repository: {repo_label}] {path}\n{content}"
 
             elif tool_name == "write_file":
                 path = tool_input.get("path", "")
@@ -443,8 +490,9 @@ class McpToolExecutor:
                     f.write(content)
                 # Update cache with the written content (mtime from disk after write)
                 self.file_cache.put(real_path, content)
-                logger.info("builtin[write_file]: %s → %d bytes written (resolved: %s)", path, len(content), real_path)
-                return json.dumps({"status": "ok", "path": path, "bytes_written": len(content)})
+                repo_label = self._identify_repo(workspace_path, real_path)
+                logger.info("builtin[write_file]: %s → %d bytes written (repo=%s)", path, len(content), repo_label)
+                return json.dumps({"status": "ok", "path": path, "bytes_written": len(content), "repository": repo_label})
 
             elif tool_name == "edit_file":
                 path = tool_input.get("path", "")
@@ -477,6 +525,7 @@ class McpToolExecutor:
                             "builtin[edit_file]: %s — replaced %d chars with %d chars (method=%s, confidence=%.2f)",
                             path, len(old_text), len(new_text), match.method, match.confidence,
                         )
+                        repo_label = self._identify_repo(workspace_path, real_path)
                         return json.dumps({
                             "status": "ok",
                             "path": path,
@@ -484,6 +533,7 @@ class McpToolExecutor:
                             "chars_added": len(new_text),
                             "match_method": match.method,
                             "match_confidence": round(match.confidence, 3),
+                            "repository": repo_label,
                         })
                     except EditMatchError as e:
                         logger.info("builtin[edit_file]: fuzzy match failed in %s: %s", path, str(e)[:200])
@@ -505,12 +555,14 @@ class McpToolExecutor:
                     with open(real_path, "w") as f:
                         f.write(new_content)
                     self.file_cache.put(real_path, new_content)
-                    logger.info("builtin[edit_file]: %s — replaced %d chars with %d chars", path, len(old_text), len(new_text))
+                    repo_label = self._identify_repo(workspace_path, real_path)
+                    logger.info("builtin[edit_file]: %s — replaced %d chars with %d chars (repo=%s)", path, len(old_text), len(new_text), repo_label)
                     return json.dumps({
                         "status": "ok",
                         "path": path,
                         "chars_removed": len(old_text),
                         "chars_added": len(new_text),
+                        "repository": repo_label,
                     })
 
             elif tool_name == "list_directory":
@@ -524,6 +576,7 @@ class McpToolExecutor:
                 if not os.path.isdir(real_path):
                     logger.info("builtin[list_directory]: directory not found: %s (resolved: %s)", path, real_path)
                     return json.dumps({"error": f"Directory not found: {path}"})
+                repo_label = self._identify_repo(workspace_path, real_path)
                 entries = sorted(os.listdir(real_path))
                 result = []
                 for e in entries[:500]:  # limit entries
@@ -532,8 +585,8 @@ class McpToolExecutor:
                         "name": e,
                         "type": "directory" if os.path.isdir(full_e) else "file",
                     })
-                logger.info("builtin[list_directory]: %s → %d entries", path or "/", len(result))
-                return json.dumps(result)
+                logger.info("builtin[list_directory]: %s → %d entries (repo=%s)", path or "/", len(result), repo_label)
+                return json.dumps({"repository": repo_label, "path": path or "/", "entries": result})
 
             elif tool_name == "search_files":
                 pattern = tool_input.get("pattern", "")
@@ -551,7 +604,8 @@ class McpToolExecutor:
                     logger.info("builtin[search_files]: directory not found: %s", search_path)
                     return json.dumps({"error": f"Directory not found: {search_path}"})
 
-                logger.info("builtin[search_files]: pattern=%s path=%s glob=%s", pattern, search_path or "/", file_glob)
+                repo_label = self._identify_repo(workspace_path, real_search)
+                logger.info("builtin[search_files]: pattern=%s path=%s glob=%s repo=%s", pattern, search_path or "/", file_glob, repo_label)
                 cmd = ["grep", "-rn", "--include", file_glob, pattern, "."]
                 proc = await asyncio.create_subprocess_exec(
                     *cmd,
@@ -567,7 +621,8 @@ class McpToolExecutor:
                         output = output[:50_000] + "\n... (truncated)"
                     match_count = output.count("\n") if output else 0
                     logger.info("builtin[search_files]: %d matching lines, %d chars", match_count, len(output))
-                    return output if output else "No matches found."
+                    header = f"[Repository: {repo_label}] Search results for '{pattern}':\n"
+                    return (header + output) if output else f"[Repository: {repo_label}] No matches found."
                 except asyncio.CancelledError:
                     try:
                         proc.kill()
@@ -662,11 +717,13 @@ class McpToolExecutor:
                     # Strip absolute repo path from output so LLM never sees it
                     if repo_dir:
                         output = output.replace(repo_dir + "/", "").replace(repo_dir, ".")
-                    logger.info("builtin[run_command]: exit_code=%d output_len=%d cmd=%s",
-                                proc.returncode, len(output), actual_command[:100])
+                    repo_label = self._identify_repo(workspace_path, os.path.realpath(repo_dir))
+                    logger.info("builtin[run_command]: exit_code=%d output_len=%d cmd=%s repo=%s",
+                                proc.returncode, len(output), actual_command[:100], repo_label)
                     return json.dumps({
                         "exit_code": proc.returncode,
                         "output": output,
+                        "repository": repo_label,
                     })
                 except asyncio.CancelledError:
                     try:

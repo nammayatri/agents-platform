@@ -24,6 +24,7 @@ const PRIORITY_COLORS: Record<string, string> = {
 interface PlanReviewCardProps {
   planData: ChatPlanData
   isAccepted: boolean
+  isLatest?: boolean
   onAccept: () => void
   onReject: (feedback: string) => void
   disabled?: boolean
@@ -32,6 +33,7 @@ interface PlanReviewCardProps {
 export default function PlanReviewCard({
   planData,
   isAccepted,
+  isLatest,
   onAccept,
   onReject,
   disabled,
@@ -225,7 +227,12 @@ export default function PlanReviewCard({
       </div>
 
       {/* Action buttons */}
-      {!isAccepted && (
+      {!isAccepted && isLatest === false && (
+        <div className="px-4 py-2 border-t border-gray-800">
+          <span className="text-[11px] text-gray-600">Earlier version — see latest plan below</span>
+        </div>
+      )}
+      {!isAccepted && isLatest !== false && (
         <div className="px-4 py-2.5 border-t border-gray-800">
           {showRejectInput ? (
             <div className="flex items-center gap-2">

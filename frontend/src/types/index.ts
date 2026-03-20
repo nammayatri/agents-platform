@@ -220,6 +220,7 @@ export interface TodoItem {
   state: TodoState
   sub_state?: string
   state_changed_at: string
+  retried_at?: string
   retry_count: number
   error_message?: string
   result_summary?: string
@@ -246,6 +247,7 @@ export interface ChatMessage {
   role: 'user' | 'assistant' | 'system'
   content: string
   agent_run_id?: string
+  metadata_json?: Record<string, unknown>
   created_at: string
 }
 
@@ -555,6 +557,21 @@ export interface ProjectChatMessage {
     raw_output?: string
     routing_mode?: string
     mode_auto_switched?: boolean
+    // Review verdict metadata (plan_review_verdict / code_review_verdict)
+    verdict?: 'approved' | 'needs_changes'
+    approved?: boolean
+    feedback?: string
+    issues?: Array<{
+      severity: 'critical' | 'major' | 'minor' | 'nit'
+      file?: string
+      line?: number | null
+      description: string
+      suggestion?: string
+    }>
+    subtask_title?: string
+    summary?: string
+    iteration?: number
+    [key: string]: unknown
   }
   created_at: string
 }
@@ -563,7 +580,7 @@ export interface WSEvent {
   type: 'state_change' | 'subtask_update' | 'chat_message' | 'progress' | 'activity' | 'deliverable_created' | 'task_cancelled' | 'llm_response' | 'workspace_commit' | 'workspace_push' | 'tool_start' | 'tool_result' | 'llm_thinking' | 'iteration_start' | 'iteration_end' | 'testing_step' | 'user_inject' | 'index_search' | 'index_build' | 'ping'
   state?: TodoState
   status?: string
-  message?: string | { role: string; content: string; id?: string }
+  message?: string | { role: string; content: string; id?: string; metadata_json?: Record<string, unknown> }
   sub_task_id?: string
   progress_pct?: number
   activity?: string

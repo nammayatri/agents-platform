@@ -258,7 +258,7 @@ async def retry_todo(
 
     await db.execute(
         "UPDATE todo_items SET retry_count = 0, error_message = NULL, "
-        "completed_at = NULL WHERE id = $1",
+        "completed_at = NULL, retried_at = NOW() WHERE id = $1",
         todo_id,
     )
     await redis.publish(
@@ -862,7 +862,7 @@ async def _retry_pr_creation(db, redis, event_bus, todo_id: str, todo: dict) -> 
 
     await db.execute(
         "UPDATE todo_items SET error_message = NULL, completed_at = NULL, "
-        "sub_state = 'pr_retry' WHERE id = $1",
+        "retried_at = NOW(), sub_state = 'pr_retry' WHERE id = $1",
         todo_id,
     )
 

@@ -1,7 +1,11 @@
 import { useEffect, useState, useCallback } from 'react'
 import { useParams, useNavigate, useSearchParams } from 'react-router-dom'
 import { projects as projectsApi, providers as providersApi, gitProviders as gitProvidersApi, skills as skillsApi, mcpServers as mcpApi, projectConfig as projectConfigApi } from '../services/api'
+import { FileText, GitBranch, Link as LinkIcon, BookOpen, Hammer, Rocket, Bug, Zap, Users, Brain, Bot, Database, Settings as SettingsIcon } from 'lucide-react'
+import { tabBar, tabBtn } from '../styles/classes'
+import { InlineError } from '../components/ui/InlineError'
 import type { Project, ProjectDependency, ProjectMember, ProviderConfig, GitProviderConfig, Skill, McpServer, WorkRules, ProjectMemory, ReleaseConfig } from '../types'
+import type { LucideIcon } from 'lucide-react'
 
 import ProjectWizard from '../components/project/ProjectWizard'
 import ProjectGeneralTab from '../components/project/ProjectGeneralTab'
@@ -71,8 +75,21 @@ export default function ProjectSettingsPage() {
   const [editorModel, setEditorModel] = useState('')
   const [providerModels, setProviderModels] = useState<{id: string; name: string}[]>([])
 
-  const editTabs = ['General', 'Repository', 'Dependencies', 'Rules', 'Build & Merge', 'Release', 'Debug', 'Capabilities', 'Members', 'Understanding', 'Agents', 'Memories']
-  const activeTab = searchParams.get('tab') || editTabs[0]
+  const editTabs: { key: string; label: string; Icon: LucideIcon }[] = [
+    { key: 'General', label: 'General', Icon: FileText },
+    { key: 'Repository', label: 'Repository', Icon: GitBranch },
+    { key: 'Dependencies', label: 'Dependencies', Icon: LinkIcon },
+    { key: 'Rules', label: 'Rules', Icon: BookOpen },
+    { key: 'Build & Merge', label: 'Build & Merge', Icon: Hammer },
+    { key: 'Release', label: 'Release', Icon: Rocket },
+    { key: 'Debug', label: 'Debug', Icon: Bug },
+    { key: 'Capabilities', label: 'Capabilities', Icon: Zap },
+    { key: 'Members', label: 'Members', Icon: Users },
+    { key: 'Understanding', label: 'Understanding', Icon: Brain },
+    { key: 'Agents', label: 'Agents', Icon: Bot },
+    { key: 'Memories', label: 'Memories', Icon: Database },
+  ]
+  const activeTab = searchParams.get('tab') || editTabs[0].key
   const setActiveTab = (t: string) => setSearchParams({ tab: t })
 
   const loadProject = useCallback(async () => {
@@ -187,11 +204,15 @@ export default function ProjectSettingsPage() {
   if (loading) {
     return (
       <div className="p-6 max-w-2xl mx-auto">
-        <div className="animate-pulse space-y-4">
-          <div className="h-6 bg-gray-800 rounded w-48" />
-          <div className="h-4 bg-gray-800 rounded w-72" />
-          <div className="h-10 bg-gray-900 rounded" />
-          <div className="h-10 bg-gray-900 rounded" />
+        <div className="space-y-4">
+          <div className="h-6 skeleton w-48" />
+          <div className="h-4 skeleton w-72" />
+          <div className="flex gap-2 mt-4 mb-6 border-b border-gray-800 pb-2">
+            {[1,2,3,4,5].map(i => <div key={i} className="h-5 skeleton w-20" />)}
+          </div>
+          <div className="h-10 skeleton" />
+          <div className="h-10 skeleton" />
+          <div className="h-10 skeleton w-3/4" />
         </div>
       </div>
     )
@@ -209,24 +230,24 @@ export default function ProjectSettingsPage() {
 
   return (
     <div className="p-4 md:p-6 max-w-2xl mx-auto">
-      <div className="mb-6">
-        <h1 className="text-xl font-semibold text-white">Project Settings</h1>
+      <div className="mb-6 animate-fade-in">
+        <div className="flex items-center gap-2.5">
+          <SettingsIcon className="w-5 h-5 text-gray-500" />
+          <h1 className="text-xl font-semibold text-white">Project Settings</h1>
+        </div>
         <p className="text-sm text-gray-500 mt-1">{name}</p>
       </div>
 
       {/* Tabs */}
-      <div className="flex gap-1 mb-6 border-b border-gray-900 -mx-1 overflow-x-auto">
+      <div className={`${tabBar} mb-6`}>
         {editTabs.map((tab) => (
           <button
-            key={tab}
-            onClick={() => setActiveTab(tab)}
-            className={`px-3 py-2 text-sm font-medium transition-colors border-b-2 -mb-px shrink-0 whitespace-nowrap ${
-              activeTab === tab
-                ? 'text-white border-indigo-500'
-                : 'text-gray-500 border-transparent hover:text-gray-300'
-            }`}
+            key={tab.key}
+            onClick={() => setActiveTab(tab.key)}
+            className={tabBtn(activeTab === tab.key)}
           >
-            {tab}
+            <tab.Icon className="w-3.5 h-3.5" />
+            {tab.label}
           </button>
         ))}
       </div>
@@ -431,13 +452,11 @@ export default function ProjectSettingsPage() {
         )}
 
         {/* Error */}
-        {error && (
-          <div className="px-4 py-2.5 bg-red-500/10 border border-red-500/20 rounded-lg text-red-400 text-sm">{error}</div>
-        )}
+        {error && <InlineError message={error} onDismiss={() => setError('')} />}
 
         {/* Actions */}
         {activeTab !== 'Understanding' && activeTab !== 'Agents' && activeTab !== 'Members' && activeTab !== 'Rules' && activeTab !== 'Build & Merge' && activeTab !== 'Release' && activeTab !== 'Debug' && (
-          <div className="flex items-center gap-3 pt-2 flex-wrap">
+          <div className="sticky bottom-0 bg-gray-950/80 backdrop-blur-sm border-t border-gray-800 py-3 -mx-6 px-6 flex items-center gap-3 flex-wrap">
             {userRole === 'owner' && (
               <button onClick={handleSave} disabled={saving} className="px-5 py-2 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 rounded-lg text-sm font-medium text-white transition-colors">
                 {saving ? 'Saving...' : 'Save Changes'}

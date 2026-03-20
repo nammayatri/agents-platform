@@ -207,7 +207,7 @@ async def _compact_messages_with_llm(
     for m in middle:
         if m.role == "assistant" and m.tool_calls:
             for tc in m.tool_calls:
-                middle_text_parts.append(f"Called {tc['name']}({', '.join(f'{k}={repr(v)[:80]}' for k, v in tc.get('arguments', {}).items())})")
+                middle_text_parts.append(f"Called {tc['name']}({', '.join(f'{k}={repr(v)[:80]}' for k, v in _normalize_tool_args(tc.get('arguments', {})).items())})")
         elif m.role == "user" and m.tool_results:
             for tr in m.tool_results:
                 preview = tr.get("content", "")[:200]
@@ -564,7 +564,7 @@ async def _execute_tools_parallel(
 
         async def _run_read(tc):
             tc_name = tc["name"]
-            tc_args = tc.get("arguments", {})
+            tc_args = _normalize_tool_args(tc.get("arguments", {}))
 
             # Validate
             if known_tool_names and tc_name not in known_tool_names:
@@ -831,7 +831,7 @@ async def run_tool_loop(
                     break
 
                 tc_name = tc["name"]
-                tc_args = tc.get("arguments", {})
+                tc_args = _normalize_tool_args(tc.get("arguments", {}))
                 logger.info("tool_loop: round %d — exec %s args_keys=%s", loop_count, tc_name, list(tc_args.keys()))
 
                 # Validate tool name against known tools
@@ -1126,8 +1126,24 @@ def _smart_result_preview(tool_name: str, result_text: str, max_len: int = 500) 
     return result_text
 
 
-def _tool_activity_summary(name: str, args: dict) -> str:
+def _normalize_tool_args(raw: object) -> dict:
+    """Ensure tool arguments are a dict — some providers return a JSON string."""
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str):
+        try:
+            import json as _j
+            parsed = _j.loads(raw)
+            if isinstance(parsed, dict):
+                return parsed
+        except (ValueError, TypeError):
+            pass
+    return {}
+
+
+def _tool_activity_summary(name: str, args: dict | str) -> str:
     """One-line human-readable summary of a tool call for the activity log."""
+    args = _normalize_tool_args(args)
     import os.path as _osp
 
     if name == "write_file":
@@ -1160,8 +1176,9 @@ def _tool_activity_summary(name: str, args: dict) -> str:
     return f"Tool: {name}"
 
 
-def _tool_brief(name: str, args: dict) -> str:
+def _tool_brief(name: str, args: dict | str) -> str:
     """Compact tool+arg hint for 'Agent will:' lines, e.g. run_command(npm test)."""
+    args = _normalize_tool_args(args)
     import os.path as _osp
 
     if name in ("read_file", "write_file", "edit_file"):

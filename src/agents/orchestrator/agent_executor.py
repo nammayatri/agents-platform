@@ -15,7 +15,7 @@ import time
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
-from agents.agents.registry import get_builtin_tool_schemas
+from agents.agents.registry import get_builtin_tool_schemas, get_default_tools
 from agents.schemas.agent import LLMMessage, LLMResponse
 from agents.providers.base import AIProvider
 
@@ -188,11 +188,15 @@ class AgentExecutor:
             user_id=str(todo["creator_id"]),
         )
 
-        # Filter tools if custom agent has tools_enabled
+        # Filter MCP tools to only those allowed for this agent role.
+        # Custom configs with tools_enabled take precedence; otherwise
+        # fall back to the role's default tool list from the registry.
         if agent_config and agent_config.get("tools_enabled"):
             allowed = set(agent_config["tools_enabled"])
-            if mcp_tools:
-                mcp_tools = [t for t in mcp_tools if t.get("name") in allowed]
+        else:
+            allowed = set(get_default_tools(sub_task["agent_role"]))
+        if mcp_tools:
+            mcp_tools = [t for t in mcp_tools if t.get("name") in allowed]
 
         # Ensure agents always have workspace tools (built-in fallback)
         if workspace_path:
@@ -483,11 +487,15 @@ class AgentExecutor:
         _cached_skills_ctx = await self.tools_registry.build_skills_context(
             project_id=_project_id, user_id=_creator_id,
         )
-        # Filter per-agent tool allowlist
+        # Filter MCP tools to only those allowed for this agent role.
+        # Custom configs with tools_enabled take precedence; otherwise
+        # fall back to the role's default tool list from the registry.
         if agent_config and agent_config.get("tools_enabled"):
             _allowed = set(agent_config["tools_enabled"])
-            if _cached_mcp_tools:
-                _cached_mcp_tools = [t for t in _cached_mcp_tools if t.get("name") in _allowed]
+        else:
+            _allowed = set(get_default_tools(role))
+        if _cached_mcp_tools:
+            _cached_mcp_tools = [t for t in _cached_mcp_tools if t.get("name") in _allowed]
 
         # Merge built-in workspace tools with MCP tools
         _cached_all_tools: list[dict] | None = None

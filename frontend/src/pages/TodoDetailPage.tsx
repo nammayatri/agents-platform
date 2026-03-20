@@ -1,12 +1,13 @@
 import { useEffect, useState, useRef } from 'react'
 import { useParams } from 'react-router-dom'
-import { Code2 } from 'lucide-react'
+import { Code2, Loader2, CheckCircle2, AlertCircle, XCircle, FileText, CirclePause, CircleDashed } from 'lucide-react'
 import { useTodoStore } from '../stores/todoStore'
 import { useTaskWebSocket } from '../hooks/useTaskWebSocket'
 import { todos as todosApi } from '../services/api'
 import DiffViewer from '../components/DiffViewer'
 import WorkspaceView from '../components/workspace/WorkspaceView'
 import ExecutionLog from '../components/workspace/ExecutionLog'
+import ReviewFeedbackCard from '../components/chat/ReviewFeedbackCard'
 import type { SubTask, ChatMessage, Deliverable, AgentRun, PlanSubTask, IterationLogEntry, ProgressLogEntry } from '../types'
 
 const STATE_COLORS: Record<string, string> = {
@@ -57,6 +58,46 @@ function safeStr(v: unknown): string {
   return JSON.stringify(v)
 }
 
+const STATE_ICON_MAP: Record<string, React.ReactNode> = {
+  intake: <CircleDashed className="w-4 h-4 text-violet-400" />,
+  planning: <Loader2 className="w-4 h-4 text-blue-400 animate-spin" />,
+  plan_ready: <FileText className="w-4 h-4 text-cyan-400" />,
+  in_progress: <Loader2 className="w-4 h-4 text-amber-400 animate-spin" />,
+  testing: <Loader2 className="w-4 h-4 text-teal-400 animate-spin" />,
+  review: <CirclePause className="w-4 h-4 text-orange-400" />,
+  completed: <CheckCircle2 className="w-4 h-4 text-emerald-400" />,
+  failed: <AlertCircle className="w-4 h-4 text-red-400" />,
+  cancelled: <XCircle className="w-4 h-4 text-gray-500" />,
+}
+
+const STATE_BANNER_BG: Record<string, string> = {
+  intake: 'bg-violet-500/5',
+  planning: 'bg-blue-500/5',
+  plan_ready: 'bg-cyan-500/5',
+  in_progress: 'bg-amber-500/5',
+  testing: 'bg-teal-500/5',
+  review: 'bg-orange-500/5',
+  completed: 'bg-emerald-500/5',
+  failed: 'bg-red-500/5',
+  cancelled: 'bg-gray-500/5',
+}
+
+function CollapsibleSection({ title, count, defaultOpen = true, children }: {
+  title: string; count?: number; defaultOpen?: boolean; children: React.ReactNode
+}) {
+  const [open, setOpen] = useState(defaultOpen)
+  return (
+    <div className="mb-6">
+      <button onClick={() => setOpen(!open)} className="flex items-center gap-2 w-full text-left mb-3">
+        <span className="text-gray-600 text-[11px]">{open ? '\u25BC' : '\u25B6'}</span>
+        <h2 className="text-sm font-medium text-gray-300 uppercase tracking-wider">{title}</h2>
+        {count !== undefined && <span className="text-[10px] text-gray-600 font-mono">{count}</span>}
+      </button>
+      {open && children}
+    </div>
+  )
+}
+
 export default function TodoDetailPage() {
   const { todoId } = useParams<{ todoId: string }>()
   const todos = useTodoStore((s) => s.todos)
@@ -78,7 +119,6 @@ export default function TodoDetailPage() {
   const rejectMerge = useTodoStore((s) => s.rejectMerge)
   const appendActivity = useTodoStore((s) => s.appendActivity)
   const resumeTodo = useTodoStore((s) => s.resumeTodo)
-  const llmResponses = useTodoStore((s) => s.llmResponses)
   const allExecutionEvents = useTodoStore((s) => s.executionEvents)
   const agentRunsByTodo = useTodoStore((s) => s.agentRunsByTodo)
   const fetchAgentRuns = useTodoStore((s) => s.fetchAgentRuns)
@@ -95,7 +135,6 @@ export default function TodoDetailPage() {
   const [showRejectReleaseForm, setShowRejectReleaseForm] = useState(false)
   const [expandedSubTasks, setExpandedSubTasks] = useState<Set<string>>(new Set())
   const [expandedActivity, setExpandedActivity] = useState<Set<string>>(new Set())
-  const [expandedLlmResponse, setExpandedLlmResponse] = useState<Set<string>>(new Set())
   const [expandedDetails, setExpandedDetails] = useState<Set<string>>(new Set())
   const [showMobileChat, setShowMobileChat] = useState(false)
   const [showWorkspace, setShowWorkspace] = useState(false)
@@ -125,19 +164,21 @@ export default function TodoDetailPage() {
   const agentRuns = todoId ? agentRunsByTodo[todoId] || [] : []
   const executionEvents = todoId ? allExecutionEvents[todoId] || [] : []
 
-  // Previous-run detection: when a todo is retried, items from before the last
-  // state change are considered "previous run" and greyed out.
+  // Previous-run detection: when a todo is retried, items from before the
+  // retry are considered "previous run" and greyed out. We use retried_at
+  // (set only on explicit retries) rather than state_changed_at (which
+  // updates on every state transition and causes false positives).
   const todoActive = todo ? !['completed', 'failed', 'cancelled'].includes(todo.state) : false
-  const stateChangedAt = todo?.state_changed_at ? new Date(todo.state_changed_at).getTime() : 0
-  const hasPreviousRun = todoActive && stateChangedAt > 0
+  const retriedAt = todo?.retried_at ? new Date(todo.retried_at).getTime() : 0
+  const hasPreviousRun = todoActive && retriedAt > 0
 
   const isSubTaskPreviousRun = (st: SubTask) =>
     hasPreviousRun &&
-    new Date(st.created_at).getTime() < stateChangedAt &&
+    new Date(st.created_at).getTime() < retriedAt &&
     (st.status === 'completed' || st.status === 'failed')
 
   const isTimestampPreviousRun = (createdAt: string) =>
-    hasPreviousRun && new Date(createdAt).getTime() < stateChangedAt
+    hasPreviousRun && new Date(createdAt).getTime() < retriedAt
 
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: 'smooth' })
@@ -179,7 +220,22 @@ export default function TodoDetailPage() {
   }
 
   if (!todo) {
-    return <div className="p-6 text-gray-600 text-sm">Loading...</div>
+    return (
+      <div className="p-4 md:p-6 space-y-4 animate-fade-in">
+        <div className="flex items-center gap-2.5 mb-2">
+          <div className="skeleton h-5 w-20 rounded" />
+          <div className="skeleton h-5 w-16 rounded" />
+        </div>
+        <div className="skeleton h-7 w-80 rounded" />
+        <div className="skeleton h-4 w-full max-w-lg rounded" />
+        <div className="skeleton h-4 w-48 rounded" />
+        <div className="mt-6 space-y-2">
+          {[1, 2, 3].map(i => (
+            <div key={i} className="skeleton h-16 w-full rounded-lg" />
+          ))}
+        </div>
+      </div>
+    )
   }
 
   return (
@@ -187,8 +243,9 @@ export default function TodoDetailPage() {
       {/* Main content */}
       <div className="flex-1 p-4 md:p-6 overflow-y-auto">
         {/* Header */}
-        <div className="mb-6">
+        <div className={`mb-6 -mx-4 md:-mx-6 -mt-4 md:-mt-6 px-4 md:px-6 pt-4 md:pt-6 pb-4 ${STATE_BANNER_BG[todo.state] || ''} animate-fade-in`}>
           <div className="flex items-center gap-2.5 mb-2">
+            {STATE_ICON_MAP[todo.state]}
             <span className={`px-2 py-0.5 rounded text-[11px] font-medium text-white ${STATE_COLORS[todo.state]}`}>
               {todo.state.replace('_', ' ')}
             </span>
@@ -213,6 +270,23 @@ export default function TodoDetailPage() {
                 )}
               </div>
             )}
+            {todo.actual_tokens > 0 && (
+              <span className="text-[11px] text-gray-600 font-mono">{todo.actual_tokens.toLocaleString()} tok</span>
+            )}
+            {todo.cost_usd > 0 && (
+              <span className="text-[11px] text-gray-600 font-mono">${todo.cost_usd.toFixed(4)}</span>
+            )}
+            {todo.retry_count > 0 && (
+              <span className="text-[11px] text-gray-600 font-mono">{todo.retry_count} retries</span>
+            )}
+            {todo.completed_at && todo.created_at && (() => {
+              const dur = new Date(todo.completed_at).getTime() - new Date(todo.created_at).getTime()
+              const secs = Math.round(dur / 1000)
+              const durStr = secs >= 3600
+                ? `${Math.floor(secs / 3600)}h ${Math.floor((secs % 3600) / 60)}m`
+                : secs >= 60 ? `${Math.floor(secs / 60)}m ${secs % 60}s` : `${secs}s`
+              return <span className="text-[11px] text-gray-600 font-mono">{durStr}</span>
+            })()}
             <button
               onClick={() => setShowWorkspace(!showWorkspace)}
               className={`ml-auto px-3 py-1.5 rounded-lg text-xs transition-colors flex items-center gap-1.5 ${
@@ -226,6 +300,7 @@ export default function TodoDetailPage() {
             </button>
           </div>
         </div>
+        <div className="mb-2" />
 
         {/* Workspace Mode */}
         {showWorkspace ? (
@@ -738,20 +813,21 @@ export default function TodoDetailPage() {
           )
 
           return (
-            <div className="mb-6">
-              <h2 className="text-sm font-medium text-gray-300 mb-3 uppercase tracking-wider">Review Chains</h2>
+            <CollapsibleSection title="Review Chains" count={currentChains.length} defaultOpen={false}>
               <div className="space-y-3">
                 {currentChains.map(renderChain)}
               </div>
               {previousChains.length > 0 && (
-                <div className="mt-3">
-                  <div className="text-[10px] text-gray-600 uppercase tracking-wider mb-1.5">Previous Run</div>
-                  <div className="space-y-3 opacity-40">
+                <details className="mt-3">
+                  <summary className="text-[10px] text-gray-600 uppercase tracking-wider cursor-pointer hover:text-gray-500">
+                    Previous Run ({previousChains.length})
+                  </summary>
+                  <div className="mt-1.5 space-y-3 opacity-40">
                     {previousChains.map(renderChain)}
                   </div>
-                </div>
+                </details>
               )}
-            </div>
+            </CollapsibleSection>
           )
         })()}
 
@@ -764,8 +840,7 @@ export default function TodoDetailPage() {
           currentTasks.forEach((st: SubTask, idx: number) => stIdToIndex.set(st.id, idx + 1))
 
           return (
-          <div className="mb-6">
-            <h2 className="text-sm font-medium text-gray-300 mb-3 uppercase tracking-wider">Sub-tasks</h2>
+          <CollapsibleSection title="Sub-tasks" count={currentTasks.length}>
             <div className="space-y-1.5">
               {currentTasks.map((st: SubTask) => {
                 const iterLog = st.iteration_log || []
@@ -776,13 +851,14 @@ export default function TodoDetailPage() {
                 const lastStuck = [...iterLog].reverse().find((e) => e.stuck_check?.stuck)
 
                 return (
-                  <div key={st.id} className="bg-gray-900 rounded-lg border border-gray-800/50 overflow-hidden">
+                  <div key={st.id} className="bg-gray-900 rounded-lg border border-gray-800/50 overflow-hidden animate-fade-in">
                     {/* Sub-task header */}
                     <div
                       className={`p-3 ${hasIterations ? 'cursor-pointer hover:bg-gray-800/30' : ''}`}
                       onClick={() => hasIterations && toggleSubTask(st.id)}
                     >
-                      <div className="flex items-center gap-2 mb-1 flex-wrap">
+                      {/* Row 1: identity */}
+                      <div className="flex items-center gap-2">
                         {hasIterations && (
                           <span className="text-gray-600 text-[11px] w-3 shrink-0">{isExpanded ? '\u25BC' : '\u25B6'}</span>
                         )}
@@ -790,86 +866,82 @@ export default function TodoDetailPage() {
                           {st.status}
                         </span>
                         <span className="text-[11px] text-indigo-400/70">{ROLE_LABELS[st.agent_role] || st.agent_role}</span>
-                        <span className="text-sm text-gray-300">{st.title}</span>
-                        {st.review_loop && (
-                          <span className="px-1.5 py-0.5 bg-cyan-500/10 border border-cyan-500/20 rounded text-[10px] text-cyan-400/80">review loop</span>
-                        )}
-                        {st.review_verdict && (
-                          <span className={`px-1.5 py-0.5 border rounded text-[10px] ${VERDICT_COLORS[st.review_verdict] || 'bg-gray-800 text-gray-400'}`}>
-                            {st.review_verdict === 'approved' ? 'approved' : 'changes requested'}
-                          </span>
-                        )}
-                        <span className={`px-1.5 py-0.5 rounded text-[10px] font-mono ${
-                          st.target_repo
-                            ? 'bg-purple-500/10 border border-purple-500/20 text-purple-400/80'
-                            : 'bg-gray-800 text-gray-500'
-                        }`}>
-                          {st.target_repo ? st.target_repo.name : 'main'}
-                        </span>
-                        {st.depends_on && st.depends_on.length > 0 && (
-                          <span className={`text-[10px] font-mono shrink-0 ${
-                            st.status === 'pending' ? 'text-amber-400/70' : 'text-gray-600'
-                          }`}>
-                            {st.status === 'pending' ? 'blocked by' : 'after'}{' '}
-                            {st.depends_on.map((depId) => `#${stIdToIndex.get(depId) ?? '?'}`).join(', ')}
-                          </span>
-                        )}
-                        {hasIterations && (
-                          <span className="text-[11px] text-gray-600 font-mono shrink-0">
-                            {iterLog.length} iter{iterLog.length !== 1 ? 's' : ''}
-                            {failedCount > 0 && <span className="text-red-400/60 ml-1">{failedCount} fail</span>}
-                            {passedCount > 0 && <span className="text-emerald-400/60 ml-1">{passedCount} pass</span>}
-                          </span>
-                        )}
-                        {(() => {
-                          // Duration display for completed/failed subtasks
-                          if (st.started_at && st.completed_at) {
-                            const dur = new Date(st.completed_at).getTime() - new Date(st.started_at).getTime()
-                            const secs = Math.round(dur / 1000)
-                            const durStr = secs >= 60 ? `${Math.floor(secs / 60)}m ${secs % 60}s` : `${secs}s`
-                            return <span className="text-[11px] text-gray-600 font-mono shrink-0">{durStr}</span>
-                          }
-                          if (st.started_at && st.status === 'running') {
-                            const startTime = new Date(st.started_at).toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit' })
-                            return <span className="text-[11px] text-gray-600 font-mono shrink-0">started {startTime}</span>
-                          }
-                          return null
-                        })()}
-                        {(() => {
-                          const canForceRun = (st.status === 'pending' || st.status === 'failed') && todoId
-                          const hasInputContext = st.input_context && Object.keys(st.input_context).length > 0
-                          const canShowDetails = (st.output_result || st.description || st.error_message || hasInputContext)
-                          if (!canForceRun && !canShowDetails) return null
-                          return (
-                            <div className="ml-auto shrink-0 flex items-center gap-1.5">
-                              {canForceRun && (
-                                <button
-                                  onClick={(e) => { e.stopPropagation(); triggerSubTask(todoId!, st.id, true) }}
-                                  className="px-2 py-0.5 bg-gray-800 hover:bg-gray-700 rounded text-[10px] text-gray-400 transition-colors"
-                                  title="Force run — skip dependency checks"
-                                >
-                                  Force Run
-                                </button>
-                              )}
-                              {canShowDetails && (
-                                <button
-                                  onClick={(e) => {
-                                    e.stopPropagation()
-                                    setExpandedDetails((prev) => {
-                                      const next = new Set(prev)
-                                      if (next.has(st.id)) next.delete(st.id); else next.add(st.id)
-                                      return next
-                                    })
-                                  }}
-                                  className="px-2 py-0.5 bg-gray-800 hover:bg-gray-700 rounded text-[10px] text-gray-400 transition-colors"
-                                >
-                                  {expandedDetails.has(st.id) ? 'Hide' : 'Details'}
-                                </button>
-                              )}
-                            </div>
-                          )
-                        })()}
+                        <span className="text-sm text-gray-300 truncate">{st.title}</span>
+                        <div className="ml-auto shrink-0 flex items-center gap-1.5">
+                          {(() => {
+                            if (st.started_at && st.completed_at) {
+                              const dur = new Date(st.completed_at).getTime() - new Date(st.started_at).getTime()
+                              const secs = Math.round(dur / 1000)
+                              const durStr = secs >= 60 ? `${Math.floor(secs / 60)}m ${secs % 60}s` : `${secs}s`
+                              return <span className="text-[11px] text-gray-600 font-mono">{durStr}</span>
+                            }
+                            if (st.started_at && st.status === 'running') {
+                              const startTime = new Date(st.started_at).toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit' })
+                              return <span className="text-[11px] text-gray-600 font-mono">started {startTime}</span>
+                            }
+                            return null
+                          })()}
+                          {(st.status === 'pending' || st.status === 'failed') && todoId && (
+                            <button
+                              onClick={(e) => { e.stopPropagation(); triggerSubTask(todoId!, st.id, true) }}
+                              className="px-2 py-0.5 bg-gray-800 hover:bg-gray-700 rounded text-[10px] text-gray-400 transition-colors"
+                              title="Force run — skip dependency checks"
+                            >
+                              Force Run
+                            </button>
+                          )}
+                          {(st.output_result || st.description || st.error_message || (st.input_context && Object.keys(st.input_context).length > 0)) && (
+                            <button
+                              onClick={(e) => {
+                                e.stopPropagation()
+                                setExpandedDetails((prev) => {
+                                  const next = new Set(prev)
+                                  if (next.has(st.id)) next.delete(st.id); else next.add(st.id)
+                                  return next
+                                })
+                              }}
+                              className="px-2 py-0.5 bg-gray-800 hover:bg-gray-700 rounded text-[10px] text-gray-400 transition-colors"
+                            >
+                              {expandedDetails.has(st.id) ? 'Hide' : 'Details'}
+                            </button>
+                          )}
+                        </div>
                       </div>
+                      {/* Row 2: metadata tags */}
+                      {(st.target_repo || (st.depends_on && st.depends_on.length > 0) || st.review_loop || st.review_verdict || hasIterations) && (
+                        <div className={`flex items-center gap-1.5 mt-1 flex-wrap ${hasIterations ? 'ml-5' : ''}`}>
+                          <span className={`px-1.5 py-0.5 rounded text-[10px] font-mono ${
+                            st.target_repo
+                              ? 'bg-purple-500/10 border border-purple-500/20 text-purple-400/80'
+                              : 'bg-gray-800 text-gray-500'
+                          }`}>
+                            {st.target_repo ? st.target_repo.name : 'main'}
+                          </span>
+                          {st.depends_on && st.depends_on.length > 0 && (
+                            <span className={`text-[10px] font-mono ${
+                              st.status === 'pending' ? 'text-amber-400/70' : 'text-gray-600'
+                            }`}>
+                              {st.status === 'pending' ? 'blocked by' : 'after'}{' '}
+                              {st.depends_on.map((depId) => `#${stIdToIndex.get(depId) ?? '?'}`).join(', ')}
+                            </span>
+                          )}
+                          {st.review_loop && (
+                            <span className="px-1.5 py-0.5 bg-cyan-500/10 border border-cyan-500/20 rounded text-[10px] text-cyan-400/80">review</span>
+                          )}
+                          {st.review_verdict && (
+                            <span className={`px-1.5 py-0.5 border rounded text-[10px] ${VERDICT_COLORS[st.review_verdict] || 'bg-gray-800 text-gray-400'}`}>
+                              {st.review_verdict === 'approved' ? 'approved' : 'changes requested'}
+                            </span>
+                          )}
+                          {hasIterations && (
+                            <span className="text-[11px] text-gray-600 font-mono">
+                              {iterLog.length} iter{iterLog.length !== 1 ? 's' : ''}
+                              {failedCount > 0 && <span className="text-red-400/60 ml-1">{failedCount} fail</span>}
+                              {passedCount > 0 && <span className="text-emerald-400/60 ml-1">{passedCount} pass</span>}
+                            </span>
+                          )}
+                        </div>
+                      )}
                       {/* Inline output summary for completed/failed subtasks */}
                       {(st.status === 'completed' || st.status === 'failed') && st.output_result && (() => {
                         const out = st.output_result
@@ -960,39 +1032,6 @@ export default function TodoDetailPage() {
                           <SubtaskInjectInput todoId={todoId!} subtaskId={st.id} />
                         </div>
                       )}
-                      {/* LLM Response */}
-                      {(() => {
-                        const lr = llmResponses[st.id]
-                        if (!lr) return null
-                        const isOpen = expandedLlmResponse.has(st.id)
-                        const preview = lr.content.length > 120 ? lr.content.slice(0, 120) + '...' : lr.content
-                        return (
-                          <div className="mt-2">
-                            <button
-                              type="button"
-                              className="flex items-center gap-1.5 text-[11px] text-indigo-400/70 hover:text-indigo-400 transition-colors"
-                              onClick={(e) => {
-                                e.stopPropagation()
-                                setExpandedLlmResponse((prev) => {
-                                  const next = new Set(prev)
-                                  if (next.has(st.id)) next.delete(st.id); else next.add(st.id)
-                                  return next
-                                })
-                              }}
-                            >
-                              <span className="w-3">{isOpen ? '\u25BC' : '\u25B6'}</span>
-                              <span className="shrink-0">LLM Response</span>
-                              <span className="text-gray-700">(iter {lr.iteration})</span>
-                              {!isOpen && <span className="text-gray-600 truncate max-w-xs font-mono">{preview}</span>}
-                            </button>
-                            {isOpen && (
-                              <div className="mt-1.5 max-h-60 overflow-y-auto bg-gray-950 border border-indigo-500/10 rounded px-3 py-2">
-                                <pre className="text-[11px] text-gray-400 whitespace-pre-wrap font-mono leading-relaxed">{lr.content}</pre>
-                              </div>
-                            )}
-                          </div>
-                        )
-                      })()}
                       {st.error_message && (
                         <div className="mt-2 px-2.5 py-2 bg-red-500/5 border border-red-500/10 rounded">
                           <div className="flex items-center gap-1.5 mb-0.5">
@@ -1008,84 +1047,6 @@ export default function TodoDetailPage() {
                         </div>
                       )}
                     </div>
-
-                    {/* Reviewer output details */}
-                    {st.agent_role === 'reviewer' && st.output_result && (
-                      <div className="border-t border-gray-800 px-3 py-2.5">
-                        {st.output_result.summary && (
-                          <p className="text-[11px] text-gray-400 mb-2">{st.output_result.summary}</p>
-                        )}
-
-                        {st.output_result.issues && st.output_result.issues.length > 0 && (() => {
-                          type Issue = { severity: string; file?: string; line?: number | null; description: string; suggestion?: string }
-                          const issues = st.output_result!.issues as Issue[]
-
-                          const grouped = new Map<string, Issue[]>()
-                          for (const issue of issues) {
-                            const key = issue.file || '_general'
-                            if (!grouped.has(key)) grouped.set(key, [])
-                            grouped.get(key)!.push(issue)
-                          }
-
-                          const severityClass = (sev: string) =>
-                            sev === 'critical' ? 'bg-red-500/10 text-red-400' :
-                            sev === 'major' ? 'bg-amber-500/10 text-amber-400' :
-                            sev === 'minor' ? 'bg-gray-800 text-gray-400' :
-                            'bg-gray-800 text-gray-600'
-
-                          const renderIssue = (issue: Issue, idx: number) => (
-                            <div key={idx} className="flex items-start gap-2">
-                              <span className={`text-[10px] font-medium px-1.5 py-0.5 rounded shrink-0 ${severityClass(issue.severity)}`}>
-                                {issue.severity}
-                              </span>
-                              <div className="flex-1 min-w-0">
-                                <div className="text-[11px] text-gray-300">
-                                  {issue.line != null && (
-                                    <span className="text-[10px] text-gray-600 font-mono mr-1.5">L{issue.line}</span>
-                                  )}
-                                  {issue.description}
-                                </div>
-                                {issue.suggestion && (
-                                  <p className="text-[11px] text-gray-600 mt-0.5">{'\u2192'} {issue.suggestion}</p>
-                                )}
-                              </div>
-                            </div>
-                          )
-
-                          // Single group or no file info: flat list (backward compatible)
-                          if (grouped.size <= 1 && (grouped.has('_general') || grouped.size === 0)) {
-                            return <div className="space-y-1.5">{issues.map(renderIssue)}</div>
-                          }
-
-                          // Multiple groups: grouped by file
-                          return (
-                            <div className="space-y-2.5">
-                              {Array.from(grouped.entries()).map(([fileKey, fileIssues]) => (
-                                <div key={fileKey}>
-                                  {fileKey !== '_general' ? (
-                                    <div className="text-[11px] text-gray-500 font-mono flex items-center gap-1.5 mb-1">
-                                      <span className="w-1 h-1 rounded-full bg-gray-700 shrink-0" />
-                                      {fileKey}
-                                    </div>
-                                  ) : (
-                                    <div className="text-[11px] text-gray-600 uppercase tracking-wider mb-1">General</div>
-                                  )}
-                                  <div className="space-y-1.5 pl-2.5">
-                                    {fileIssues.map(renderIssue)}
-                                  </div>
-                                </div>
-                              ))}
-                            </div>
-                          )
-                        })()}
-
-                        {st.output_result.needs_human_review && (
-                          <div className="mt-2 text-[10px] text-amber-400/70 flex items-center gap-1">
-                            <span>{'\u26A0'}</span> Needs human review
-                          </div>
-                        )}
-                      </div>
-                    )}
 
                     {/* Collapsible details panel */}
                     {expandedDetails.has(st.id) && (
@@ -1187,7 +1148,6 @@ export default function TodoDetailPage() {
                             if (out.pr_merged != null) items.push({ label: 'PR Merged', value: (out.pr_merged as boolean) ? 'Yes' : 'No' })
                             if (out.merge_commit_sha) items.push({ label: 'Merge SHA', value: out.merge_commit_sha as string })
                           } else if (role === 'reviewer') {
-                            // Reviewer already has its own detailed section above, just show summary here
                             if (out.summary) items.push({ label: 'Summary', value: out.summary as string })
                           } else {
                             // Unknown role — show any string/array fields
@@ -1198,7 +1158,17 @@ export default function TodoDetailPage() {
                             }
                           }
 
-                          if (items.length === 0) return null
+                          // Reviewer issues
+                          type ReviewIssue = { severity: string; file?: string; line?: number | null; description: string; suggestion?: string }
+                          const reviewerIssues = role === 'reviewer' && out.issues ? out.issues as ReviewIssue[] : null
+
+                          if (items.length === 0 && (!reviewerIssues || reviewerIssues.length === 0)) return null
+
+                          const severityClass = (sev: string) =>
+                            sev === 'critical' ? 'bg-red-500/10 text-red-400' :
+                            sev === 'major' ? 'bg-amber-500/10 text-amber-400' :
+                            sev === 'minor' ? 'bg-gray-800 text-gray-400' :
+                            'bg-gray-800 text-gray-600'
 
                           return (
                             <div className="space-y-1.5">
@@ -1222,6 +1192,59 @@ export default function TodoDetailPage() {
                                   )}
                                 </div>
                               ))}
+                              {reviewerIssues && reviewerIssues.length > 0 && (() => {
+                                const grouped = new Map<string, ReviewIssue[]>()
+                                for (const issue of reviewerIssues) {
+                                  const key = issue.file || '_general'
+                                  if (!grouped.has(key)) grouped.set(key, [])
+                                  grouped.get(key)!.push(issue)
+                                }
+                                const renderIssue = (issue: ReviewIssue, idx: number) => (
+                                  <div key={idx} className="flex items-start gap-2">
+                                    <span className={`text-[10px] font-medium px-1.5 py-0.5 rounded shrink-0 ${severityClass(issue.severity)}`}>
+                                      {issue.severity}
+                                    </span>
+                                    <div className="flex-1 min-w-0">
+                                      <div className="text-[11px] text-gray-300">
+                                        {issue.line != null && (
+                                          <span className="text-[10px] text-gray-600 font-mono mr-1.5">L{issue.line}</span>
+                                        )}
+                                        {issue.description}
+                                      </div>
+                                      {issue.suggestion && (
+                                        <p className="text-[11px] text-gray-600 mt-0.5">{'\u2192'} {issue.suggestion}</p>
+                                      )}
+                                    </div>
+                                  </div>
+                                )
+                                if (grouped.size <= 1 && (grouped.has('_general') || grouped.size === 0)) {
+                                  return <div className="space-y-1.5 mt-2">{reviewerIssues.map(renderIssue)}</div>
+                                }
+                                return (
+                                  <div className="space-y-2.5 mt-2">
+                                    {Array.from(grouped.entries()).map(([fileKey, fileIssues]) => (
+                                      <div key={fileKey}>
+                                        {fileKey !== '_general' ? (
+                                          <div className="text-[11px] text-gray-500 font-mono flex items-center gap-1.5 mb-1">
+                                            <span className="w-1 h-1 rounded-full bg-gray-700 shrink-0" />
+                                            {fileKey}
+                                          </div>
+                                        ) : (
+                                          <div className="text-[11px] text-gray-600 uppercase tracking-wider mb-1">General</div>
+                                        )}
+                                        <div className="space-y-1.5 pl-2.5">
+                                          {fileIssues.map(renderIssue)}
+                                        </div>
+                                      </div>
+                                    ))}
+                                  </div>
+                                )
+                              })()}
+                              {out.needs_human_review && (
+                                <div className="mt-2 text-[10px] text-amber-400/70 flex items-center gap-1">
+                                  <span>{'\u26A0'}</span> Needs human review
+                                </div>
+                              )}
                             </div>
                           )
                         })()}
@@ -1239,26 +1262,58 @@ export default function TodoDetailPage() {
                           </details>
                         )}
 
-                        {/* Iteration summary table */}
+                        {/* Iterations (full log) */}
                         {iterLog.length > 0 && (
                           <details>
                             <summary className="text-[10px] text-gray-600 uppercase tracking-wider cursor-pointer hover:text-gray-500">
-                              Iterations ({iterLog.length})
+                              Iterations ({iterLog.length}) — {iterLog.reduce((s, e) => s + e.tokens_used, 0).toLocaleString()} tokens
                             </summary>
-                            <div className="mt-1.5 space-y-1">
+                            <div className="mt-1.5 max-h-64 overflow-y-auto divide-y divide-gray-800/50">
                               {iterLog.map((entry: IterationLogEntry, i: number) => (
-                                <div key={i} className="flex items-start gap-2 text-[11px]">
-                                  <span className="text-gray-700 font-mono w-5 shrink-0 text-right">#{entry.iteration}</span>
-                                  <span className={`px-1 py-0.5 rounded text-[10px] font-medium shrink-0 ${
-                                    entry.outcome === 'passed' ? 'bg-emerald-500/10 text-emerald-400/70' : 'bg-red-500/10 text-red-400/70'
-                                  }`}>{entry.outcome}</span>
-                                  <span className="text-gray-500 truncate flex-1">{entry.action}</span>
-                                  <span className="text-gray-700 font-mono shrink-0">{entry.tokens_used.toLocaleString()} tok</span>
+                                <div key={i} className="py-1.5 text-[11px]">
+                                  <div className="flex items-center gap-2">
+                                    <span className="text-gray-600 font-mono w-5 shrink-0 text-right">#{entry.iteration}</span>
+                                    <span className={`px-1 py-0.5 rounded text-[10px] font-medium shrink-0 ${
+                                      entry.outcome === 'passed' ? 'bg-emerald-500/10 text-emerald-400/70' : 'bg-red-500/10 text-red-400/70'
+                                    }`}>{entry.outcome}</span>
+                                    <span className="text-gray-500 truncate flex-1">{entry.action}</span>
+                                    <span className="text-gray-700 font-mono shrink-0">{entry.tokens_used.toLocaleString()} tok</span>
+                                  </div>
+                                  {entry.learnings.length > 0 && (
+                                    <div className="mt-1 pl-7 space-y-0.5">
+                                      {entry.learnings.map((l, li) => (
+                                        <div key={li} className="text-gray-500 flex items-start gap-1.5">
+                                          <span className="w-1 h-1 rounded-full bg-gray-700 mt-1.5 shrink-0" />
+                                          {l}
+                                        </div>
+                                      ))}
+                                    </div>
+                                  )}
+                                  {entry.llm_response && (
+                                    <details className="mt-1 pl-7">
+                                      <summary className="text-indigo-400/60 cursor-pointer hover:text-indigo-400/80 text-[10px]">
+                                        LLM Response ({entry.llm_response.length} chars)
+                                      </summary>
+                                      <pre className="mt-1 text-gray-500 font-mono whitespace-pre-wrap max-h-40 overflow-y-auto leading-relaxed">
+                                        {entry.llm_response}
+                                      </pre>
+                                    </details>
+                                  )}
+                                  {entry.error_output && (
+                                    <pre className="mt-1 pl-7 text-red-400/50 font-mono whitespace-pre-wrap max-h-20 overflow-y-auto">
+                                      {entry.error_output}
+                                    </pre>
+                                  )}
+                                  {entry.stuck_check?.stuck && (
+                                    <div className="mt-1 pl-7 px-2 py-1 bg-amber-500/5 border border-amber-500/10 rounded">
+                                      <span className="text-amber-300/70">Stuck: {entry.stuck_check.pattern}</span>
+                                      {entry.stuck_check.advice && (
+                                        <div className="text-amber-200/50 mt-0.5">Advice: {entry.stuck_check.advice}</div>
+                                      )}
+                                    </div>
+                                  )}
                                 </div>
                               ))}
-                              <div className="text-[10px] text-gray-700 font-mono pt-1 border-t border-gray-800/50">
-                                Total: {iterLog.reduce((s, e) => s + e.tokens_used, 0).toLocaleString()} tokens across {iterLog.length} iterations
-                              </div>
                             </div>
                           </details>
                         )}
@@ -1274,76 +1329,18 @@ export default function TodoDetailPage() {
                         )}
                       </div>
                     )}
-
-                    {/* Expanded iteration log */}
-                    {isExpanded && hasIterations && (
-                      <div className="border-t border-gray-800">
-                        <div className="px-3 py-2 bg-gray-950/50">
-                          <span className="text-[10px] text-gray-600 uppercase tracking-wider">Iteration Log</span>
-                        </div>
-                        <div className="max-h-64 overflow-y-auto divide-y divide-gray-800/50">
-                          {iterLog.map((entry: IterationLogEntry, i: number) => (
-                            <div key={i} className="px-3 py-2 text-[11px]">
-                              <div className="flex items-center gap-2">
-                                <span className="text-gray-600 font-mono w-6 shrink-0">#{entry.iteration}</span>
-                                <span className={`px-1.5 py-0.5 rounded font-medium ${
-                                  entry.outcome === 'passed'
-                                    ? 'bg-emerald-500/10 text-emerald-400/80'
-                                    : 'bg-red-500/10 text-red-400/80'
-                                }`}>
-                                  {entry.outcome}
-                                </span>
-                                <span className="text-gray-700">{entry.action}</span>
-                                <span className="ml-auto text-gray-700 font-mono">{entry.tokens_used.toLocaleString()} tok</span>
-                              </div>
-                              {entry.learnings.length > 0 && (
-                                <div className="mt-1 pl-8 space-y-0.5">
-                                  {entry.learnings.map((l, li) => (
-                                    <div key={li} className="text-gray-500 flex items-start gap-1.5">
-                                      <span className="w-1 h-1 rounded-full bg-gray-700 mt-1.5 shrink-0" />
-                                      {l}
-                                    </div>
-                                  ))}
-                                </div>
-                              )}
-                              {entry.llm_response && (
-                                <details className="mt-1 pl-8">
-                                  <summary className="text-indigo-400/60 cursor-pointer hover:text-indigo-400/80 text-[10px]">
-                                    LLM Response ({entry.llm_response.length} chars)
-                                  </summary>
-                                  <pre className="mt-1 text-gray-500 font-mono whitespace-pre-wrap max-h-40 overflow-y-auto leading-relaxed">
-                                    {entry.llm_response}
-                                  </pre>
-                                </details>
-                              )}
-                              {entry.error_output && (
-                                <pre className="mt-1 pl-8 text-red-400/50 font-mono whitespace-pre-wrap max-h-20 overflow-y-auto">
-                                  {entry.error_output}
-                                </pre>
-                              )}
-                              {entry.stuck_check?.stuck && (
-                                <div className="mt-1 pl-8 px-2 py-1 bg-amber-500/5 border border-amber-500/10 rounded">
-                                  <span className="text-amber-300/70">Stuck: {entry.stuck_check.pattern}</span>
-                                  {entry.stuck_check.advice && (
-                                    <div className="text-amber-200/50 mt-0.5">Advice: {entry.stuck_check.advice}</div>
-                                  )}
-                                </div>
-                              )}
-                            </div>
-                          ))}
-                        </div>
-                      </div>
-                    )}
                   </div>
                 )
               })}
             </div>
 
-            {/* Previous run sub-tasks (greyed out, with expandable details) */}
+            {/* Previous run sub-tasks */}
             {previousTasks.length > 0 && (
-              <div className="mt-4">
-                <div className="text-[10px] text-gray-600 uppercase tracking-wider mb-1.5">Previous Run</div>
-                <div className="space-y-1.5 opacity-50">
+              <details className="mt-4">
+                <summary className="text-[10px] text-gray-600 uppercase tracking-wider cursor-pointer hover:text-gray-500">
+                  Previous Run ({previousTasks.length} sub-tasks)
+                </summary>
+                <div className="mt-1.5 space-y-1.5 opacity-50">
                   {previousTasks.map((st: SubTask) => {
                     const hasOutputDetails = st.output_result && Object.keys(st.output_result).some(k => k !== 'raw_content' && k !== 'content')
                     const hasInputCtx = st.input_context && Object.keys(st.input_context).length > 0
@@ -1505,20 +1502,79 @@ export default function TodoDetailPage() {
                     )
                   })}
                 </div>
-              </div>
+              </details>
             )}
-          </div>
+
+            {/* Deliverables */}
+            {taskDeliverables.length > 0 && (() => {
+              const currentDeliverables = taskDeliverables.filter((d: Deliverable) => !isTimestampPreviousRun(d.created_at))
+              const previousDeliverables = taskDeliverables.filter((d: Deliverable) => isTimestampPreviousRun(d.created_at))
+              if (currentDeliverables.length === 0 && previousDeliverables.length === 0) return null
+
+              const renderDel = (d: Deliverable) => (
+                <div key={d.id} className="p-3 bg-gray-900 rounded-lg border border-gray-800/50">
+                  <div className="flex items-center gap-2 mb-1 flex-wrap">
+                    <span className="px-1.5 py-0.5 bg-indigo-600/30 border border-indigo-500/20 rounded text-[11px] text-indigo-300">{d.type.replace('_', ' ')}</span>
+                    <span className="text-sm text-gray-300">{d.title}</span>
+                    {d.merged_at && (
+                      <span className="px-1.5 py-0.5 bg-emerald-500/10 border border-emerald-500/20 rounded text-[10px] text-emerald-400/80">
+                        merged{d.merge_method ? ` (${d.merge_method})` : ''}
+                      </span>
+                    )}
+                    {d.pr_state && d.pr_state !== 'merged' && (
+                      <span className="px-1.5 py-0.5 bg-gray-800 rounded text-[10px] text-gray-400">{d.pr_state}</span>
+                    )}
+                    {d.target_repo_name && (
+                      <span className="px-1.5 py-0.5 bg-purple-500/10 border border-purple-500/20 rounded text-[10px] text-purple-400/80 font-mono">{d.target_repo_name}</span>
+                    )}
+                  </div>
+                  {d.pr_url && (
+                    <a href={d.pr_url} target="_blank" rel="noreferrer" className="text-[11px] text-indigo-400 hover:underline">{d.pr_url}</a>
+                  )}
+                  {d.type === 'code_diff' && d.content_json && (d.content_json as Record<string, unknown>).diff ? (
+                    <DiffViewer
+                      diff={(d.content_json as Record<string, unknown>).diff as string}
+                      stats={(d.content_json as Record<string, unknown>).stats as string}
+                      files={(d.content_json as Record<string, unknown>).files as Array<{status: string; path: string}>}
+                    />
+                  ) : d.content_md ? (
+                    <pre className="mt-2 text-[11px] text-gray-500 whitespace-pre-wrap max-h-40 overflow-y-auto font-mono leading-relaxed">{d.content_md}</pre>
+                  ) : null}
+                </div>
+              )
+
+              return (
+                <details className="mt-4" open>
+                  <summary className="text-[10px] text-gray-600 uppercase tracking-wider cursor-pointer hover:text-gray-500">
+                    Deliverables ({currentDeliverables.length}{previousDeliverables.length > 0 ? ` + ${previousDeliverables.length} previous` : ''})
+                  </summary>
+                  <div className="mt-1.5 space-y-1.5">
+                    {currentDeliverables.map(renderDel)}
+                    {previousDeliverables.length > 0 && (
+                      <details className="mt-2">
+                        <summary className="text-[10px] text-gray-600 cursor-pointer hover:text-gray-500">
+                          Previous Run ({previousDeliverables.length})
+                        </summary>
+                        <div className="mt-1.5 space-y-1.5 opacity-40">
+                          {previousDeliverables.map(renderDel)}
+                        </div>
+                      </details>
+                    )}
+                  </div>
+                </details>
+              )
+            })()}
+          </CollapsibleSection>
           )
         })()}
 
         {/* Execution Log (streaming tool events) */}
         {todoId && executionEvents.length > 0 && (
-          <div className="mb-6">
-            <h2 className="text-sm font-medium text-gray-300 mb-3 uppercase tracking-wider">Execution Log</h2>
+          <CollapsibleSection title="Execution Log" count={executionEvents.length} defaultOpen={false}>
             <div className="bg-gray-900 rounded-lg border border-gray-800/50 overflow-hidden">
               <ExecutionLog events={executionEvents} maxHeight="400px" />
             </div>
-          </div>
+          </CollapsibleSection>
         )}
 
         {/* Progress Log (RALPH learnings) */}
@@ -1555,103 +1611,25 @@ export default function TodoDetailPage() {
           )
 
           return (
-            <div className="mb-6">
-              <h2 className="text-sm font-medium text-gray-300 mb-3 uppercase tracking-wider">Progress Log</h2>
+            <CollapsibleSection title="Progress Log" count={currentLog.length} defaultOpen={false}>
               {currentLog.length > 0 && (
                 <div className="space-y-1.5">
                   {currentLog.map(renderLogEntry)}
                 </div>
               )}
               {previousLog.length > 0 && (
-                <div className={currentLog.length > 0 ? 'mt-3' : ''}>
-                  <div className="text-[10px] text-gray-600 uppercase tracking-wider mb-1.5">Previous Run</div>
-                  <div className="space-y-1.5 opacity-40">
+                <details className={currentLog.length > 0 ? 'mt-3' : ''}>
+                  <summary className="text-[10px] text-gray-600 uppercase tracking-wider cursor-pointer hover:text-gray-500">
+                    Previous Run ({previousLog.length})
+                  </summary>
+                  <div className="mt-1.5 space-y-1.5 opacity-40">
                     {previousLog.map(renderLogEntry)}
                   </div>
-                </div>
+                </details>
               )}
-            </div>
+            </CollapsibleSection>
           )
         })()}
-
-        {/* Deliverables */}
-        {taskDeliverables.length > 0 && (() => {
-          const currentDeliverables = taskDeliverables.filter((d: Deliverable) => !isTimestampPreviousRun(d.created_at))
-          const previousDeliverables = taskDeliverables.filter((d: Deliverable) => isTimestampPreviousRun(d.created_at))
-
-          const renderDeliverable = (d: Deliverable) => (
-            <div key={d.id} className="p-3 bg-gray-900 rounded-lg border border-gray-800/50">
-              <div className="flex items-center gap-2 mb-1">
-                <span className="px-1.5 py-0.5 bg-indigo-600/30 border border-indigo-500/20 rounded text-[11px] text-indigo-300">{d.type.replace('_', ' ')}</span>
-                <span className="text-sm text-gray-300">{d.title}</span>
-                {d.merged_at && (
-                  <span className="px-1.5 py-0.5 bg-emerald-500/10 border border-emerald-500/20 rounded text-[10px] text-emerald-400/80">
-                    merged{d.merge_method ? ` (${d.merge_method})` : ''}
-                  </span>
-                )}
-                {d.pr_state && d.pr_state !== 'merged' && (
-                  <span className="px-1.5 py-0.5 bg-gray-800 rounded text-[10px] text-gray-400">
-                    {d.pr_state}
-                  </span>
-                )}
-                {d.target_repo_name && (
-                  <span className="px-1.5 py-0.5 bg-purple-500/10 border border-purple-500/20 rounded text-[10px] text-purple-400/80 font-mono">
-                    {d.target_repo_name}
-                  </span>
-                )}
-              </div>
-              {d.pr_url && (
-                <a href={d.pr_url} target="_blank" rel="noreferrer" className="text-[11px] text-indigo-400 hover:underline">{d.pr_url}</a>
-              )}
-              {d.type === 'code_diff' && d.content_json && (d.content_json as Record<string, unknown>).diff ? (
-                <DiffViewer
-                  diff={(d.content_json as Record<string, unknown>).diff as string}
-                  stats={(d.content_json as Record<string, unknown>).stats as string}
-                  files={(d.content_json as Record<string, unknown>).files as Array<{status: string; path: string}>}
-                />
-              ) : d.content_md ? (
-                <pre className="mt-2 text-[11px] text-gray-500 whitespace-pre-wrap max-h-40 overflow-y-auto font-mono leading-relaxed">
-                  {d.content_md}
-                </pre>
-              ) : null}
-            </div>
-          )
-
-          return (
-            <div className="mb-6">
-              <h2 className="text-sm font-medium text-gray-300 mb-3 uppercase tracking-wider">Deliverables</h2>
-              {currentDeliverables.length > 0 && (
-                <div className="space-y-1.5">
-                  {currentDeliverables.map(renderDeliverable)}
-                </div>
-              )}
-              {previousDeliverables.length > 0 && (
-                <div className={currentDeliverables.length > 0 ? 'mt-3' : ''}>
-                  <div className="text-[10px] text-gray-600 uppercase tracking-wider mb-1.5">Previous Run</div>
-                  <div className="space-y-1.5 opacity-40">
-                    {previousDeliverables.map(renderDeliverable)}
-                  </div>
-                </div>
-              )}
-            </div>
-          )
-        })()}
-
-        {/* Metrics */}
-        <div className="flex gap-4 flex-wrap text-[11px] text-gray-600 font-mono border-t border-gray-900 pt-4">
-          <span>tokens: {todo.actual_tokens.toLocaleString()}</span>
-          <span>cost: ${todo.cost_usd.toFixed(4)}</span>
-          <span>retries: {todo.retry_count}</span>
-          {todo.completed_at && todo.created_at && (() => {
-            const dur = new Date(todo.completed_at).getTime() - new Date(todo.created_at).getTime()
-            const secs = Math.round(dur / 1000)
-            if (secs < 60) return <span>duration: {secs}s</span>
-            if (secs < 3600) return <span>duration: {Math.floor(secs / 60)}m {secs % 60}s</span>
-            const hrs = Math.floor(secs / 3600)
-            const mins = Math.floor((secs % 3600) / 60)
-            return <span>duration: {hrs}h {mins}m</span>
-          })()}
-        </div>
 
         {/* Mobile chat toggle */}
         <button
@@ -1683,6 +1661,7 @@ export default function TodoDetailPage() {
 
             const renderMessage = (msg: ChatMessage) => {
               const time = new Date(msg.created_at).toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit' })
+              const meta = msg.metadata_json as Record<string, unknown> | undefined
               return (
               <div
                 key={msg.id}
@@ -1699,16 +1678,38 @@ export default function TodoDetailPage() {
                   <span className="text-gray-700 font-mono">{time}</span>
                 </div>
                 <div className="text-gray-300 whitespace-pre-wrap text-[13px] leading-relaxed">{msg.content}</div>
+                {meta?.action === 'plan_review_verdict' && (
+                  <ReviewFeedbackCard
+                    type="plan"
+                    approved={!!meta.approved}
+                    feedback={meta.feedback as string | undefined}
+                    iteration={meta.iteration as number | undefined}
+                  />
+                )}
+                {meta?.action === 'code_review_verdict' && (
+                  <ReviewFeedbackCard
+                    type="code"
+                    approved={meta.verdict === 'approved'}
+                    feedback={meta.feedback as string | undefined}
+                    summary={meta.summary as string | undefined}
+                    issues={meta.issues as Array<{ severity: 'critical' | 'major' | 'minor' | 'nit'; file?: string; line?: number | null; description: string; suggestion?: string }>}
+                    subtaskTitle={meta.subtask_title as string | undefined}
+                  />
+                )}
               </div>
             )}
 
             return (
               <>
                 {previousMessages.length > 0 && (
-                  <div className="opacity-40 space-y-2.5 pb-2 mb-2 border-b border-gray-800/50">
-                    <div className="text-[10px] text-gray-600 uppercase tracking-wider">Previous Run</div>
-                    {previousMessages.map(renderMessage)}
-                  </div>
+                  <details className="pb-2 mb-2 border-b border-gray-800/50">
+                    <summary className="text-[10px] text-gray-600 uppercase tracking-wider cursor-pointer hover:text-gray-500">
+                      Previous Run ({previousMessages.length} messages)
+                    </summary>
+                    <div className="mt-1.5 opacity-40 space-y-2.5">
+                      {previousMessages.map(renderMessage)}
+                    </div>
+                  </details>
                 )}
                 {currentMessages.map(renderMessage)}
               </>

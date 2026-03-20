@@ -42,6 +42,7 @@ async def get_chat_history(todo_id: str, user: CurrentUser, db: DB):
                 "role": r["role"],
                 "content": r["content"],
                 "agent_run_id": None,
+                "metadata_json": r.get("metadata_json"),
                 "created_at": r["created_at"].isoformat() if hasattr(r["created_at"], "isoformat") else str(r["created_at"]),
             }
             for r in rows

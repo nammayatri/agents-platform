@@ -77,7 +77,7 @@ class TestingPhase:
             if project and project.get("repo_url"):
                 workspace_path = await coord.workspace_mgr.setup_task_workspace(coord.todo_id)
         except Exception:
-            logger.warning("[%s] Could not set up workspace for testing", coord.todo_id, exc_info=True)
+            logger.exception("[%s] Could not set up workspace for testing — skipping to review", coord.todo_id)
 
         if not workspace_path:
             logger.info("[%s] No workspace for testing, skipping to review", coord.todo_id)

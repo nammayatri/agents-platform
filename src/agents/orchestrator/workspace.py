@@ -71,13 +71,17 @@ class WorkspaceManager:
         )
         branch = project.get("default_branch") or "main"
 
-        await self._clone_or_pull(
+        ok = await self._clone_or_pull(
             repo_url=repo_url,
             target_dir=repo_dir,
             branch=branch,
             token=token,
             provider_type=provider_type,
         )
+        if not ok:
+            raise RuntimeError(
+                f"Failed to clone/pull project repo {repo_url} into {repo_dir}"
+            )
 
         context_docs = project.get("context_docs") or []
         if isinstance(context_docs, str):
@@ -152,8 +156,30 @@ class WorkspaceManager:
             project_workspace = await self.setup_project_workspace(project_id)
 
         project_repo_dir = os.path.join(project_workspace, "repo")
-        if not os.path.isdir(project_repo_dir):
-            raise ValueError(f"Project repo not cloned at {project_repo_dir}")
+
+        # Verify the project repo is a valid, functional git clone.
+        # Just checking for .git dir is insufficient — the repo can be corrupt
+        # (missing objects, interrupted clone, /tmp cleanup, etc.).
+        repo_valid = False
+        if os.path.isdir(project_repo_dir):
+            rc, _ = await run_git_command(
+                "rev-parse", "--git-dir", cwd=project_repo_dir,
+            )
+            repo_valid = rc == 0
+
+        if not repo_valid:
+            if os.path.isdir(project_repo_dir):
+                logger.warning(
+                    "[workspace] Project repo dir exists but is not a valid git repo, "
+                    "removing and re-cloning for project=%s", project_id,
+                )
+                shutil.rmtree(project_repo_dir, ignore_errors=True)
+            else:
+                logger.info("[workspace] Project repo dir missing, re-cloning for project=%s", project_id)
+            project_workspace = await self.setup_project_workspace(project_id)
+            project_repo_dir = os.path.join(project_workspace, "repo")
+            if not os.path.isdir(project_repo_dir):
+                raise ValueError(f"Project repo not cloned at {project_repo_dir} after re-setup")
 
         short_id = str(todo_id)[:8]
         task_dir = os.path.join(project_workspace, "tasks", str(todo_id))
@@ -221,6 +247,86 @@ class WorkspaceManager:
             shutil.rmtree(task_dir, ignore_errors=True)
             logger.info("Cleaned up task workspace %s", task_dir)
 
+    async def evict_old_workspaces(self, max_total_bytes: int = 10 * 1024**3) -> int:
+        """LRU-evict completed task workspaces when total size exceeds limit.
+
+        Scans all ``{project}/tasks/{todo}/`` directories, measures total disk
+        usage, and removes the oldest (by mtime) directories belonging to
+        completed/cancelled/failed tasks until total drops below *max_total_bytes*.
+
+        Returns the number of workspaces evicted.
+        """
+        task_dirs: list[tuple[float, str, str]] = []  # (mtime, path, todo_id)
+
+        for project_name in os.listdir(self.workspace_root):
+            project_path = os.path.join(self.workspace_root, project_name)
+            tasks_root = os.path.join(project_path, "tasks")
+            if not os.path.isdir(tasks_root):
+                continue
+            for todo_name in os.listdir(tasks_root):
+                task_path = os.path.join(tasks_root, todo_name)
+                if not os.path.isdir(task_path):
+                    continue
+                try:
+                    mtime = os.path.getmtime(task_path)
+                except OSError:
+                    continue
+                task_dirs.append((mtime, task_path, todo_name))
+
+        if not task_dirs:
+            return 0
+
+        # Calculate total size (approximate via du-style walk)
+        total_bytes = 0
+        dir_sizes: dict[str, int] = {}
+        for _, path, _ in task_dirs:
+            size = 0
+            try:
+                for dirpath, _dirnames, filenames in os.walk(path):
+                    for f in filenames:
+                        try:
+                            size += os.path.getsize(os.path.join(dirpath, f))
+                        except OSError:
+                            pass
+            except OSError:
+                pass
+            dir_sizes[path] = size
+            total_bytes += size
+
+        if total_bytes <= max_total_bytes:
+            return 0
+
+        # Sort by mtime ascending (oldest first) for LRU eviction
+        task_dirs.sort(key=lambda t: t[0])
+
+        # Only evict completed/cancelled/failed tasks
+        terminal_ids: set[str] = set()
+        try:
+            rows = await self.db.fetch(
+                "SELECT id FROM todo_items WHERE state IN ('completed', 'cancelled', 'failed')"
+            )
+            terminal_ids = {str(r["id"]) for r in rows}
+        except Exception:
+            logger.warning("Could not fetch terminal task IDs for eviction")
+            return 0
+
+        evicted = 0
+        for _mtime, path, todo_id in task_dirs:
+            if total_bytes <= max_total_bytes:
+                break
+            if todo_id not in terminal_ids:
+                continue  # don't evict active tasks
+            freed = dir_sizes.get(path, 0)
+            try:
+                shutil.rmtree(path, ignore_errors=True)
+                total_bytes -= freed
+                evicted += 1
+                logger.info("Evicted workspace %s (freed ~%dMB)", path, freed // (1024 * 1024))
+            except Exception:
+                logger.debug("Failed to evict workspace %s", path)
+
+        return evicted
+
     # ------------------------------------------------------------------
     # Command execution (quality checks, etc.)
     # ------------------------------------------------------------------
@@ -256,18 +362,29 @@ class WorkspaceManager:
         workspace_path: str,
         message: str,
         branch: str,
-    ) -> bool:
+    ) -> dict:
         """Stage all changes, commit, and push to remote.
 
-        Returns True if the branch was successfully pushed.
+        Returns a dict with:
+            success (bool): True if the branch was successfully pushed.
+            error (str | None): Error description on failure.
+            pre_commit_failed (bool): True if commit failed due to pre-commit hooks.
+            pre_commit_output (str | None): Raw pre-commit/hook error output.
         """
+        result: dict = {
+            "success": False,
+            "error": None,
+            "pre_commit_failed": False,
+            "pre_commit_output": None,
+        }
         repo_dir = os.path.join(workspace_path, "repo")
         if not os.path.isdir(repo_dir):
             repo_dir = workspace_path
 
         if not os.path.isdir(os.path.join(repo_dir, ".git")):
             logger.error("commit_and_push: no .git directory in %s", repo_dir)
-            return False
+            result["error"] = "no .git directory"
+            return result
 
         await ensure_authenticated_remote(repo_dir, self.db)
 
@@ -281,12 +398,14 @@ class WorkspaceManager:
                     rc, out = await run_git_command("checkout", "-b", branch, cwd=repo_dir)
                     if rc != 0:
                         logger.error("git checkout -b %s failed: %s", branch, out)
-                        return False
+                        result["error"] = f"checkout failed: {out}"
+                        return result
 
         rc, out = await run_git_command("add", "-A", cwd=repo_dir)
         if rc != 0:
             logger.error("git add failed: %s", out)
-            return False
+            result["error"] = f"git add failed: {out}"
+            return result
 
         rc, out = await run_git_command("diff", "--cached", "--quiet", cwd=repo_dir)
         if rc == 0:
@@ -294,17 +413,34 @@ class WorkspaceManager:
         else:
             rc, out = await run_git_command("commit", "-m", message, cwd=repo_dir)
             if rc != 0:
-                logger.error("git commit failed: %s", out)
-                return False
+                # Detect pre-commit hook failure
+                hook_indicators = [
+                    "pre-commit", "hook", "husky", "lint-staged",
+                    "eslint", "prettier", "tsc", "mypy", "ruff",
+                    "flake8", "black", "isort",
+                ]
+                out_lower = out.lower()
+                is_hook_failure = any(ind in out_lower for ind in hook_indicators)
+                if is_hook_failure:
+                    logger.warning("commit_and_push: pre-commit hook failed:\n%s", out[:2000])
+                    result["pre_commit_failed"] = True
+                    result["pre_commit_output"] = out
+                    result["error"] = "pre-commit hook failed"
+                else:
+                    logger.error("git commit failed: %s", out)
+                    result["error"] = f"git commit failed: {out}"
+                return result
             logger.info("Committed changes on branch %s", branch)
 
         rc, out = await run_git_command("push", "-u", "origin", branch, cwd=repo_dir)
         if rc != 0:
             logger.error("git push failed: %s", out)
-            return False
+            result["error"] = f"git push failed: {out}"
+            return result
 
         logger.info("Pushed branch %s to origin", branch)
-        return True
+        result["success"] = True
+        return result
 
     async def create_pr(
         self,

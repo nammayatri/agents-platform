@@ -112,15 +112,27 @@ class AgentCoordinator:
 
     async def _transition_todo(self, target_state: str, **kwargs) -> dict | None:
         """Wrapper that auto-passes db, todo_id, and redis for WS publishing."""
-        return await _transition_todo(
+        result = await _transition_todo(
             self.db, self.todo_id, target_state, redis=self.redis, **kwargs,
         )
+        if result is None:
+            logger.warning(
+                "[%s] transition_todo to '%s' failed (state changed concurrently)",
+                self.todo_id, target_state,
+            )
+        return result
 
     async def _transition_subtask(self, subtask_id: str, target_status: str, **kwargs) -> dict | None:
         """Wrapper that auto-passes db and redis for WS publishing."""
-        return await _transition_subtask(
+        result = await _transition_subtask(
             self.db, subtask_id, target_status, redis=self.redis, **kwargs,
         )
+        if result is None:
+            logger.warning(
+                "[%s] transition_subtask %s to '%s' failed (status changed concurrently)",
+                self.todo_id, subtask_id[:8], target_status,
+            )
+        return result
 
     async def _resolve_agent_config(self, role: str, owner_id: str) -> dict | None:
         """Look up a custom agent_config for the given role.
@@ -675,10 +687,17 @@ class AgentCoordinator:
                 )
         else:
             # Standard: write to chat_messages
-            await self.db.execute(
-                "INSERT INTO chat_messages (todo_id, role, content) VALUES ($1, $2, $3)",
-                self.todo_id, role, content,
-            )
+            if metadata:
+                await self.db.execute(
+                    "INSERT INTO chat_messages (todo_id, role, content, metadata_json) "
+                    "VALUES ($1, $2, $3, $4::jsonb)",
+                    self.todo_id, role, content, json.dumps(metadata),
+                )
+            else:
+                await self.db.execute(
+                    "INSERT INTO chat_messages (todo_id, role, content) VALUES ($1, $2, $3)",
+                    self.todo_id, role, content,
+                )
 
         # Always publish to the task events channel for the todo detail WS
         msg_payload = {"role": role, "content": content}

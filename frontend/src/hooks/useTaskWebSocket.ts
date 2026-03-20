@@ -78,6 +78,7 @@ export function useTaskWebSocket(todoId: string | null) {
                 todo_id: todoId,
                 role: data.message.role as ChatMessage['role'],
                 content: data.message.content,
+                metadata_json: data.message.metadata_json,
                 created_at: new Date().toISOString(),
               })
             }

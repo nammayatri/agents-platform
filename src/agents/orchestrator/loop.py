@@ -23,6 +23,7 @@ from agents.orchestrator.coordinator import AgentCoordinator
 from agents.orchestrator.events import EventBus, TaskEvent
 from agents.orchestrator.locks import LockManager
 from agents.orchestrator.state_machine import transition_todo
+from agents.orchestrator.workspace import WorkspaceManager
 from agents.providers.registry import ProviderRegistry
 
 logger = logging.getLogger(__name__)
@@ -43,6 +44,7 @@ class EventDrivenOrchestrator:
         self.locks = LockManager(db_pool, worker_id, settings.orchestrator_lock_ttl)
         self.provider_registry = ProviderRegistry(db_pool)
         self.notifier = Notifier(db_pool)
+        self.workspace_mgr = WorkspaceManager(db_pool, settings.workspace_root)
         self.active_tasks: dict[str, asyncio.Task] = {}
         self.shutdown_event = asyncio.Event()
         self.max_concurrent = settings.orchestrator_max_concurrent
@@ -183,13 +185,12 @@ class EventDrivenOrchestrator:
             await self.event_bus.ack(msg_id)
             return
 
-        # Dispatch
+        # Dispatch — ack is deferred to _run_todo finally block
         task = asyncio.create_task(
-            self._run_todo(dict(todo)),
+            self._run_todo(dict(todo), msg_id=msg_id),
             name=f"todo-{todo_id[:8]}",
         )
         self.active_tasks[todo_id] = task
-        await self.event_bus.ack(msg_id)
         logger.info("Dispatched task %s (state=%s, sub_state=%s) from event %s",
                      todo_id[:8], todo["state"], todo.get("sub_state"), event.event_type)
 
@@ -221,6 +222,14 @@ class EventDrivenOrchestrator:
 
                 # 7. Fallback poll: catch anything events missed
                 await self._fallback_poll()
+
+                # 8. LRU-evict old task workspaces when disk usage exceeds 10GB
+                try:
+                    evicted = await self.workspace_mgr.evict_old_workspaces()
+                    if evicted:
+                        logger.info("Evicted %d old task workspaces", evicted)
+                except Exception:
+                    logger.debug("Workspace eviction failed", exc_info=True)
 
             except asyncio.CancelledError:
                 raise
@@ -309,7 +318,7 @@ class EventDrivenOrchestrator:
 
     # ── Task Execution ───────────────────────────────────────────────
 
-    async def _run_todo(self, todo: dict) -> None:
+    async def _run_todo(self, todo: dict, *, msg_id: str | None = None) -> None:
         """Process a single TODO through its lifecycle."""
         todo_id = str(todo["id"])
         logger.info("_run_todo START: %s (state=%s, sub_state=%s, title=%s)",
@@ -356,6 +365,11 @@ class EventDrivenOrchestrator:
             except Exception:
                 logger.exception("Failed to transition task %s to failed", todo_id[:8])
         finally:
+            if msg_id:
+                try:
+                    await self.event_bus.ack(msg_id)
+                except Exception:
+                    logger.warning("Failed to ack event %s for task %s", msg_id, todo_id[:8])
             await self.locks.release(todo_id)
             self.active_tasks.pop(todo_id, None)
 

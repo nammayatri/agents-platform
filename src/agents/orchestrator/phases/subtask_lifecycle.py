@@ -181,8 +181,17 @@ class SubtaskLifecycle:
                 )
 
             if verdict == "approved":
+                output = st.get("output_result") or {}
                 await coord._post_system_message(
-                    "**Review approved.** Creating PR sub-task..."
+                    "**Code review: Approved.** Creating PR sub-task...",
+                    metadata={
+                        "action": "code_review_verdict",
+                        "task_id": coord.todo_id,
+                        "subtask_title": st.get("title", ""),
+                        "verdict": "approved",
+                        "feedback": output.get("content", "")[:500] if isinstance(output, dict) else "",
+                        "summary": output.get("summary", "") if isinstance(output, dict) else "",
+                    },
                 )
                 await self.create_pr_creator_subtask(st, chain_id)
             else:
@@ -190,12 +199,88 @@ class SubtaskLifecycle:
                 if isinstance(output, dict):
                     reviewer_feedback = output.get("content", "")
                     structured_issues = output.get("issues", [])
+                    review_summary = output.get("summary", "")
                 else:
                     reviewer_feedback = str(output)
                     structured_issues = []
+                    review_summary = ""
+
+                # Post review feedback to chat before creating fix subtasks
+                issues_text = ""
+                if structured_issues:
+                    parts = []
+                    for iss in structured_issues[:20]:
+                        if isinstance(iss, dict):
+                            sev = iss.get("severity", "major").upper()
+                            f = iss.get("file", "")
+                            loc = f" `{f}`" if f else ""
+                            if iss.get("line"):
+                                loc += f":{iss['line']}"
+                            parts.append(f"- **[{sev}]**{loc} {iss.get('description', '')}")
+                    issues_text = "\n".join(parts)
+
+                await coord._post_system_message(
+                    f"**Code review: Changes requested**\n\n"
+                    + (f"{review_summary}\n\n" if review_summary else "")
+                    + (issues_text if issues_text else reviewer_feedback[:1500]),
+                    metadata={
+                        "action": "code_review_verdict",
+                        "task_id": coord.todo_id,
+                        "subtask_title": st.get("title", ""),
+                        "verdict": "needs_changes",
+                        "feedback": reviewer_feedback[:2000],
+                        "issues": structured_issues[:20],
+                        "summary": review_summary,
+                    },
+                )
+
                 await self.create_fix_subtasks(
                     st, chain_id, reviewer_feedback, structured_issues,
                 )
+
+    # ------------------------------------------------------------------
+    # Dependency propagation
+    # ------------------------------------------------------------------
+
+    async def _propagate_dependencies(
+        self, parent_subtask_id: str, new_subtask_ids: list[str],
+    ) -> None:
+        """When a subtask creates continuation subtasks, propagate to dependents.
+
+        Any subtask that depends on `parent_subtask_id` should also depend on
+        the newly created subtask IDs so it waits for the full chain to finish.
+        """
+        if not new_subtask_ids:
+            return
+        coord = self._coord
+
+        # Find all subtasks that have parent_subtask_id in their depends_on
+        dependents = await coord.db.fetch(
+            "SELECT id, depends_on FROM sub_tasks "
+            "WHERE todo_id = $1 AND $2 = ANY(depends_on) AND status = 'pending'",
+            coord.todo_id, parent_subtask_id,
+        )
+        if not dependents:
+            return
+
+        for dep in dependents:
+            dep_id = str(dep["id"])
+            # Skip if the dependent IS one of the new subtasks (avoid circular deps)
+            if dep_id in new_subtask_ids:
+                continue
+            existing = [str(d) for d in (dep["depends_on"] or [])]
+            to_add = [sid for sid in new_subtask_ids if sid not in existing and sid != dep_id]
+            if not to_add:
+                continue
+            updated_deps = existing + to_add
+            await coord.db.execute(
+                "UPDATE sub_tasks SET depends_on = $2 WHERE id = $1",
+                dep["id"], updated_deps,
+            )
+            logger.info(
+                "[%s] Propagated deps: subtask %s now also depends on %s (via parent %s)",
+                coord.todo_id, dep_id[:8], [s[:8] for s in to_add], parent_subtask_id[:8],
+            )
 
     # ------------------------------------------------------------------
     # Reviewer / fix subtask creation
@@ -285,10 +370,13 @@ class SubtaskLifecycle:
             chain_id,
             target_repo_json,
         )
+        reviewer_id = str(row["id"])
         logger.info(
             "Created reviewer sub-task %s for chain %s (depends on coder %s)",
-            row["id"], chain_id, coder_st["id"],
+            reviewer_id, chain_id, coder_st["id"],
         )
+        # Propagate: tasks depending on the coder should also wait for the reviewer
+        await self._propagate_dependencies(str(coder_st["id"]), [reviewer_id])
         await coord._post_system_message(
             f"**Review loop:** Created reviewer sub-task for '{coder_st['title']}'"
         )
@@ -375,9 +463,15 @@ class SubtaskLifecycle:
             chain_id,
             target_repo_json,
         )
+        new_reviewer_id = str(reviewer_row["id"])
         logger.info(
             "Created pre-reviewer sub-task %s (depends on %d fixes) for chain %s",
-            reviewer_row["id"], len(fix_task_ids), chain_id,
+            new_reviewer_id, len(fix_task_ids), chain_id,
+        )
+        # Propagate: tasks depending on the old reviewer should also wait
+        # for the new reviewer (the final output of this fix cycle)
+        await self._propagate_dependencies(
+            str(reviewer_st["id"]), [new_reviewer_id],
         )
         await coord._post_system_message(
             f"**Review loop:** Reviewer requested changes across {len(file_groups)} files. "
@@ -448,7 +542,10 @@ class SubtaskLifecycle:
             chain_id,
             target_repo_json,
         )
-        logger.info("Created fix sub-task %s for chain %s", row["id"], chain_id)
+        fix_id = str(row["id"])
+        logger.info("Created fix sub-task %s for chain %s", fix_id, chain_id)
+        # Propagate: tasks depending on the old reviewer should also wait for the fix
+        await self._propagate_dependencies(str(reviewer_st["id"]), [fix_id])
         await coord._post_system_message(
             "**Review loop:** Reviewer requested changes. Created fix sub-task."
         )
@@ -655,6 +752,11 @@ class SubtaskLifecycle:
             created.append(("reviewer", reviewer_id))
 
         if created:
+            # Propagate: tasks depending on coders should also wait for guardrails
+            all_new_ids = [sid for _, sid in created]
+            for coder_id in coder_ids:
+                await self._propagate_dependencies(coder_id, all_new_ids)
+
             roles = ", ".join(r for r, _ in created)
             logger.info(
                 "[%s] Coding guardrails: auto-created %s subtask(s) for unreviewed coder work",
@@ -856,6 +958,60 @@ class SubtaskLifecycle:
         )
 
     # ------------------------------------------------------------------
+    # Pre-commit hook fix description builder
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _build_pre_commit_fix_description(error_output: str) -> str:
+        """Build a detailed coder subtask description for fixing pre-commit hook errors."""
+        return (
+            "The git pre-commit hooks failed when trying to commit your changes. "
+            "You MUST fix every error and then successfully commit.\n\n"
+            "## Workflow (repeat until commit succeeds)\n\n"
+            "1. Read the pre-commit errors below.\n"
+            "2. Read each failing file to understand context.\n"
+            "3. Fix the errors.\n"
+            "4. Stage and commit: `git add -A && git commit -m \"fix: resolve pre-commit hook errors\"`\n"
+            "5. If the commit **fails again**, read the NEW error output, fix the new errors, "
+            "and run the commit command again. **Keep looping until the commit succeeds.**\n"
+            "6. Only call `task_complete` after a successful commit.\n\n"
+            "## Critical Rules\n\n"
+            "1. **Fix every error** — do NOT skip or ignore any.\n"
+            "2. **Do NOT suppress checks** — no `eslint-disable`, `@ts-ignore`, `type: ignore`, "
+            "`noqa`, `# noinspection`, `prettier-ignore`, or any other skip/suppress comment.\n"
+            "3. **Do NOT revert the functional changes** — only fix the lint/type/style issues "
+            "while preserving the intended behavior.\n"
+            "4. **Do NOT remove or simplify existing code** just to avoid lint errors. "
+            "Rewrite the code to satisfy the rule properly.\n"
+            "5. **NEVER use `--no-verify`** — always let pre-commit hooks run.\n"
+            "6. **You MUST commit successfully** — do not mark the task complete without a "
+            "successful `git commit` (exit code 0).\n\n"
+            "## Common Fix Patterns\n\n"
+            "- **`functional/immutable-data`** (Modifying object/array/map not allowed): "
+            "Use spread syntax (`{...obj, key: value}`), `.map()`, `.filter()`, "
+            "`new Map([...oldMap, [key, value]])`, or `Object.assign({}, obj, updates)` "
+            "instead of direct mutation.\n"
+            "- **`no-as-in-modified-files`** (No type assertions with `as`): "
+            "Use `satisfies`, generic type parameters, proper type annotations on variables, "
+            "or type guard functions instead of `as` casts.\n"
+            "- **`functional/no-let`** (No `let`): "
+            "Use `const` with ternary expressions, `Array.reduce()`, or immediately-invoked "
+            "functions to avoid mutable bindings.\n"
+            "- **`no-console`** (No console.log): "
+            "Remove `console.log` calls or replace with allowed methods "
+            "(`console.warn`, `console.error`, `console.info`).\n"
+            "- **`no-non-null-assertion`** (No `!` assertions): "
+            "Use optional chaining (`?.`), nullish coalescing (`??`), "
+            "or explicit null checks with early returns.\n"
+            "- **`immutable-data` on arrays** (No `.push()`, `.splice()`, etc.): "
+            "Use `[...arr, newItem]`, `.concat()`, or `.filter()` to produce new arrays.\n\n"
+            "## Pre-Commit Errors\n\n"
+            f"```\n{error_output[:6000]}\n```\n\n"
+            "**Remember:** Fix → `git add -A && git commit` → if it fails, fix again → repeat. "
+            "Do NOT call task_complete until the commit exits with code 0."
+        )
+
+    # ------------------------------------------------------------------
     # Workspace finalization (commit → push → PR)
     # ------------------------------------------------------------------
 
@@ -898,14 +1054,24 @@ class SubtaskLifecycle:
                         bool(target_repo), workspace_path)
 
             # Step 1: commit and push
-            pushed = await coord.workspace_mgr.commit_and_push(
+            commit_result = await coord.workspace_mgr.commit_and_push(
                 workspace_path,
                 message=f"[agents] {sub_task['title']}",
                 branch=branch_name,
             )
-            if not pushed:
-                logger.error("[%s] commit_and_push failed for branch %s", coord.todo_id, branch_name)
-                await coord._post_system_message(f"**PR creation failed:** could not push to branch `{branch_name}`.")
+
+            # If pre-commit hooks failed, signal the caller to create a fix subtask
+            if commit_result.get("pre_commit_failed"):
+                return {
+                    "_pre_commit_failed": True,
+                    "pre_commit_output": commit_result.get("pre_commit_output", ""),
+                    "workspace_path": workspace_path,
+                }
+
+            if not commit_result["success"]:
+                error = commit_result.get("error", "unknown error")
+                logger.error("[%s] commit_and_push failed for branch %s: %s", coord.todo_id, branch_name, error)
+                await coord._post_system_message(f"**PR creation failed:** could not push to branch `{branch_name}` — {error}")
                 return None
 
             logger.info("[%s] Pushed to branch %s", coord.todo_id, branch_name)
@@ -1118,6 +1284,36 @@ class SubtaskLifecycle:
             if not pr_info:
                 raise ValueError("PR creation failed — no PR data returned")
 
+            # Handle pre-commit hook failure — create a fix subtask and retry
+            if pr_info.get("_pre_commit_failed"):
+                pre_commit_output = pr_info.get("pre_commit_output", "")
+                logger.info("[%s] Pre-commit hooks failed, creating fix subtask", coord.todo_id)
+
+                fix_description = self._build_pre_commit_fix_description(pre_commit_output)
+                fix_id = await self.create_guardrail_subtask(
+                    title="Fix: pre-commit hook errors",
+                    description=fix_description,
+                    role="coder",
+                    depends_on=[],
+                )
+
+                await coord._post_system_message(
+                    f"**Pre-commit hooks failed.** Created fix subtask to resolve the errors.\n\n"
+                    f"```\n{pre_commit_output[:2000]}\n```"
+                )
+
+                # Reset PR creator to pending, blocked on the fix subtask
+                await coord.db.execute(
+                    "UPDATE sub_tasks SET status = 'pending', depends_on = $2, updated_at = NOW() WHERE id = $1",
+                    sub_task["id"],
+                    [fix_id],
+                )
+                logger.info(
+                    "[%s] PR creator %s reset to pending, blocked on fix subtask %s",
+                    coord.todo_id, st_id, fix_id,
+                )
+                return
+
             pr_url = pr_info.get("url", "N/A")
             await coord._report_progress(st_id, 80, f"PR created: {pr_url}")
             await coord._post_system_message(
@@ -1174,7 +1370,7 @@ class SubtaskLifecycle:
 
             if require_merge_approval:
                 # Merge not allowed — create observer that watches for external merge
-                await coord.db.fetchrow(
+                merge_row = await coord.db.fetchrow(
                     """
                     INSERT INTO sub_tasks (
                         todo_id, title, description, agent_role,
@@ -1195,7 +1391,7 @@ class SubtaskLifecycle:
                 )
             else:
                 # Auto-merge allowed — create merge agent
-                await coord.db.fetchrow(
+                merge_row = await coord.db.fetchrow(
                     """
                     INSERT INTO sub_tasks (
                         todo_id, title, description, agent_role,
@@ -1211,6 +1407,9 @@ class SubtaskLifecycle:
                     all_coder_ids,
                     target_repo_json,
                 )
+
+            # Propagate: tasks depending on pr_creator should also wait for merge
+            await self._propagate_dependencies(st_id, [str(merge_row["id"])])
 
             await coord._report_progress(st_id, 100, "PR created successfully")
             await coord._transition_subtask(

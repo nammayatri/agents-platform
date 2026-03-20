@@ -312,6 +312,16 @@ export const projectChat = {
         `/projects/${projectId}/chat/sessions/${sessionId}/accept-plan`,
         { method: 'POST' },
       ),
+    acceptTaskPlan: (projectId: string, sessionId: string) =>
+      request<{ user_message: ProjectChatMessage; assistant_message: ProjectChatMessage; task_id: string }>(
+        `/projects/${projectId}/chat/sessions/${sessionId}/accept-task-plan`,
+        { method: 'POST' },
+      ),
+    discardTaskPlan: (projectId: string, sessionId: string, feedback: string) =>
+      request<{ status: string }>(
+        `/projects/${projectId}/chat/sessions/${sessionId}/discard-task-plan`,
+        { method: 'POST', body: JSON.stringify({ feedback }) },
+      ),
   },
   sendInSession: (projectId: string, sessionId: string, content: string, intent?: string, model?: string) =>
     request<{ user_message: ProjectChatMessage; assistant_message: ProjectChatMessage; routing_mode?: string; mode_auto_switched?: boolean }>(

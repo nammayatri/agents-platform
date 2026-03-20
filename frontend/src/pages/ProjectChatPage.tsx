@@ -1,7 +1,9 @@
 import { useEffect, useRef, useState } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
-import { projectChat, projects as projectsApi, providers as providersApi, todos as todosApi } from '../services/api'
+import { Plus, X, PanelLeft, ArrowLeft, Bot, Send, Syringe, ChevronDown, ChevronRight, Loader2 } from 'lucide-react'
+import { projectChat, projects as projectsApi, providers as providersApi } from '../services/api'
 import PlanReviewCard from '../components/chat/PlanReviewCard'
+import ReviewFeedbackCard from '../components/chat/ReviewFeedbackCard'
 import { useChatSessionWebSocket } from '../hooks/useChatSessionWebSocket'
 import type { Project, ChatSession, ProjectChatMessage, ModelInfo, ChatMode, ChatExecutionInfo } from '../types'
 
@@ -17,7 +19,7 @@ const modeStyles: Record<ChatMode, string> = {
   auto: 'text-blue-400 bg-blue-500/10 border border-blue-500/20',
   chat: 'text-gray-400 hover:text-gray-300 bg-gray-900 border border-gray-800',
   plan: 'text-amber-400 bg-amber-500/10 border border-amber-500/20',
-  debug: 'text-red-400 bg-red-500/10 border border-red-500/20',
+  debug: 'text-orange-400 bg-orange-500/10 border border-orange-500/20',
   create_task: 'text-indigo-400 bg-indigo-500/10 border border-indigo-500/20',
 }
 
@@ -31,7 +33,7 @@ const routingModeLabels: Record<string, string> = {
 const routingModeColors: Record<string, string> = {
   chat: 'text-gray-400 bg-gray-800',
   plan: 'text-amber-400 bg-amber-500/10',
-  debug: 'text-red-400 bg-red-500/10',
+  debug: 'text-orange-400 bg-orange-500/10',
   create_task: 'text-indigo-400 bg-indigo-500/10',
 }
 
@@ -39,7 +41,7 @@ const sendButtonStyles: Record<ChatMode, string> = {
   auto: 'bg-blue-600 hover:bg-blue-500 disabled:bg-gray-800 disabled:text-gray-600',
   chat: 'bg-indigo-600 hover:bg-indigo-500 disabled:bg-gray-800 disabled:text-gray-600',
   plan: 'bg-amber-600 hover:bg-amber-500 disabled:bg-gray-800 disabled:text-gray-600',
-  debug: 'bg-red-600 hover:bg-red-500 disabled:bg-gray-800 disabled:text-gray-600',
+  debug: 'bg-orange-600 hover:bg-orange-500 disabled:bg-gray-800 disabled:text-gray-600',
   create_task: 'bg-indigo-600 hover:bg-indigo-500 disabled:bg-gray-800 disabled:text-gray-600',
 }
 
@@ -47,7 +49,7 @@ const sessionDotColors: Record<ChatMode, string> = {
   auto: 'bg-blue-500',
   chat: 'bg-gray-600',
   plan: 'bg-amber-500',
-  debug: 'bg-red-500',
+  debug: 'bg-orange-500',
   create_task: 'bg-indigo-500',
 }
 
@@ -80,12 +82,7 @@ function ExecutionDetails({ execution }: { execution: ChatExecutionInfo }) {
         onClick={() => setExpanded(!expanded)}
         className="flex items-center gap-1 text-[11px] text-gray-600 hover:text-gray-400 transition-colors"
       >
-        <svg
-          className={`w-3 h-3 transition-transform ${expanded ? 'rotate-90' : ''}`}
-          fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}
-        >
-          <path strokeLinecap="round" strokeLinejoin="round" d="M9 5l7 7-7 7" />
-        </svg>
+        {expanded ? <ChevronDown className="w-3 h-3" /> : <ChevronRight className="w-3 h-3" />}
         <span>{summary}{modelLabel}{stopLabel}</span>
       </button>
       {expanded && toolCalls.length > 0 && (
@@ -151,12 +148,7 @@ function StreamingPanel({
         onClick={() => setExpanded(!expanded)}
         className="w-full flex items-center gap-1.5 px-2.5 py-1.5 text-[11px] text-gray-600 hover:text-gray-400 transition-colors"
       >
-        <svg
-          className={`w-3 h-3 transition-transform ${expanded ? 'rotate-90' : ''}`}
-          fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}
-        >
-          <path strokeLinecap="round" strokeLinejoin="round" d="M9 5l7 7-7 7" />
-        </svg>
+        {expanded ? <ChevronDown className="w-3 h-3" /> : <ChevronRight className="w-3 h-3" />}
         <span>
           {isStreaming ? 'Streaming' : 'LLM output'} ({fullText.length.toLocaleString()} chars)
         </span>
@@ -189,12 +181,7 @@ function RawOutputToggle({ content }: { content: string }) {
         onClick={() => setOpen(!open)}
         className="flex items-center gap-1 text-[11px] text-gray-600 hover:text-gray-400 transition-colors"
       >
-        <svg
-          className={`w-3 h-3 transition-transform ${open ? 'rotate-90' : ''}`}
-          fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}
-        >
-          <path strokeLinecap="round" strokeLinejoin="round" d="M9 5l7 7-7 7" />
-        </svg>
+        {open ? <ChevronDown className="w-3 h-3" /> : <ChevronRight className="w-3 h-3" />}
         <span>Tool loop output</span>
       </button>
       {open && (
@@ -293,7 +280,27 @@ export default function ProjectChatPage() {
     if (!projectId) return
     try {
       const data = await projectChat.sessions.get(projectId, sessionId)
-      setMessages(data.messages || [])
+      const msgs = data.messages || []
+      setMessages(msgs)
+
+      // Pre-populate approvedTaskPlans from message history
+      const approved = new Set<string>()
+      for (const msg of msgs) {
+        const meta = parseMeta(msg)
+        // If a task_plan_ready message is followed by a task_created or system "Plan approved", mark it
+        if (meta?.action === 'task_plan_ready') {
+          const hasApproval = msgs.some((m) => {
+            const mm = parseMeta(m)
+            return (
+              m.created_at > msg.created_at &&
+              (mm?.action === 'task_created' ||
+                (m.role === 'system' && m.content.includes('Plan approved')))
+            )
+          })
+          if (hasApproval) approved.add(msg.id)
+        }
+      }
+      setApprovedTaskPlans(approved)
     } catch {
       setMessages([])
     }
@@ -499,21 +506,16 @@ export default function ProjectChatPage() {
     }
   }
 
-  const handleApproveTaskPlan = async (taskId: string) => {
-    if (sending) return
+  const handleApproveTaskPlan = async () => {
+    if (!projectId || !activeSessionId || sending) return
     setSending(true)
     try {
-      await todosApi.approvePlan(taskId)
-      setApprovedTaskPlans((prev) => new Set(prev).add(taskId))
-      const confirmMsg: ProjectChatMessage = {
-        id: `plan-approved-${Date.now()}`,
-        project_id: projectId!,
-        user_id: '',
-        role: 'system',
-        content: 'Plan approved. Starting execution.',
-        created_at: new Date().toISOString(),
+      const result = await projectChat.sessions.acceptTaskPlan(projectId, activeSessionId)
+      setMessages((prev) => [...prev, result.user_message, result.assistant_message])
+      // Mark the task_plan_ready message as approved using the message ID
+      if (latestTaskPlanMsgId) {
+        setApprovedTaskPlans((prev) => new Set(prev).add(latestTaskPlanMsgId))
       }
-      setMessages((prev) => [...prev, confirmMsg])
     } catch (err) {
       const errorMsg: ProjectChatMessage = {
         id: `error-${Date.now()}`,
@@ -529,27 +531,33 @@ export default function ProjectChatPage() {
     }
   }
 
-  const handleRejectTaskPlan = async (taskId: string, feedback: string) => {
-    if (sending || !feedback.trim()) return
+  const handleDiscardTaskPlan = async (feedback: string) => {
+    if (sending || !feedback.trim() || !projectId || !activeSessionId) return
     setSending(true)
     try {
-      await todosApi.rejectPlan(taskId, feedback.trim())
-      const confirmMsg: ProjectChatMessage = {
-        id: `plan-rejected-${Date.now()}`,
-        project_id: projectId!,
+      await projectChat.sessions.discardTaskPlan(projectId, activeSessionId, feedback.trim())
+      const discardMsg: ProjectChatMessage = {
+        id: `plan-discarded-${Date.now()}`,
+        project_id: projectId,
         user_id: '',
         role: 'system',
-        content: `Plan rejected with feedback: "${feedback.trim()}". Re-planning...`,
+        content: `Plan discarded. Revising based on feedback...`,
         created_at: new Date().toISOString(),
       }
-      setMessages((prev) => [...prev, confirmMsg])
+      setMessages((prev) => [...prev, discardMsg])
+      // Mark the plan message as handled so buttons disappear
+      if (latestTaskPlanMsgId) {
+        setApprovedTaskPlans((prev) => new Set(prev).add(latestTaskPlanMsgId))
+      }
+      // Send feedback as a new message so the LLM generates a new plan
+      await handleSend(`The previous plan wasn't right. Here's what needs to change: ${feedback.trim()}`)
     } catch (err) {
       const errorMsg: ProjectChatMessage = {
         id: `error-${Date.now()}`,
-        project_id: projectId!,
+        project_id: projectId,
         user_id: '',
         role: 'system',
-        content: `Error: ${err instanceof Error ? err.message : 'Failed to reject plan'}`,
+        content: `Error: ${err instanceof Error ? err.message : 'Failed to discard plan'}`,
         created_at: new Date().toISOString(),
       }
       setMessages((prev) => [...prev, errorMsg])
@@ -619,13 +627,36 @@ export default function ProjectChatPage() {
 
   if (!projectId || !project) {
     return (
-      <div className="flex items-center justify-center h-full text-gray-600 text-sm">
-        Loading...
+      <div className="flex items-center justify-center h-full animate-fade-in">
+        <div className="flex items-center gap-2 text-gray-600 text-sm">
+          <Loader2 className="w-4 h-4 animate-spin" />
+          Loading...
+        </div>
       </div>
     )
   }
 
   const hasMessages = messages.length > 0
+
+  // Compute the latest unapproved plan message IDs so only the newest plan shows action buttons
+  const latestTaskPlanMsgId = (() => {
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const m = parseMeta(messages[i])
+      if (m?.action === 'task_plan_ready' && !approvedTaskPlans.has(messages[i].id))
+        return messages[i].id
+    }
+    return null
+  })()
+
+  const latestPlanProposedMsgId = (() => {
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const m = parseMeta(messages[i])
+      if (m?.action === 'plan_proposed' && !messages.some(
+        (m2) => parseMeta(m2)?.action === 'plan_accepted' && m2.created_at > messages[i].created_at
+      )) return messages[i].id
+    }
+    return null
+  })()
 
   return (
     <div className="flex h-full">
@@ -643,9 +674,7 @@ export default function ProjectChatPage() {
                 onClick={() => createSession()}
                 className="w-full flex items-center gap-2 px-3 py-2 rounded-lg text-xs text-gray-400 hover:text-white hover:bg-gray-900 transition-colors"
               >
-                <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                  <path strokeLinecap="round" strokeLinejoin="round" d="M12 4.5v15m7.5-7.5h-15" />
-                </svg>
+                <Plus className="w-3.5 h-3.5" />
                 New Chat
               </button>
             </div>
@@ -682,9 +711,7 @@ export default function ProjectChatPage() {
                     }}
                     className="block md:hidden md:group-hover:block px-2 text-gray-700 hover:text-red-400 transition-colors"
                   >
-                    <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                      <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
-                    </svg>
+                    <X className="w-3 h-3" />
                   </button>
                 </div>
               ))}
@@ -702,17 +729,13 @@ export default function ProjectChatPage() {
               onClick={() => setShowSidebar(!showSidebar)}
               className="text-gray-600 hover:text-gray-400 transition-colors"
             >
-              <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
-                <path strokeLinecap="round" strokeLinejoin="round" d="M3.75 6.75h16.5M3.75 12h16.5m-16.5 5.25h16.5" />
-              </svg>
+              <PanelLeft className="w-4 h-4" />
             </button>
             <button
               onClick={() => navigate(`/projects/${projectId}`)}
               className="text-gray-500 hover:text-gray-300 transition-colors"
             >
-              <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
-                <path strokeLinecap="round" strokeLinejoin="round" d="M10.5 19.5L3 12m0 0l7.5-7.5M3 12h18" />
-              </svg>
+              <ArrowLeft className="w-4 h-4" />
             </button>
             <div>
               <div className="flex items-center gap-2">
@@ -721,7 +744,7 @@ export default function ProjectChatPage() {
                   <span className={`px-1.5 py-0.5 rounded text-[10px] ${
                     chatMode === 'auto' ? 'bg-blue-500/10 text-blue-400'
                     : chatMode === 'plan' ? 'bg-amber-500/10 text-amber-400'
-                    : chatMode === 'debug' ? 'bg-red-500/10 text-red-400'
+                    : chatMode === 'debug' ? 'bg-orange-500/10 text-orange-400'
                     : 'bg-indigo-500/10 text-indigo-400'
                   }`}>
                     {chatMode === 'auto'
@@ -827,14 +850,21 @@ export default function ProjectChatPage() {
                 return (
                 <div
                   key={msg.id}
-                  className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}
+                  className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start gap-2.5'} animate-fade-in`}
                 >
+                  {msg.role === 'assistant' && (
+                    <div className="w-6 h-6 rounded-full bg-indigo-500/20 flex items-center justify-center shrink-0 mt-1">
+                      <Bot className="w-3.5 h-3.5 text-indigo-400" />
+                    </div>
+                  )}
                   <div
                     className={`max-w-[80%] rounded-xl px-4 py-2.5 text-sm ${
                       msg.role === 'user'
                         ? 'bg-indigo-600 text-white'
                         : msg.role === 'system'
-                          ? 'bg-red-900/30 text-red-400 border border-red-800/50'
+                          ? msg.content.startsWith('Error')
+                            ? 'bg-red-900/30 text-red-400 border border-red-800/50'
+                            : 'bg-gray-800/50 text-gray-400 border border-gray-700/50'
                           : 'bg-gray-900 border border-gray-800 text-gray-300'
                     }`}
                   >
@@ -863,7 +893,7 @@ export default function ProjectChatPage() {
                             </button>
                             <button
                               onClick={() => handleDeleteMessage(msg.id)}
-                              className="inline-flex items-center gap-1 px-2 py-1 text-red-400/60 rounded-lg text-xs hover:text-red-400 hover:bg-red-900/20 transition-colors"
+                              className="inline-flex items-center gap-1 px-2 py-1 text-gray-600 rounded-lg text-xs hover:text-gray-400 hover:bg-gray-800 transition-colors"
                             >
                               <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
                                 <path strokeLinecap="round" strokeLinejoin="round" d="M14.74 9l-.346 9m-4.788 0L9.26 9m9.968-3.21c.342.052.682.107 1.022.166m-1.022-.165L18.16 19.673a2.25 2.25 0 01-2.244 2.077H8.084a2.25 2.25 0 01-2.244-2.077L4.772 5.79m14.456 0a48.108 48.108 0 00-3.478-.397m-12 .562c.34-.059.68-.114 1.022-.165m0 0a48.11 48.11 0 013.478-.397m7.5 0v-.916c0-1.18-.91-2.164-2.09-2.201a51.964 51.964 0 00-3.32 0c-1.18.037-2.09 1.022-2.09 2.201v.916m7.5 0a48.667 48.667 0 00-7.5 0" />
@@ -881,6 +911,7 @@ export default function ProjectChatPage() {
                                 parseMeta(m)?.action === 'plan_accepted' &&
                                 m.created_at > msg.created_at
                             )}
+                            isLatest={msg.id === latestPlanProposedMsgId}
                             onAccept={handleAcceptPlan}
                             onReject={(fb) => handleSend(fb)}
                             disabled={sending}
@@ -908,8 +939,8 @@ export default function ProjectChatPage() {
                             </span>
                           </div>
                         )}
-                        {/* Task plan ready — orchestrator generated plan, needs user approval */}
-                        {meta?.action === 'task_plan_ready' && meta.task_id && !approvedTaskPlans.has(meta.task_id) && (
+                        {/* Task plan ready — needs user approval */}
+                        {meta?.action === 'task_plan_ready' && !approvedTaskPlans.has(msg.id) && (
                           <div className="mt-2 bg-gray-950 border border-cyan-500/20 rounded-lg overflow-hidden">
                             <div className="px-3 py-2 border-b border-gray-800/50 flex items-center gap-2">
                               <svg className="w-3.5 h-3.5 text-cyan-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
@@ -1000,8 +1031,9 @@ export default function ProjectChatPage() {
                                 ))}
                               </div>
                             )}
+                            {msg.id === latestTaskPlanMsgId ? (
                             <div className="px-3 py-2 border-t border-gray-800/50">
-                              {taskPlanFeedbackFor === meta.task_id ? (
+                              {taskPlanFeedbackFor === msg.id ? (
                                 <div className="flex items-center gap-2">
                                   <input
                                     type="text"
@@ -1009,7 +1041,7 @@ export default function ProjectChatPage() {
                                     onChange={(e) => setTaskPlanFeedback(e.target.value)}
                                     onKeyDown={(e) => {
                                       if (e.key === 'Enter' && taskPlanFeedback.trim()) {
-                                        handleRejectTaskPlan(meta.task_id!, taskPlanFeedback)
+                                        handleDiscardTaskPlan(taskPlanFeedback)
                                       }
                                       if (e.key === 'Escape') {
                                         setTaskPlanFeedbackFor(null)
@@ -1021,7 +1053,7 @@ export default function ProjectChatPage() {
                                     autoFocus
                                   />
                                   <button
-                                    onClick={() => handleRejectTaskPlan(meta.task_id!, taskPlanFeedback)}
+                                    onClick={() => handleDiscardTaskPlan(taskPlanFeedback)}
                                     disabled={!taskPlanFeedback.trim() || sending}
                                     className="px-2.5 py-1.5 bg-gray-800 hover:bg-gray-700 disabled:opacity-40 rounded-lg text-xs text-gray-300 transition-colors"
                                   >
@@ -1037,32 +1069,57 @@ export default function ProjectChatPage() {
                               ) : (
                                 <div className="flex items-center gap-2">
                                   <button
-                                    onClick={() => handleApproveTaskPlan(meta.task_id!)}
+                                    onClick={() => handleApproveTaskPlan()}
                                     disabled={sending}
                                     className="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 rounded-lg text-xs font-medium text-white transition-colors"
                                   >
                                     Approve Plan
                                   </button>
                                   <button
-                                    onClick={() => setTaskPlanFeedbackFor(meta.task_id!)}
+                                    onClick={() => setTaskPlanFeedbackFor(msg.id)}
                                     disabled={sending}
                                     className="px-3 py-1.5 bg-gray-800 hover:bg-gray-700 disabled:opacity-50 rounded-lg text-xs text-gray-400 transition-colors"
                                   >
-                                    Reject with Feedback
+                                    Discard &amp; Revise
                                   </button>
                                 </div>
                               )}
                             </div>
+                            ) : (
+                            <div className="px-3 py-2 border-t border-gray-800/50">
+                              <span className="text-[11px] text-gray-600">Earlier plan — superseded</span>
+                            </div>
+                            )}
                           </div>
                         )}
                         {/* Task plan approved badge */}
-                        {meta?.action === 'task_plan_ready' && meta.task_id && approvedTaskPlans.has(meta.task_id) && (
+                        {meta?.action === 'task_plan_ready' && approvedTaskPlans.has(msg.id) && (
                           <div className="flex items-center gap-2 px-3 py-1.5 bg-emerald-500/5 border border-emerald-500/20 rounded-lg mt-1">
                             <svg className="w-3.5 h-3.5 text-emerald-400 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
                               <path strokeLinecap="round" strokeLinejoin="round" d="M4.5 12.75l6 6 9-13.5" />
                             </svg>
                             <span className="text-xs text-emerald-400">Plan approved — executing</span>
                           </div>
+                        )}
+                        {/* Plan review verdict */}
+                        {meta?.action === 'plan_review_verdict' && (
+                          <ReviewFeedbackCard
+                            type="plan"
+                            approved={!!meta.approved}
+                            feedback={meta.feedback as string | undefined}
+                            iteration={meta.iteration as number | undefined}
+                          />
+                        )}
+                        {/* Code review verdict */}
+                        {meta?.action === 'code_review_verdict' && (
+                          <ReviewFeedbackCard
+                            type="code"
+                            approved={meta.verdict === 'approved'}
+                            feedback={meta.feedback as string | undefined}
+                            summary={meta.summary as string | undefined}
+                            issues={meta.issues}
+                            subtaskTitle={meta.subtask_title as string | undefined}
+                          />
                         )}
                         {/* Quick-action buttons: only show when there's a pending plan_proposed that hasn't been accepted */}
                         {msg.id === messages.filter((m) => m.role === 'assistant').slice(-1)[0]?.id &&
@@ -1154,10 +1211,7 @@ export default function ProjectChatPage() {
                     <div className="bg-gray-900 border border-gray-800 rounded-xl px-4 py-2.5 text-sm">
                       {activity ? (
                         <span className="inline-flex items-center gap-2 text-gray-500">
-                          <svg className="w-3 h-3 animate-spin text-indigo-400" fill="none" viewBox="0 0 24 24">
-                            <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-                            <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
-                          </svg>
+                          <Loader2 className="w-3 h-3 animate-spin text-indigo-400" />
                           <span className="text-gray-400">{activity}</span>
                         </span>
                       ) : (
@@ -1197,9 +1251,7 @@ export default function ProjectChatPage() {
               >
                 <ModeIcon mode={chatMode} />
                 <span className="hidden sm:inline">{chatModes.find(m => m.key === chatMode)?.label}</span>
-                <svg className="w-3 h-3 opacity-50" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                  <path strokeLinecap="round" strokeLinejoin="round" d="M19.5 8.25l-7.5 7.5-7.5-7.5" />
-                </svg>
+                <ChevronDown className="w-3 h-3 opacity-50" />
               </button>
               {showModeDropdown && (
                 <>
@@ -1260,9 +1312,7 @@ export default function ProjectChatPage() {
                 className="shrink-0 px-3 py-2.5 rounded-xl text-sm text-white transition-colors bg-cyan-600 hover:bg-cyan-500 disabled:bg-gray-800 disabled:text-gray-600"
                 title="Inject guidance into the running agent"
               >
-                <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                  <path strokeLinecap="round" strokeLinejoin="round" d="M12 4.5v15m7.5-7.5h-15" />
-                </svg>
+                <Syringe className="w-4 h-4" />
               </button>
             ) : (
               <button
@@ -1270,13 +1320,7 @@ export default function ProjectChatPage() {
                 disabled={!input.trim() || sending}
                 className={`shrink-0 px-3 py-2.5 rounded-xl text-sm text-white transition-colors ${sendButtonStyles[chatMode]}`}
               >
-                <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                  <path
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                    d="M6 12L3.269 3.126A59.768 59.768 0 0121.485 12 59.77 59.77 0 013.27 20.876L5.999 12zm0 0h7.5"
-                  />
-                </svg>
+                <Send className="w-4 h-4" />
               </button>
             )}
           </div>

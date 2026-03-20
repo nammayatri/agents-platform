@@ -138,8 +138,18 @@ def extract_submit_result(
             if tc.get("name") == SUBMIT_TOOL_NAME:
                 args = tc.get("arguments", {})
                 if isinstance(args, dict) and args:
+                    # Skip sentinel dicts from unparseable args
+                    if "_raw_arguments" in args and len(args) == 1:
+                        logger.warning(
+                            "submit_result tool call has unparseable _raw_arguments, skipping"
+                        )
+                        continue
                     logger.info("Extracted structured output via submit_result tool call")
                     return args
+                logger.warning(
+                    "submit_result tool call found but arguments empty or not a dict: %s",
+                    type(args).__name__,
+                )
 
     # 2. Scan message history backwards for submit_result
     if messages:
@@ -149,6 +159,8 @@ def extract_submit_result(
                 if tc.get("name") == SUBMIT_TOOL_NAME:
                     args = tc.get("arguments", {})
                     if isinstance(args, dict) and args:
+                        if "_raw_arguments" in args and len(args) == 1:
+                            continue
                         logger.info("Extracted structured output via submit_result in message history")
                         return args
 

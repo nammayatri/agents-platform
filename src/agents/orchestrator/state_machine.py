@@ -9,6 +9,8 @@ from typing import TYPE_CHECKING
 
 import asyncpg
 
+from agents.utils.db_retry import db_retry
+
 if TYPE_CHECKING:
     from agents.orchestrator.events import EventBus
 
@@ -74,7 +76,8 @@ async def transition_todo(
     is_terminal = target_state in ("completed", "cancelled")
     completed_at = datetime.now(timezone.utc) if is_terminal else None
 
-    updated = await db.fetchrow(
+    updated = await db_retry(
+        db.fetchrow,
         """
         UPDATE todo_items
         SET state = $2, sub_state = $3, state_changed_at = NOW(),
@@ -152,7 +155,8 @@ async def transition_subtask(
     completed_at = now if target_status == "completed" else None
     started_at = now if target_status == "running" else None
 
-    updated = await db.fetchrow(
+    updated = await db_retry(
+        db.fetchrow,
         """
         UPDATE sub_tasks
         SET status = $2,

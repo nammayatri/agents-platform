@@ -46,6 +46,12 @@ class ContextBuilder:
         self.workspace_mgr = workspace_mgr
         self.provider_registry = provider_registry
 
+        # Per-todo-execution caches (lifetime = coordinator lifetime)
+        self._cached_memories: list[dict] | None = None
+        self._cached_completed_ids: set[str] = set()
+        self._cached_completed_results: list[dict] | None = None
+        self._cached_file_tree: dict[str, str] = {}  # workspace_path -> tree_text
+
     # ------------------------------------------------------------------
     # Small helpers (previously on coordinator)
     # ------------------------------------------------------------------
@@ -62,6 +68,47 @@ class ContextBuilder:
             self.todo_id,
         )
         return [dict(r) for r in rows]
+
+    async def get_completed_results_cached(self) -> list[dict]:
+        """Return completed results, re-fetching only if new subtasks completed."""
+        current_ids = {
+            str(r["id"])
+            for r in await self.db.fetch(
+                "SELECT id FROM sub_tasks WHERE todo_id = $1 AND status = 'completed'",
+                self.todo_id,
+            )
+        }
+        if current_ids != self._cached_completed_ids or self._cached_completed_results is None:
+            self._cached_completed_ids = current_ids
+            self._cached_completed_results = await self.get_completed_results()
+        return self._cached_completed_results
+
+    async def _get_memories_cached(self, project_id: str) -> list[dict]:
+        """Fetch project memories once and cache for the coordinator lifetime."""
+        if self._cached_memories is None:
+            try:
+                rows = await self.db.fetch(
+                    """
+                    SELECT content, category, confidence FROM project_memories
+                    WHERE project_id = $1
+                    ORDER BY confidence DESC
+                    LIMIT 10
+                    """,
+                    project_id,
+                )
+                self._cached_memories = [dict(r) for r in rows]
+            except Exception:
+                logger.debug("[%s] Failed to load project memories", self.todo_id[:8], exc_info=True)
+                self._cached_memories = []
+        return self._cached_memories
+
+    def _get_file_tree_cached(self, workspace_path: str, max_depth: int = 4) -> str:
+        """Cache file tree per workspace path for the coordinator lifetime."""
+        if workspace_path not in self._cached_file_tree:
+            self._cached_file_tree[workspace_path] = self.workspace_mgr.get_file_tree(
+                workspace_path, max_depth=max_depth,
+            )
+        return self._cached_file_tree[workspace_path]
 
     @staticmethod
     def filter_rules_for_role(work_rules: dict, role: str) -> dict:
@@ -372,7 +419,7 @@ class ContextBuilder:
         regenerating.
         """
         todo = await self.load_todo()
-        previous_results = await self.get_completed_results()
+        previous_results = await self.get_completed_results_cached()
         intake = safe_json(todo.get("intake_data"))
 
         # Determine if this is a dependency repo sub-task
@@ -384,7 +431,7 @@ class ContextBuilder:
         # Workspace context
         workspace_context = ""
         if workspace_path:
-            file_tree = self.workspace_mgr.get_file_tree(workspace_path, max_depth=4)
+            file_tree = self._get_file_tree_cached(workspace_path)
 
             if is_dep_workspace:
                 dep_name = target_repo.get("name", "dependency")
@@ -498,25 +545,13 @@ class ContextBuilder:
         if repo_map_text:
             system += f"\n\n## Repository Symbol Map\n{repo_map_text}\n"
 
-        # -- Project Memories --
-        try:
-            memories_rows = await self.db.fetch(
-                """
-                SELECT content, category, confidence FROM project_memories
-                WHERE project_id = $1
-                ORDER BY confidence DESC
-                LIMIT 10
-                """,
-                str(todo["project_id"]),
-            )
-            if memories_rows:
-                memories_block = "\n\n## Project Memories (learnings from past tasks)\n"
-                for m in memories_rows:
-                    memories_block += f"- [{m['category']}] {m['content']}\n"
-                system += memories_block
-                logger.info("[%s] Injected %d project memories", self.todo_id[:8], len(memories_rows))
-        except Exception:
-            logger.debug("[%s] Failed to load project memories", self.todo_id[:8], exc_info=True)
+        # -- Project Memories (cached across iterations) --
+        memories_rows = await self._get_memories_cached(str(todo["project_id"]))
+        if memories_rows:
+            memories_block = "\n\n## Project Memories (learnings from past tasks)\n"
+            for m in memories_rows:
+                memories_block += f"- [{m['category']}] {m['content']}\n"
+            system += memories_block
 
         # -- Iteration Learnings (with LLM compaction for old entries) --
         if iteration_log:

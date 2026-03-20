@@ -536,6 +536,13 @@ Project: "{project['name']}"
                     if result_data.get("awaiting_approval") and result_data.get("plan_data"):
                         metadata["action"] = "task_plan_ready"
                         metadata["plan_data"] = result_data["plan_data"]
+                elif result_data.get("action") == "task_plan_ready":
+                    # Deferred creation: plan stored in session, no task_id yet
+                    metadata = {
+                        "action": "task_plan_ready",
+                        "task_title": result_data.get("title"),
+                        "plan_data": result_data.get("plan_data"),
+                    }
             except (json.JSONDecodeError, KeyError):
                 pass
             return result_text
@@ -699,6 +706,15 @@ You are a project planning assistant for "{project_name}".
 
 {tools_doc}
 
+YOUR PROCESS — follow this order:
+1. UNDERSTAND THE REQUEST — Read the user's message carefully. Identify what they want to achieve.
+2. GATHER MISSING INFORMATION — If the request is vague or high-level:
+   - Ask 1-2 targeted clarifying questions about scope, priorities, or constraints
+   - Use tools to explore relevant code, understand the current state, find patterns
+   - Do NOT propose a plan until you understand the problem well enough to define concrete subtasks
+3. PROPOSE A PLAN — Only after you have sufficient context, output the plan JSON.
+4. ITERATE — If the user requests changes, revise and re-propose.
+
 RESPONSE STYLE — MANDATORY:
 - Keep responses SHORT. Max 2-3 short paragraphs for discussion, or a bullet list.
 - Use bullet points, not long prose. No preamble, no summaries of what you already know.
@@ -814,7 +830,8 @@ async def generate_plan_response(
         dep_str = ", ".join(f"'{n}'" for n in dep_repo_names)
         project_ctx_parts.append(
             f"Dependency repos (for target_repo field): {dep_str}. "
-            "Set target_repo to the EXACT dependency name for subtasks that modify a dep repo."
+            "Set target_repo to the EXACT dependency name for subtasks that modify a dep repo. "
+            "Tool outputs include [Repository: <name>] labels — use these to determine which repo each file belongs to."
         )
 
     settings = safe_json(project.get("settings_json"))
@@ -1542,13 +1559,18 @@ You are a task creation assistant for "{project_name}".
 {project_context}
 
 The user wants to create a task. Your job:
-1. Parse the user's description into a well-structured task
-2. Use action__create_task to create it immediately
-3. Include sub_tasks with appropriate agent roles if the scope is clear
-4. If the description is too vague, ask ONE clarifying question, then create
-5. Every sub_task MUST have target_repo set — you must know which repo each sub_task targets
+1. GATHER REQUIREMENTS FIRST — Before creating any task, make sure you understand:
+   - What exactly needs to be done (the scope and expected outcome)
+   - Which parts of the codebase are affected
+   - Any constraints, dependencies, or preferences
+2. If the user's description is vague or missing key details, ask 1-2 clarifying questions.
+   Do NOT create a task until you have enough information to define clear sub_tasks.
+3. Once you have a clear picture, use action__create_task to create it.
+4. Include sub_tasks with appropriate agent roles.
+5. Every sub_task MUST have target_repo set — you must know which repo each sub_task targets.
 
-Always create exactly ONE task. Be efficient — don't over-discuss, just create.
+IMPORTANT: Do NOT rush to create. A well-specified task with clear sub_tasks is worth \
+more than a quick but vague task. Ask questions first if the scope is unclear.
 
 {tools_doc}
 
@@ -1682,6 +1704,13 @@ async def generate_create_task_response(
                     if result_data.get("awaiting_approval") and result_data.get("plan_data"):
                         metadata["action"] = "task_plan_ready"
                         metadata["plan_data"] = result_data["plan_data"]
+                elif result_data.get("action") == "task_plan_ready":
+                    # Deferred creation: plan stored in session, no task_id yet
+                    metadata = {
+                        "action": "task_plan_ready",
+                        "task_title": result_data.get("title"),
+                        "plan_data": result_data.get("plan_data"),
+                    }
             except (json.JSONDecodeError, KeyError):
                 pass
             return result_text
@@ -1703,7 +1732,7 @@ async def generate_create_task_response(
         provider, messages,
         tools=action_tools if action_tools else None,
         tool_executor=_execute_tool,
-        max_rounds=3,
+        max_rounds=8,
         on_activity=on_activity,
         on_tool_event=_on_tool_event,
         on_token=on_token,

@@ -202,42 +202,24 @@ async def _handle_create_task(arguments: dict, context: dict) -> dict:
         }
 
         if session_id:
-            # Chat session context: create in plan_ready for user approval.
-            # Sub-tasks are NOT inserted here — the approve-plan endpoint
-            # creates them from plan_json when the user approves.
-            todo = await db.fetchrow(
-                """
-                INSERT INTO todo_items (
-                    project_id, creator_id, title, description, priority, task_type,
-                    state, plan_json, intake_data
-                )
-                VALUES ($1, $2, $3, $4, $5, $6, 'plan_ready', $7::jsonb, $8::jsonb)
-                RETURNING *
-                """,
-                project_id,
-                user_id,
-                arguments["title"],
-                arguments.get("description", ""),
-                arguments.get("priority", "medium"),
-                arguments.get("task_type", "general"),
-                json.dumps(plan_json),
-                json.dumps(intake_data),
-            )
-            todo_id = str(todo["id"])
-
-            # Link to chat session
+            # Chat session context: store plan in session for user approval.
+            # Task is NOT created in DB until user explicitly approves.
+            task_plan_data = {
+                "title": arguments["title"],
+                "description": arguments.get("description", ""),
+                "priority": arguments.get("priority", "medium"),
+                "task_type": arguments.get("task_type", "general"),
+                "plan_json": plan_json,
+                "intake_data": intake_data,
+            }
             await db.execute(
-                "UPDATE todo_items SET chat_session_id = $1 WHERE id = $2",
-                session_id, todo_id,
-            )
-            await db.execute(
-                "UPDATE project_chat_sessions SET linked_todo_id = $1 WHERE id = $2",
-                todo_id, session_id,
+                "UPDATE project_chat_sessions SET task_plan_json = $2::jsonb, updated_at = NOW() WHERE id = $1",
+                session_id,
+                json.dumps(task_plan_data),
             )
 
             return {
-                "action": "task_created",
-                "task_id": todo_id,
+                "action": "task_plan_ready",
                 "title": arguments["title"],
                 "priority": arguments.get("priority", "medium"),
                 "task_type": arguments.get("task_type", "general"),

@@ -196,7 +196,8 @@ class PlanningPhase:
                 workspace_path = await coord.workspace_mgr.setup_task_workspace(coord.todo_id)
                 logger.info("[%s] Planner workspace ready at %s", coord.todo_id, workspace_path)
         except Exception:
-            logger.warning("[%s] Could not set up planner workspace", coord.todo_id, exc_info=True)
+            logger.exception("[%s] Could not set up planner workspace — planning will proceed without workspace tools",
+                             coord.todo_id)
 
         # ── Pre-build code indexes (structural + embedding) ──
         repo_map_text: str | None = None
@@ -273,6 +274,7 @@ class PlanningPhase:
             if dep_dirs:
                 planner_prompt += "\n\nDependency repositories (read-only at ../deps/{dir_name}/, writable via target_repo):"
                 planner_prompt += "\nTo modify a dep repo, set target_repo to the dep name string. The orchestrator resolves all metadata."
+                planner_prompt += "\nTool outputs include [Repository: <name>] labels — use these to determine which repo each file belongs to."
                 for dep in deps_list:
                     name = dep.get("name", "")
                     dir_name = dep_dirs.get(name, "")
@@ -503,11 +505,20 @@ class PlanningPhase:
                 if hasattr(_plan_token_cb, "flush"):
                     await _plan_token_cb.flush()
             else:
-                response = await provider.send_message(
-                    messages, temperature=0.1, max_tokens=16384,
-                    tools=[plan_submit_tool],
-                    tool_choice={"name": "submit_result"},
-                )
+                if attempt == 0:
+                    # First attempt without workspace — use structured submit tool
+                    response = await provider.send_message(
+                        messages, temperature=0.1, max_tokens=16384,
+                        tools=[plan_submit_tool],
+                        tool_choice={"name": "submit_result"},
+                    )
+                else:
+                    # Retry — ask for raw JSON text without tools.  Models that
+                    # don't support tool_choice (e.g. kimi) return empty args
+                    # when forced, so plain-text JSON is more reliable.
+                    response = await provider.send_message(
+                        messages, temperature=0.1, max_tokens=16384,
+                    )
                 content = response.content
             await coord._track_tokens(response)
 
@@ -516,6 +527,16 @@ class PlanningPhase:
             )
             if plan is None:
                 plan = parse_llm_json(content)
+            # Last resort: if the model called submit_result with raw string
+            # args (common with kimi-latest), try to parse those
+            if plan is None and response.tool_calls:
+                for tc in response.tool_calls:
+                    raw = tc.get("arguments", {}).get("_raw_arguments", "")
+                    if raw:
+                        plan = parse_llm_json(raw)
+                        if plan:
+                            logger.info("[%s] Recovered plan from _raw_arguments fallback", coord.todo_id)
+                            break
             if plan is not None:
                 logger.info(
                     "[%s] Plan parsed on attempt %d: keys=%s, sub_tasks=%d",
@@ -555,8 +576,24 @@ class PlanningPhase:
 
             if attempt < max_retries - 1:
                 planner_tools = None
+                # Retry with a minimal, focused system prompt — no tool references,
+                # just clear instructions to output JSON.
+                retry_system = (
+                    "You are a project planner. Based on the task and context below, "
+                    "produce an execution plan as a JSON object.\n\n"
+                    "Output ONLY a raw JSON object (no markdown fences, no explanation):\n"
+                    '{"summary":"...", "sub_tasks":[{"title":"...", "description":"...", '
+                    '"agent_role":"coder|tester|reviewer|debugger|report_writer", '
+                    '"execution_order":0, "depends_on":[], "review_loop":false, '
+                    '"target_repo":"main", "context":{"relevant_files":[], '
+                    '"what_to_change":"..."}}]}\n\n'
+                    "Rules:\n"
+                    "- Split work into parallel sub-tasks (same execution_order, no depends_on)\n"
+                    "- Be specific in descriptions — include file paths and what to change\n"
+                    "- Every sub-task MUST have target_repo set (use 'main' for main repo)"
+                )
                 messages = [
-                    LLMMessage(role="system", content=PLANNER_SYSTEM_PROMPT),
+                    LLMMessage(role="system", content=retry_system),
                     LLMMessage(
                         role="user",
                         content=(
@@ -565,9 +602,7 @@ class PlanningPhase:
                             f"Type: {todo['task_type']}\n"
                             f"Intake data: {json.dumps(intake_data, default=str)}\n"
                             f"Project context: {json.dumps(context, default=str)}\n\n"
-                            "IMPORTANT: Your previous response was not valid JSON and could not be parsed. "
-                            "You MUST respond with ONLY a valid JSON object. No markdown fences, no explanation, "
-                            "no text before or after the JSON. Just the raw JSON object starting with {{ and ending with }}."
+                            "Respond with ONLY the JSON plan object."
                         ),
                     ),
                 ]
@@ -594,8 +629,20 @@ class PlanningPhase:
         for review_iter in range(max_review_iterations + 1):
             review = await self.review_plan(plan, task_context, provider, context=context)
 
+            review_metadata = {
+                "action": "plan_review_verdict",
+                "task_id": coord.todo_id,
+                "approved": review["approved"],
+                "feedback": review.get("feedback", ""),
+                "iteration": review_iter + 1,
+            }
+
             if review["approved"]:
                 logger.info("[%s] Plan review approved (iteration %d)", coord.todo_id, review_iter)
+                await coord._post_system_message(
+                    f"**Plan review:** Approved",
+                    metadata=review_metadata,
+                )
                 break
 
             if review_iter == max_review_iterations:
@@ -603,11 +650,16 @@ class PlanningPhase:
                     "[%s] Plan review: max iterations (%d) reached, proceeding with current plan",
                     coord.todo_id, max_review_iterations,
                 )
+                await coord._post_system_message(
+                    f"**Plan review:** Max revisions reached, proceeding with current plan.",
+                    metadata=review_metadata,
+                )
                 break
 
             feedback = review.get("feedback", "Plan needs improvement.")
             await coord._post_system_message(
-                f"**Plan review (iteration {review_iter + 1}):** Revising plan...\n\n{feedback}"
+                f"**Plan review (iteration {review_iter + 1}):** Revising plan...\n\n{feedback}",
+                metadata=review_metadata,
             )
             plan = await self.re_plan_with_feedback(
                 plan, feedback, provider, todo, context,
@@ -765,9 +817,32 @@ class PlanningPhase:
             await coord._track_tokens(response)
 
             result = extract_submit_result(response.tool_calls, response.content)
+            if result is None:
+                result = parse_llm_json(response.content)
             if result and isinstance(result.get("approved"), bool):
                 logger.info(
                     "[%s] Plan review verdict: approved=%s feedback=%s",
+                    coord.todo_id, result["approved"], result.get("feedback", "")[:200],
+                )
+                return result
+
+            # If tool-based extraction failed (e.g. model doesn't support
+            # tool_choice), retry without tools asking for plain JSON.
+            logger.warning("[%s] Plan review: tool extraction failed, retrying as plain JSON", coord.todo_id)
+            messages.append(LLMMessage(role="assistant", content=response.content or ""))
+            messages.append(LLMMessage(
+                role="user",
+                content=(
+                    'Respond with ONLY a JSON object: {"approved": true/false, "feedback": "..."}\n'
+                    "No other text."
+                ),
+            ))
+            retry_resp = await provider.send_message(messages, temperature=0.1, max_tokens=1024)
+            await coord._track_tokens(retry_resp)
+            result = parse_llm_json(retry_resp.content)
+            if result and isinstance(result.get("approved"), bool):
+                logger.info(
+                    "[%s] Plan review verdict (retry): approved=%s feedback=%s",
                     coord.todo_id, result["approved"], result.get("feedback", "")[:200],
                 )
                 return result
@@ -894,6 +969,7 @@ class PlanningPhase:
                 if hasattr(_replan_token_cb, "flush"):
                     await _replan_token_cb.flush()
             else:
+                # No workspace tools — try structured tool first, then plain text
                 response = await provider.send_message(
                     messages, temperature=0.1, max_tokens=16384,
                     tools=[plan_submit_tool],
@@ -906,6 +982,14 @@ class PlanningPhase:
             revised = extract_submit_result(response.tool_calls, content, messages=messages)
             if revised is None:
                 revised = parse_llm_json(content)
+            # Fallback: try _raw_arguments
+            if revised is None and response.tool_calls:
+                for tc in response.tool_calls:
+                    raw = tc.get("arguments", {}).get("_raw_arguments", "")
+                    if raw:
+                        revised = parse_llm_json(raw)
+                        if revised:
+                            break
 
             if revised and revised.get("sub_tasks"):
                 logger.info(
@@ -913,6 +997,27 @@ class PlanningPhase:
                     coord.todo_id, len(revised["sub_tasks"]),
                 )
                 return revised
+
+            # If tool-based extraction failed, retry without tools
+            if not planner_tools:
+                logger.warning("[%s] Re-plan tool extraction failed, retrying as plain JSON", coord.todo_id)
+                messages.append(LLMMessage(role="assistant", content=content or ""))
+                messages.append(LLMMessage(
+                    role="user",
+                    content=(
+                        "Your response could not be parsed. Respond with ONLY a raw JSON object "
+                        "containing your revised plan. No markdown fences, no other text."
+                    ),
+                ))
+                retry_resp = await provider.send_message(
+                    messages, temperature=0.1, max_tokens=16384,
+                )
+                await coord._track_tokens(retry_resp)
+                revised = parse_llm_json(retry_resp.content)
+                if revised and revised.get("sub_tasks"):
+                    logger.info("[%s] Re-plan (retry) produced %d sub-tasks",
+                                coord.todo_id, len(revised["sub_tasks"]))
+                    return revised
         except Exception:
             logger.warning("[%s] Re-plan failed, keeping previous plan", coord.todo_id, exc_info=True)
 
@@ -964,7 +1069,7 @@ class PlanningPhase:
                         execution_order, input_context,
                         review_loop, target_repo
                     )
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                    VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8::jsonb)
                     RETURNING id
                     """,
                     coord.todo_id,
@@ -972,9 +1077,9 @@ class PlanningPhase:
                     st.get("description", ""),
                     st["agent_role"],
                     st.get("execution_order", 0),
-                    st.get("context", {}),
+                    json.dumps(st.get("context", {})),
                     bool(st.get("review_loop", False)),
-                    target_repo,
+                    json.dumps(target_repo) if target_repo else None,
                 )
                 st_id = str(row["id"])
                 sub_task_ids.append(st_id)

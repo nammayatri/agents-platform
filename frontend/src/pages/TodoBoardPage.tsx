@@ -1,44 +1,36 @@
-import { useEffect, useState, useRef } from 'react'
+import { useEffect, useState, useRef, useMemo } from 'react'
 import { useParams, Link, useNavigate, useSearchParams } from 'react-router-dom'
 import { useTodoStore } from '../stores/todoStore'
 import { providers as providersApi } from '../services/api'
+import { Plus, ListTodo, Clock } from 'lucide-react'
+import { EmptyState } from '../components/ui/EmptyState'
 import type { TodoItem, TodoState, ProviderConfig, ModelInfo } from '../types'
 
-const COLUMNS: { state: TodoState; label: string; accent: string }[] = [
-  { state: 'scheduled', label: 'Scheduled', accent: 'border-l-indigo-500' },
-  { state: 'intake', label: 'Intake', accent: 'border-l-violet-500' },
-  { state: 'planning', label: 'Planning', accent: 'border-l-blue-500' },
-  { state: 'plan_ready', label: 'Plan Review', accent: 'border-l-cyan-500' },
-  { state: 'in_progress', label: 'In Progress', accent: 'border-l-amber-500' },
-  { state: 'testing', label: 'Testing', accent: 'border-l-teal-500' },
-  { state: 'review', label: 'Review', accent: 'border-l-orange-500' },
-  { state: 'completed', label: 'Done', accent: 'border-l-emerald-500' },
+/* ── Group ordering & styling ─────────────────────────────────── */
+
+const GROUPS: { state: TodoState; label: string; accent: string; dotColor: string }[] = [
+  { state: 'scheduled',   label: 'Scheduled',    accent: 'border-l-indigo-500', dotColor: 'bg-indigo-500' },
+  { state: 'intake',      label: 'Intake',       accent: 'border-l-violet-500', dotColor: 'bg-violet-500' },
+  { state: 'planning',    label: 'Planning',     accent: 'border-l-blue-500',   dotColor: 'bg-blue-500' },
+  { state: 'plan_ready',  label: 'Plan Review',  accent: 'border-l-cyan-500',   dotColor: 'bg-cyan-500' },
+  { state: 'in_progress', label: 'In Progress',  accent: 'border-l-amber-500',  dotColor: 'bg-amber-500' },
+  { state: 'testing',     label: 'Testing',      accent: 'border-l-teal-500',   dotColor: 'bg-teal-500' },
+  { state: 'review',      label: 'Review',       accent: 'border-l-orange-500', dotColor: 'bg-orange-500' },
+  { state: 'completed',   label: 'Completed',    accent: 'border-l-emerald-500', dotColor: 'bg-emerald-500' },
+  { state: 'failed',      label: 'Failed',       accent: 'border-l-red-500',    dotColor: 'bg-red-500' },
+  { state: 'cancelled',   label: 'Cancelled',    accent: 'border-l-gray-600',   dotColor: 'bg-gray-600' },
 ]
 
-const ACTIVE_STATES: TodoState[] = ['scheduled', 'intake', 'planning', 'plan_ready', 'in_progress', 'testing', 'review']
 
-const PRIORITY_CONFIG: Record<string, { color: string; dot: string; label: string }> = {
-  critical: { color: 'text-red-400', dot: 'bg-red-400', label: 'Critical' },
-  high: { color: 'text-orange-400', dot: 'bg-orange-400', label: 'High' },
-  medium: { color: 'text-gray-400', dot: 'bg-gray-500', label: 'Medium' },
-  low: { color: 'text-gray-600', dot: 'bg-gray-600', label: 'Low' },
+const PRIORITY_CONFIG: Record<string, { color: string; dot: string; label: string; weight: number }> = {
+  critical: { color: 'text-red-400', dot: 'bg-red-400', label: 'Critical', weight: 0 },
+  high:     { color: 'text-orange-400', dot: 'bg-orange-400', label: 'High', weight: 1 },
+  medium:   { color: 'text-gray-400', dot: 'bg-gray-500', label: 'Medium', weight: 2 },
+  low:      { color: 'text-gray-600', dot: 'bg-gray-600', label: 'Low', weight: 3 },
 }
 
-const STATE_DOT_COLORS: Record<string, string> = {
-  scheduled: 'bg-indigo-500',
-  intake: 'bg-violet-500',
-  planning: 'bg-blue-500',
-  plan_ready: 'bg-cyan-500',
-  in_progress: 'bg-amber-500',
-  testing: 'bg-teal-500',
-  review: 'bg-orange-500',
-  completed: 'bg-emerald-500',
-  failed: 'bg-red-500',
-  cancelled: 'bg-gray-500',
-}
-
-type ViewFilter = 'active' | 'all' | 'completed'
 type DateFilter = 'all' | 'today' | 'week' | 'month'
+type SortMode = 'priority' | 'newest' | 'oldest'
 
 export default function TodoBoardPage() {
   const { projectId } = useParams<{ projectId: string }>()
@@ -56,19 +48,13 @@ export default function TodoBoardPage() {
   const [loadingModels, setLoadingModels] = useState(false)
   const [scheduleEnabled, setScheduleEnabled] = useState(false)
   const [scheduledAt, setScheduledAt] = useState('')
-  const [showTrouble, setShowTrouble] = useState(true)
-  const [showCancelled, setShowCancelled] = useState(false)
+  const [searchQuery, setSearchQuery] = useState('')
+  const [sortMode, setSortMode] = useState<SortMode>('priority')
   const titleRef = useRef<HTMLInputElement>(null)
 
   // Filter state from URL
-  const viewFilter = (searchParams.get('view') as ViewFilter) || 'active'
   const dateFilter = (searchParams.get('date') as DateFilter) || 'all'
 
-  const setViewFilter = (v: ViewFilter) => {
-    const params = new URLSearchParams(searchParams)
-    params.set('view', v)
-    setSearchParams(params)
-  }
   const setDateFilter = (d: DateFilter) => {
     const params = new URLSearchParams(searchParams)
     params.set('date', d)
@@ -129,17 +115,46 @@ export default function TodoBoardPage() {
     ? projectTodos.filter((t) => new Date(t.created_at).getTime() >= dateCutoff)
     : projectTodos
 
-  // Separate failed, cancelled from main view
-  const failedTodos = dateFilteredTodos.filter((t) => t.state === 'failed')
-  const cancelledTodos = dateFilteredTodos.filter((t) => t.state === 'cancelled')
-  const mainTodos = dateFilteredTodos.filter((t) => t.state !== 'failed' && t.state !== 'cancelled')
+  // Search filter
+  const searchFiltered = useMemo(() => {
+    if (!searchQuery.trim()) return dateFilteredTodos
+    const q = searchQuery.toLowerCase()
+    return dateFilteredTodos.filter(
+      (t) => t.title.toLowerCase().includes(q) || (t.description && t.description.toLowerCase().includes(q))
+    )
+  }, [dateFilteredTodos, searchQuery])
 
-  // Determine visible columns based on filter
-  const visibleColumns = viewFilter === 'active'
-    ? COLUMNS.filter((c) => ACTIVE_STATES.includes(c.state))
-    : viewFilter === 'completed'
-      ? COLUMNS.filter((c) => c.state === 'completed')
-      : COLUMNS
+  // Sort
+  const sortedTodos = useMemo(() => {
+    const list = [...searchFiltered]
+    switch (sortMode) {
+      case 'priority':
+        list.sort((a, b) => {
+          const wa = PRIORITY_CONFIG[a.priority]?.weight ?? 2
+          const wb = PRIORITY_CONFIG[b.priority]?.weight ?? 2
+          if (wa !== wb) return wa - wb
+          return new Date(b.updated_at || b.created_at).getTime() - new Date(a.updated_at || a.created_at).getTime()
+        })
+        break
+      case 'newest':
+        list.sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime())
+        break
+      case 'oldest':
+        list.sort((a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime())
+        break
+    }
+    return list
+  }, [searchFiltered, sortMode])
+
+  // Always show all state columns so the full pipeline is visible
+  const groupedTodos = useMemo(() => {
+    return GROUPS.map((group) => ({
+      ...group,
+      items: sortedTodos.filter((t) => t.state === group.state),
+    }))
+  }, [sortedTodos])
+
+  const failedCount = projectTodos.filter((t) => t.state === 'failed').length
 
   const handleCreate = async () => {
     if (!projectId || !newTitle.trim()) return
@@ -173,26 +188,48 @@ export default function TodoBoardPage() {
     if (e.key === 'Escape') { setShowCreate(false); clearCreateError() }
   }
 
+  const handleRetry = async (todoId: string) => {
+    await retryTodo(todoId)
+    if (projectId) fetchTodos(projectId)
+  }
+
+  const hasFilters = searchQuery.trim() !== '' || dateFilter !== 'all'
+  const noResults = hasFilters && sortedTodos.length === 0
+
   return (
     <div className="p-4 md:p-6 h-full flex flex-col">
       {/* Header */}
       <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between mb-4">
-        <div>
-          <h1 className="text-lg font-semibold text-white">Tasks</h1>
-          <p className="text-xs text-gray-600 mt-0.5">
-            {projectTodos.length} task{projectTodos.length !== 1 ? 's' : ''}
-            {failedTodos.length > 0 && (
-              <span className="text-red-400/80 ml-2">{failedTodos.length} failed</span>
-            )}
-          </p>
+        <div className="flex items-center gap-4">
+          <div>
+            <h1 className="text-lg font-semibold text-white">Tasks</h1>
+            <p className="text-xs text-gray-600 mt-0.5">
+              {projectTodos.length} task{projectTodos.length !== 1 ? 's' : ''}
+              {failedCount > 0 && (
+                <span className="text-red-400/60 ml-2">{failedCount} needs attention</span>
+              )}
+            </p>
+          </div>
         </div>
-        <div className="flex items-center gap-3">
+        <div className="flex items-center gap-2">
           {isLoading && (
             <div className="flex items-center gap-1.5 text-gray-600 text-xs">
               <Spinner size="sm" />
               <span>Syncing</span>
             </div>
           )}
+          <div className="relative">
+            <svg className="absolute left-2.5 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-gray-600 pointer-events-none" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+              <path strokeLinecap="round" strokeLinejoin="round" d="M21 21l-5.197-5.197m0 0A7.5 7.5 0 105.196 5.196a7.5 7.5 0 0010.607 10.607z" />
+            </svg>
+            <input
+              type="text"
+              placeholder="Search..."
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+              className="w-40 focus:w-56 pl-8 pr-3 py-1.5 bg-gray-900 border border-gray-800 rounded-lg text-xs text-white placeholder-gray-600 focus:outline-none focus:border-indigo-500 transition-all"
+            />
+          </div>
           <button
             onClick={() => navigate(`/projects/${projectId}/chat`)}
             className="px-3 py-1.5 bg-gray-800 hover:bg-gray-700 rounded-lg text-sm text-gray-300 transition-colors flex items-center gap-1.5"
@@ -204,30 +241,16 @@ export default function TodoBoardPage() {
           </button>
           <button
             onClick={() => { setShowCreate(true); clearCreateError() }}
-            className="px-4 py-1.5 bg-indigo-600 hover:bg-indigo-500 rounded-lg text-sm font-medium text-white transition-colors"
+            className="px-4 py-1.5 bg-indigo-600 hover:bg-indigo-500 rounded-lg text-sm font-medium text-white transition-colors flex items-center gap-1.5"
           >
+            <Plus className="w-4 h-4" />
             New Task
           </button>
         </div>
       </div>
 
       {/* Filters */}
-      <div className="flex flex-col gap-2 md:flex-row md:items-center md:justify-between mb-4">
-        <div className="flex items-center gap-1">
-          {(['active', 'all', 'completed'] as const).map((v) => (
-            <button
-              key={v}
-              onClick={() => setViewFilter(v)}
-              className={`px-3 py-1 rounded-lg text-xs font-medium transition-colors ${
-                viewFilter === v
-                  ? 'bg-indigo-600/20 text-indigo-400'
-                  : 'text-gray-600 hover:text-gray-400 hover:bg-gray-900'
-              }`}
-            >
-              {v === 'active' ? 'Active' : v === 'all' ? 'All' : 'Completed'}
-            </button>
-          ))}
-        </div>
+      <div className="flex items-center gap-2 mb-4">
         <div className="flex items-center gap-1">
           {(['all', 'today', 'week', 'month'] as const).map((d) => (
             <button
@@ -243,11 +266,20 @@ export default function TodoBoardPage() {
             </button>
           ))}
         </div>
+        <select
+          value={sortMode}
+          onChange={(e) => setSortMode(e.target.value as SortMode)}
+          className="px-2.5 py-1 bg-gray-900 border border-gray-800 rounded-lg text-[11px] text-gray-400 focus:outline-none focus:border-indigo-500 transition-colors"
+        >
+          <option value="priority">Sort: Priority</option>
+          <option value="newest">Sort: Newest</option>
+          <option value="oldest">Sort: Oldest</option>
+        </select>
       </div>
 
       {/* Create Task Panel */}
       {showCreate && (
-        <div className="mb-5 p-4 md:p-5 bg-gray-900 rounded-xl border border-gray-800" onKeyDown={handleKeyDown}>
+        <div className="mb-5 p-4 md:p-5 bg-gray-900 rounded-xl border border-gray-800 animate-fade-in-up" onKeyDown={handleKeyDown}>
           <div className="flex items-center justify-between mb-4">
             <h2 className="text-sm font-medium text-gray-300">New Task</h2>
             <span className="text-[11px] text-gray-600">
@@ -376,152 +408,129 @@ export default function TodoBoardPage() {
         </div>
       )}
 
-      {/* Failed Banner (only failed, not cancelled) */}
-      {failedTodos.length > 0 && (
-        <div className="mb-4">
-          <button
-            onClick={() => setShowTrouble(!showTrouble)}
-            className="w-full flex items-center justify-between px-4 py-2.5 bg-red-500/5 hover:bg-red-500/8 border border-red-500/10 rounded-lg transition-colors"
-          >
-            <div className="flex items-center gap-2.5">
-              <span className="w-1.5 h-1.5 rounded-full bg-red-400" />
-              <span className="text-sm text-red-300/80">
-                {failedTodos.length} failed
-              </span>
-            </div>
-            <svg className={`w-3.5 h-3.5 text-gray-600 transition-transform ${showTrouble ? 'rotate-180' : ''}`} fill="none" viewBox="0 0 24 24" stroke="currentColor">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
-            </svg>
-          </button>
+      {/* Kanban Board */}
+      <div className="flex-1 overflow-hidden">
+        {projectTodos.length === 0 && !isLoading && (
+          <EmptyState
+            icon={<ListTodo />}
+            title="No tasks yet"
+            message="Create a task or use Chat to get started"
+            action={{ label: 'New Task', onClick: () => { setShowCreate(true); clearCreateError() } }}
+            size="lg"
+          />
+        )}
 
-          {showTrouble && (
-            <div className="mt-2 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2">
-              {failedTodos.map((todo) => (
-                <TroubleCard key={todo.id} todo={todo} onRetry={async () => {
-                  await retryTodo(todo.id)
-                  if (projectId) fetchTodos(projectId)
-                }} />
-              ))}
-            </div>
-          )}
-        </div>
-      )}
+        {projectTodos.length > 0 && noResults && (
+          <div className="flex flex-col items-center justify-center py-16">
+            <p className="text-sm text-gray-500 mb-1.5">No tasks match the current filters</p>
+            <button
+              onClick={() => { setSearchQuery(''); setDateFilter('all') }}
+              className="text-xs text-indigo-400 hover:text-indigo-300 transition-colors"
+            >
+              Clear filters
+            </button>
+          </div>
+        )}
 
-      {/* Kanban Columns */}
-      <div className="flex-1 flex flex-col gap-4 overflow-y-auto md:flex-row md:gap-3 md:overflow-x-auto pb-4">
-        {visibleColumns.map((col) => {
-          const items = mainTodos.filter((t) => t.state === col.state)
-          const isSlim = col.state === 'scheduled'
-          return (
-            <div key={col.state} className={`flex flex-col ${isSlim ? 'w-full md:w-[160px] md:shrink-0' : 'w-full md:flex-1 md:min-w-[220px]'}`}>
-              <div className={`mb-3 pb-2 border-l-2 ${col.accent} pl-3 flex items-center justify-between`}>
-                <span className="text-xs font-medium text-gray-400 uppercase tracking-wider">{col.label}</span>
-                <span className="text-[11px] text-gray-600 tabular-nums">{items.length}</span>
+        {projectTodos.length > 0 && (
+          <div className="flex gap-3 h-full overflow-x-auto pb-4 pr-4">
+            {groupedTodos.map((group) => (
+              <div key={group.state} className="flex flex-col w-72 shrink-0">
+                <ColumnHeader label={group.label} count={group.items.length} dotColor={group.dotColor} />
+                <div className="flex-1 overflow-y-auto space-y-2 pr-1">
+                  {group.items.length === 0 && (
+                    <div className="py-6 text-center text-[11px] text-gray-700 border border-dashed border-gray-800/50 rounded-lg">
+                      No tasks
+                    </div>
+                  )}
+                  {group.items.map((todo) => (
+                    <TaskCard key={todo.id} todo={todo} onRetry={() => handleRetry(todo.id)} />
+                  ))}
+                </div>
               </div>
-
-              <div className="flex-1 space-y-2 overflow-y-auto">
-                {items.length === 0 && (
-                  <div className="py-8 text-center text-xs text-gray-700">No tasks</div>
-                )}
-                {items.map((todo) => (
-                  <TodoCard key={todo.id} todo={todo} slim={isSlim} />
-                ))}
-              </div>
-            </div>
-          )
-        })}
+            ))}
+          </div>
+        )}
       </div>
-
-      {/* Cancelled — subtle section at bottom */}
-      {cancelledTodos.length > 0 && (
-        <div className="pt-2 border-t border-gray-900">
-          <button
-            onClick={() => setShowCancelled(!showCancelled)}
-            className="flex items-center gap-1.5 text-[11px] text-gray-700 hover:text-gray-500 transition-colors"
-          >
-            <span className="w-1 h-1 rounded-full bg-gray-700" />
-            {cancelledTodos.length} cancelled
-            <svg className={`w-3 h-3 transition-transform ${showCancelled ? 'rotate-180' : ''}`} fill="none" viewBox="0 0 24 24" stroke="currentColor">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
-            </svg>
-          </button>
-          {showCancelled && (
-            <div className="mt-1.5 space-y-1">
-              {cancelledTodos.map((t) => (
-                <Link
-                  key={t.id}
-                  to={`/todos/${t.id}`}
-                  className="block px-3 py-1.5 text-[11px] text-gray-700 hover:text-gray-500 transition-colors truncate"
-                >
-                  {t.title}
-                </Link>
-              ))}
-            </div>
-          )}
-        </div>
-      )}
     </div>
   )
 }
 
-function TodoCard({ todo, slim }: { todo: TodoItem; slim?: boolean }) {
+/* ── Column Header ────────────────────────────────────────────── */
+
+function ColumnHeader({ label, count, dotColor }: { label: string; count: number; dotColor: string }) {
+  return (
+    <div className="flex items-center gap-2 mb-3 px-1">
+      <span className={`w-2 h-2 rounded-full shrink-0 ${dotColor}`} />
+      <span className="text-xs font-medium text-gray-400 uppercase tracking-wider">{label}</span>
+      <span className="text-[10px] text-gray-600 bg-gray-800 px-1.5 py-0.5 rounded-full">{count}</span>
+    </div>
+  )
+}
+
+/* ── Task Card ────────────────────────────────────────────────── */
+
+function TaskCard({ todo, onRetry }: { todo: TodoItem; onRetry: () => void }) {
   const priority = PRIORITY_CONFIG[todo.priority] || PRIORITY_CONFIG.medium
   const completedCount = todo.sub_tasks?.filter((s) => s.status === 'completed').length ?? 0
   const totalCount = todo.sub_tasks?.length ?? 0
   const progressPct = totalCount > 0 ? (completedCount / totalCount) * 100 : 0
-  const timeAgo = getRelativeTime(todo.created_at)
-
-  if (slim) {
-    return (
-      <Link
-        to={`/todos/${todo.id}`}
-        className="group block px-2.5 py-2 bg-gray-900 rounded-lg border border-gray-800/50 hover:border-gray-700 transition-all"
-      >
-        <div className="text-xs text-gray-300 leading-snug group-hover:text-white transition-colors truncate">
-          {todo.title}
-        </div>
-        <div className="mt-1.5 flex items-center gap-1.5">
-          <span className={`w-1.5 h-1.5 rounded-full ${priority.dot}`} />
-          {todo.scheduled_at && (
-            <span className="text-[10px] text-indigo-400/70 truncate">
-              {new Date(todo.scheduled_at).toLocaleDateString()}
-            </span>
-          )}
-          {!todo.scheduled_at && (
-            <span className="text-[10px] text-gray-700">{timeAgo}</span>
-          )}
-        </div>
-      </Link>
-    )
-  }
+  const timeAgo = getRelativeTime(todo.updated_at || todo.created_at)
+  const isFailed = todo.state === 'failed'
+  const isCancelled = todo.state === 'cancelled'
+  const isActive = todo.state === 'in_progress' || todo.state === 'testing'
 
   return (
     <Link
       to={`/todos/${todo.id}`}
-      className="group block p-3 bg-gray-900 rounded-lg border border-gray-800/50 hover:border-gray-700 transition-all"
+      className={`group block px-3 py-2.5 rounded-lg border transition-all hover:shadow-card ${
+        isFailed
+          ? 'bg-gray-900 border-red-500/10 hover:border-red-500/20'
+          : 'bg-gray-900 border-gray-800/50 hover:border-gray-700'
+      }`}
     >
-      <div className="text-sm text-gray-200 mb-2 leading-snug group-hover:text-white transition-colors">
-        {todo.title}
-      </div>
-
-      <div className="flex items-center gap-2 flex-wrap">
-        <span className="inline-flex items-center gap-1 text-[11px]">
-          <span className={`w-1.5 h-1.5 rounded-full ${priority.dot}`} />
-          <span className={priority.color}>{priority.label}</span>
+      {/* Priority + Title */}
+      <div className="flex items-start gap-2 min-w-0 mb-1.5">
+        <span className={`w-1.5 h-1.5 rounded-full shrink-0 mt-1.5 ${priority.dot}`} title={priority.label} />
+        <span className={`flex-1 text-sm leading-snug transition-colors ${
+          isCancelled
+            ? 'text-gray-600 line-through'
+            : 'text-gray-300 group-hover:text-white'
+        }`}>
+          {todo.title}
         </span>
-        <span className="text-[11px] text-gray-700">|</span>
-        <span className="text-[11px] text-gray-600">{todo.task_type}</span>
-        {todo.sub_state && (
-          <>
-            <span className="text-[11px] text-gray-700">|</span>
-            <span className="text-[11px] text-indigo-400/70 font-mono">{todo.sub_state}</span>
-          </>
+        {isActive && (
+          <span className={`w-2 h-2 rounded-full shrink-0 mt-1 ${
+            GROUPS.find(g => g.state === todo.state)?.dotColor || 'bg-gray-500'
+          } animate-pulse`} />
         )}
       </div>
 
+      {/* Metadata row */}
+      <div className="flex items-center gap-1.5 flex-wrap">
+        <span className="text-[10px] text-gray-600">{todo.task_type}</span>
+        {todo.sub_state && (
+          <span className="px-1.5 py-0.5 bg-gray-800 rounded text-[10px] text-indigo-400/70 font-mono">
+            {todo.sub_state}
+          </span>
+        )}
+        {todo.provider_model && (
+          <span className="text-[10px] text-gray-700 font-mono truncate max-w-[100px]" title={todo.provider_model}>
+            {todo.provider_model}
+          </span>
+        )}
+        {todo.state === 'scheduled' && todo.scheduled_at && (
+          <span className="text-[10px] text-indigo-400/70" title={new Date(todo.scheduled_at).toLocaleString()}>
+            <Clock className="w-3 h-3 inline" />
+          </span>
+        )}
+        <span className="ml-auto text-[10px] text-gray-700 tabular-nums shrink-0">{timeAgo}</span>
+      </div>
+
+      {/* Progress bar */}
       {totalCount > 0 && (
-        <div className="mt-2.5">
-          <div className="w-full bg-gray-800 rounded-full h-1 overflow-hidden">
+        <div className="flex items-center gap-2 mt-2">
+          <div className="flex-1 bg-gray-800 rounded-full h-1 overflow-hidden">
             <div
               className="h-full rounded-full transition-all duration-500"
               style={{
@@ -530,67 +539,31 @@ function TodoCard({ todo, slim }: { todo: TodoItem; slim?: boolean }) {
               }}
             />
           </div>
-          <div className="text-[11px] text-gray-600 mt-1">{completedCount}/{totalCount} sub-tasks</div>
+          <span className="text-[10px] text-gray-600 tabular-nums">{completedCount}/{totalCount}</span>
         </div>
       )}
 
-      {todo.state === 'scheduled' && todo.scheduled_at && (
-        <div className="mt-2 flex items-center gap-1 text-[11px] text-indigo-400/70">
-          <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-            <path strokeLinecap="round" strokeLinejoin="round" d="M12 6v6h4.5m4.5 0a9 9 0 11-18 0 9 9 0 0118 0z" />
-          </svg>
-          <span>{new Date(todo.scheduled_at).toLocaleString()}</span>
-        </div>
-      )}
-
-      <div className="mt-2 flex items-center gap-1.5 text-[11px] text-gray-700">
-        {todo.provider_model && (
-          <>
-            <span className="text-gray-600 truncate max-w-[100px] font-mono" title={todo.provider_model}>
-              {todo.provider_model}
+      {/* Error snippet + retry */}
+      {isFailed && (
+        <div className="mt-2 flex items-center gap-2">
+          {todo.error_message && (
+            <span className="flex-1 text-[10px] text-red-400/60 font-mono truncate">
+              {todo.error_message}
             </span>
-            <span>·</span>
-          </>
-        )}
-        <span>{timeAgo}</span>
-      </div>
+          )}
+          <button
+            onClick={(e) => { e.preventDefault(); e.stopPropagation(); onRetry() }}
+            className="text-[10px] px-2 py-0.5 rounded text-indigo-400 hover:text-indigo-300 hover:bg-indigo-500/10 transition-colors shrink-0"
+          >
+            Retry
+          </button>
+        </div>
+      )}
     </Link>
   )
 }
 
-function TroubleCard({ todo, onRetry }: { todo: TodoItem; onRetry: () => void }) {
-  const dotColor = STATE_DOT_COLORS[todo.state] || 'bg-gray-500'
-
-  return (
-    <div className="p-3 rounded-lg border transition-colors bg-gray-900 border-red-500/10">
-      <div className="flex items-start justify-between gap-2 mb-1.5">
-        <Link to={`/todos/${todo.id}`} className="text-sm text-gray-300 hover:text-white transition-colors leading-snug flex-1">
-          {todo.title}
-        </Link>
-        <span className="flex items-center gap-1.5 shrink-0">
-          <span className={`w-1.5 h-1.5 rounded-full ${dotColor}`} />
-          <span className="text-[11px] text-gray-500">Failed</span>
-        </span>
-      </div>
-
-      {todo.error_message && (
-        <div className="mb-2 px-2.5 py-1.5 bg-gray-950 rounded text-[11px] text-red-300/60 font-mono leading-relaxed break-words">
-          {todo.error_message}
-        </div>
-      )}
-
-      <div className="flex items-center justify-between">
-        <span className="text-[11px] text-gray-700">{getRelativeTime(todo.created_at)}</span>
-        <button
-          onClick={(e) => { e.preventDefault(); onRetry() }}
-          className="text-[11px] px-2.5 py-1 rounded text-indigo-400 hover:text-indigo-300 hover:bg-indigo-500/10 transition-colors"
-        >
-          Retry
-        </button>
-      </div>
-    </div>
-  )
-}
+/* ── Helpers ───────────────────────────────────────────────────── */
 
 function Spinner({ size = 'md' }: { size?: 'sm' | 'md' }) {
   const sizeClass = size === 'sm' ? 'w-3 h-3' : 'w-4 h-4'
