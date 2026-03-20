@@ -213,9 +213,9 @@ async def _handle_create_task(arguments: dict, context: dict) -> dict:
                 "intake_data": intake_data,
             }
             await db.execute(
-                "UPDATE project_chat_sessions SET task_plan_json = $2::jsonb, updated_at = NOW() WHERE id = $1",
+                "UPDATE project_chat_sessions SET task_plan_json = $2, updated_at = NOW() WHERE id = $1",
                 session_id,
-                json.dumps(task_plan_data),
+                task_plan_data,
             )
 
             return {
@@ -245,7 +245,7 @@ async def _handle_create_task(arguments: dict, context: dict) -> dict:
                 project_id, creator_id, title, description, priority, task_type,
                 state, sub_state, plan_json, intake_data
             )
-            VALUES ($1, $2, $3, $4, $5, $6, 'in_progress', 'executing', $7::jsonb, $8::jsonb)
+            VALUES ($1, $2, $3, $4, $5, $6, 'in_progress', 'executing', $7, $8)
             RETURNING *
             """,
             project_id,
@@ -254,8 +254,8 @@ async def _handle_create_task(arguments: dict, context: dict) -> dict:
             arguments.get("description", ""),
             arguments.get("priority", "medium"),
             arguments.get("task_type", "general"),
-            json.dumps(plan_json),
-            json.dumps(intake_data),
+            plan_json,
+            intake_data,
         )
         todo_id = str(todo["id"])
 
@@ -290,7 +290,7 @@ async def _handle_create_task(arguments: dict, context: dict) -> dict:
                 st["agent_role"],
                 st.get("execution_order", 0),
                 review_loop,
-                json.dumps(target_repo) if target_repo else None,
+                target_repo,
             )
             sub_task_ids.append(str(row["id"]))
 

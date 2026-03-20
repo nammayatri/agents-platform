@@ -37,7 +37,7 @@ async def create_provider(body: ProviderConfigInput, user: CurrentUser, db: DB):
             api_key_enc, default_model, fast_model, max_tokens,
             temperature, extra_config
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
         RETURNING id, owner_id, provider_type, display_name, api_base_url,
                   default_model, fast_model, max_tokens, temperature, is_active
         """,
@@ -50,7 +50,7 @@ async def create_provider(body: ProviderConfigInput, user: CurrentUser, db: DB):
         body.fast_model,
         body.max_tokens,
         body.temperature,
-        json.dumps(body.extra_config),
+        body.extra_config,
     )
     return dict(row)
 
@@ -74,7 +74,7 @@ async def update_provider(provider_id: str, body: ProviderConfigInput, user: Cur
         SET provider_type = $2, display_name = $3, api_base_url = $4,
             api_key_enc = COALESCE($5, api_key_enc), default_model = $6,
             fast_model = $7, max_tokens = $8, temperature = $9,
-            extra_config = $10::jsonb
+            extra_config = $10
         WHERE id = $1
         RETURNING id, owner_id, provider_type, display_name, api_base_url,
                   default_model, fast_model, max_tokens, temperature, is_active
@@ -88,7 +88,7 @@ async def update_provider(provider_id: str, body: ProviderConfigInput, user: Cur
         body.fast_model,
         body.max_tokens,
         body.temperature,
-        json.dumps(body.extra_config),
+        body.extra_config,
     )
     return dict(row)
 

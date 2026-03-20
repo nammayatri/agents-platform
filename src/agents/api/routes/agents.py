@@ -311,10 +311,10 @@ async def undo_last_agent_action(user: CurrentUser, db: DB):
         )
         await db.execute(
             "INSERT INTO agent_chat_messages (user_id, role, content, metadata_json) "
-            "VALUES ($1, 'system', $2, $3::jsonb)",
+            "VALUES ($1, 'system', $2, $3)",
             user["id"],
             f"Undone: Agent '{meta.get('agent_name', '')}' deleted.",
-            json.dumps({"action": "agent_undone"}),
+            {"action": "agent_undone"},
         )
         return {"status": "undone", "action": "deleted", "agent_id": agent_id}
 
@@ -342,10 +342,10 @@ async def undo_last_agent_action(user: CurrentUser, db: DB):
         )
         await db.execute(
             "INSERT INTO agent_chat_messages (user_id, role, content, metadata_json) "
-            "VALUES ($1, 'system', $2, $3::jsonb)",
+            "VALUES ($1, 'system', $2, $3)",
             user["id"],
             "Undone: Agent restored to previous state.",
-            json.dumps({"action": "agent_undone"}),
+            {"action": "agent_undone"},
         )
         return {"status": "undone", "action": "reverted", "agent_id": agent_id}
 
@@ -430,11 +430,11 @@ async def send_agent_chat(body: AgentChatInput, user: CurrentUser, db: DB):
         assistant_msg = await db.fetchrow(
             """
             INSERT INTO agent_chat_messages (user_id, role, content, metadata_json)
-            VALUES ($1, 'assistant', $2, $3::jsonb) RETURNING *
+            VALUES ($1, 'assistant', $2, $3) RETURNING *
             """,
             user["id"],
             content,
-            json.dumps(metadata) if metadata else None,
+            metadata if metadata else None,
         )
 
         return {

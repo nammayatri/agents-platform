@@ -181,12 +181,12 @@ async def send_session_message(
     user_msg = await db.fetchrow(
         """
         INSERT INTO project_chat_messages (project_id, user_id, role, content, metadata_json, session_id)
-        VALUES ($1, $2, 'user', $3, $4::jsonb, $5) RETURNING *
+        VALUES ($1, $2, 'user', $3, $4, $5) RETURNING *
         """,
         project_id,
         user["id"],
         body.content,
-        json.dumps({"intent": body.intent}) if body.intent else None,
+        {"intent": body.intent} if body.intent else None,
         session_id,
     )
 
@@ -369,9 +369,9 @@ async def accept_session_plan(
     assistant_msg = await db.fetchrow(
         """
         INSERT INTO project_chat_messages (project_id, user_id, role, content, metadata_json, session_id)
-        VALUES ($1, $2, 'assistant', $3, $4::jsonb, $5) RETURNING *
+        VALUES ($1, $2, 'assistant', $3, $4, $5) RETURNING *
         """,
-        project_id, user["id"], content, json.dumps(metadata), session_id,
+        project_id, user["id"], content, metadata, session_id,
     )
 
     return {
@@ -402,7 +402,7 @@ async def accept_task_plan(
             project_id, creator_id, title, description, priority, task_type,
             state, plan_json, intake_data, chat_session_id
         )
-        VALUES ($1, $2, $3, $4, $5, $6, 'plan_ready', $7::jsonb, $8::jsonb, $9)
+        VALUES ($1, $2, $3, $4, $5, $6, 'plan_ready', $7, $8, $9)
         RETURNING *
         """,
         project_id,
@@ -411,8 +411,8 @@ async def accept_task_plan(
         task_plan.get("description", ""),
         task_plan.get("priority", "medium"),
         task_plan.get("task_type", "general"),
-        json.dumps(plan_json),
-        json.dumps(intake_data),
+        plan_json,
+        intake_data,
         session_id,
     )
     todo_id = str(todo["id"])
@@ -445,7 +445,7 @@ async def accept_task_plan(
                 todo_id, title, description, agent_role,
                 execution_order, input_context, review_loop, target_repo
             )
-            VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8::jsonb)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
             RETURNING id
             """,
             todo_id,
@@ -453,9 +453,9 @@ async def accept_task_plan(
             st.get("description", ""),
             st.get("agent_role", "coder"),
             st.get("execution_order", 0),
-            json.dumps(st.get("context", {})),
+            st.get("context", {}),
             review_loop,
-            json.dumps(target_repo) if target_repo else None,
+            target_repo,
         )
         sub_task_ids.append(str(row["id"]))
 
@@ -496,9 +496,9 @@ async def accept_task_plan(
     assistant_msg = await db.fetchrow(
         """
         INSERT INTO project_chat_messages (project_id, user_id, role, content, metadata_json, session_id)
-        VALUES ($1, $2, 'assistant', $3, $4::jsonb, $5) RETURNING *
+        VALUES ($1, $2, 'assistant', $3, $4, $5) RETURNING *
         """,
-        project_id, user["id"], content, json.dumps(metadata), session_id,
+        project_id, user["id"], content, metadata, session_id,
     )
 
     return {
@@ -644,12 +644,12 @@ async def send_project_chat(
     user_msg = await db.fetchrow(
         """
         INSERT INTO project_chat_messages (project_id, user_id, role, content, metadata_json)
-        VALUES ($1, $2, 'user', $3, $4::jsonb) RETURNING *
+        VALUES ($1, $2, 'user', $3, $4) RETURNING *
         """,
         project_id,
         user["id"],
         body.content,
-        json.dumps({"intent": body.intent}) if body.intent else None,
+        {"intent": body.intent} if body.intent else None,
     )
 
     try:

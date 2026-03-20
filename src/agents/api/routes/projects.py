@@ -68,9 +68,9 @@ async def list_projects(user: CurrentUser, db: DB):
 
 @router.post("", status_code=status.HTTP_201_CREATED)
 async def create_project(body: CreateProjectInput, user: CurrentUser, db: DB, redis: Redis):
-    context_docs_json = json.dumps(
-        [d.model_dump(exclude_none=True) for d in body.context_docs]
-    ) if body.context_docs else "[]"
+    context_docs_list = [
+        d.model_dump(exclude_none=True) for d in body.context_docs
+    ] if body.context_docs else []
 
     row = await db.fetchrow(
         """
@@ -78,7 +78,7 @@ async def create_project(body: CreateProjectInput, user: CurrentUser, db: DB, re
             owner_id, name, description, repo_url, default_branch,
             ai_provider_id, context_docs, git_provider_id, icon_url
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9) RETURNING *
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING *
         """,
         user["id"],
         body.name,
@@ -86,7 +86,7 @@ async def create_project(body: CreateProjectInput, user: CurrentUser, db: DB, re
         body.repo_url,
         body.default_branch,
         body.ai_provider_id,
-        context_docs_json,
+        context_docs_list,
         body.git_provider_id,
         body.icon_url,
     )
@@ -121,19 +121,16 @@ async def update_project(project_id: str, body: UpdateProjectInput, user: Curren
     if not updates:
         return _sanitize_project(dict(row))
 
-    # Serialize context_docs to JSON string for JSONB column
+    # Ensure context_docs is a list of dicts (not Pydantic models)
     if "context_docs" in updates:
-        updates["context_docs"] = json.dumps(
-            [d if isinstance(d, dict) else d for d in updates["context_docs"]]
-        )
+        updates["context_docs"] = [
+            d if isinstance(d, dict) else d for d in updates["context_docs"]
+        ]
 
     set_parts = []
     values = []
     for i, (k, v) in enumerate(updates.items()):
-        if k == "context_docs":
-            set_parts.append(f"{k} = ${i+2}::jsonb")
-        else:
-            set_parts.append(f"{k} = ${i+2}")
+        set_parts.append(f"{k} = ${i+2}")
         values.append(v)
 
     set_clause = ", ".join(set_parts)
@@ -155,9 +152,9 @@ async def update_project(project_id: str, body: UpdateProjectInput, user: Curren
     if "repo_url" in updates and updates["repo_url"] != old_repo:
         should_reanalyze = True
     if "context_docs" in updates:
-        old_deps_str = json.dumps(old_deps) if old_deps else "[]"
-        new_deps_str = updates["context_docs"] if isinstance(updates["context_docs"], str) else json.dumps(updates["context_docs"])
-        if new_deps_str != old_deps_str:
+        old_deps_norm = json.dumps(old_deps, sort_keys=True) if old_deps else "[]"
+        new_deps_norm = json.dumps(updates["context_docs"], sort_keys=True) if updates["context_docs"] else "[]"
+        if new_deps_norm != old_deps_norm:
             should_reanalyze = True
     if "git_provider_id" in updates and str(updates["git_provider_id"] or "") != str(old_git or ""):
         should_reanalyze = True

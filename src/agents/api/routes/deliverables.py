@@ -116,9 +116,9 @@ async def get_deliverable_diff(deliverable_id: str, user: CurrentUser, db: DB):
 
     # Cache it for next time
     await db.execute(
-        "UPDATE deliverables SET content_json = $2::jsonb WHERE id = $1",
+        "UPDATE deliverables SET content_json = $2 WHERE id = $1",
         deliverable_id,
-        json.dumps(result),
+        result,
     )
 
     return result

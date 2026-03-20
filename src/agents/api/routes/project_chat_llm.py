@@ -613,12 +613,12 @@ Project: "{project['name']}"
     msg_row = await db.fetchrow(
         """
         INSERT INTO project_chat_messages (project_id, user_id, role, content, metadata_json, session_id)
-        VALUES ($1, $2, 'assistant', $3, $4::jsonb, $5) RETURNING *
+        VALUES ($1, $2, 'assistant', $3, $4, $5) RETURNING *
         """,
         project_id,
         user_id,
         content,
-        json.dumps(metadata),
+        metadata,
         session_id,
     )
     return dict(msg_row)
@@ -1028,9 +1028,9 @@ async def generate_plan_response(
                         )
 
                 await db.execute(
-                    "UPDATE project_chat_sessions SET plan_json = $2::jsonb, updated_at = NOW() WHERE id = $1",
+                    "UPDATE project_chat_sessions SET plan_json = $2, updated_at = NOW() WHERE id = $1",
                     session_id,
-                    json.dumps(plan_data),
+                    plan_data,
                 )
                 metadata = {
                     "action": "plan_proposed",
@@ -1083,12 +1083,12 @@ async def generate_plan_response(
     msg_row = await db.fetchrow(
         """
         INSERT INTO project_chat_messages (project_id, user_id, role, content, metadata_json, session_id)
-        VALUES ($1, $2, 'assistant', $3, $4::jsonb, $5) RETURNING *
+        VALUES ($1, $2, 'assistant', $3, $4, $5) RETURNING *
         """,
         project_id,
         user_id,
         content,
-        json.dumps(metadata),
+        metadata,
         session_id,
     )
     return dict(msg_row)
@@ -1147,7 +1147,7 @@ async def create_tasks_from_plan(
                     project_id, creator_id, title, description, priority, task_type,
                     state, sub_state, plan_json, intake_data
                 )
-                VALUES ($1, $2, $3, $4, $5, $6, 'in_progress', 'executing', $7::jsonb, $8::jsonb)
+                VALUES ($1, $2, $3, $4, $5, $6, 'in_progress', 'executing', $7, $8)
                 RETURNING *
                 """,
                 project_id,
@@ -1156,8 +1156,8 @@ async def create_tasks_from_plan(
                 task.get("description", ""),
                 task.get("priority", "medium"),
                 task.get("task_type", "general"),
-                json.dumps(plan_json),
-                json.dumps(intake_data),
+                plan_json,
+                intake_data,
             )
             todo_id = str(todo["id"])
             created_ids.append(todo_id)
@@ -1177,13 +1177,17 @@ async def create_tasks_from_plan(
             for i, st in enumerate(plan_json["sub_tasks"]):
                 review_loop = bool(st.get("review_loop", False))
                 target_repo = resolve_target_repo(st.get("target_repo"), context_docs)
+                logger.info(
+                    "[create_tasks] subtask[%d]: target_repo raw=%r resolved=%s",
+                    i, st.get("target_repo"), target_repo.get("name") if target_repo else None,
+                )
                 row = await db.fetchrow(
                     """
                     INSERT INTO sub_tasks (
                         todo_id, title, description, agent_role,
                         execution_order, input_context, review_loop, target_repo
                     )
-                    VALUES ($1, $2, $3, $4, $5, '{}'::jsonb, $6, $7::jsonb)
+                    VALUES ($1, $2, $3, $4, $5, '{}'::jsonb, $6, $7)
                     RETURNING id
                     """,
                     todo_id,
@@ -1192,7 +1196,7 @@ async def create_tasks_from_plan(
                     st["agent_role"],
                     st.get("execution_order", 0),
                     review_loop,
-                    json.dumps(target_repo) if target_repo else None,
+                    target_repo,
                 )
                 sub_task_ids.append(str(row["id"]))
 
@@ -1540,12 +1544,12 @@ async def generate_debug_response(
     msg_row = await db.fetchrow(
         """
         INSERT INTO project_chat_messages (project_id, user_id, role, content, metadata_json, session_id)
-        VALUES ($1, $2, 'assistant', $3, $4::jsonb, $5) RETURNING *
+        VALUES ($1, $2, 'assistant', $3, $4, $5) RETURNING *
         """,
         project_id,
         user_id,
         content,
-        json.dumps(metadata),
+        metadata,
         session_id,
     )
     return dict(msg_row)
@@ -1750,12 +1754,12 @@ async def generate_create_task_response(
     msg_row = await db.fetchrow(
         """
         INSERT INTO project_chat_messages (project_id, user_id, role, content, metadata_json, session_id)
-        VALUES ($1, $2, 'assistant', $3, $4::jsonb, $5) RETURNING *
+        VALUES ($1, $2, 'assistant', $3, $4, $5) RETURNING *
         """,
         project_id,
         user_id,
         content,
-        json.dumps(metadata),
+        metadata,
         session_id,
     )
     return dict(msg_row)

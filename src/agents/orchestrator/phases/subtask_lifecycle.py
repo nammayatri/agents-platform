@@ -2063,12 +2063,12 @@ class SubtaskLifecycle:
                 raise ValueError(f"Unsupported build provider: {build_provider}")
 
             # Store artifact in deliverables
-            artifact_json = json.dumps({"image_hash": image_hash, "build_provider": build_provider})
+            artifact_data = {"image_hash": image_hash, "build_provider": build_provider}
             await coord.db.execute(
-                "UPDATE deliverables SET release_artifact_json = $2::jsonb, head_sha = COALESCE(head_sha, $3) "
+                "UPDATE deliverables SET release_artifact_json = $2, head_sha = COALESCE(head_sha, $3) "
                 "WHERE id = $1",
                 pr_deliv["id"],
-                artifact_json,
+                artifact_data,
                 image_hash,
             )
 

@@ -18,12 +18,12 @@ class AuditLogger:
         await self.pool.execute(
             """
             INSERT INTO audit_log (todo_id, user_id, agent_run_id, action, detail, metadata_json)
-            VALUES ($1, $2, $3, $4, $5, $6::jsonb)
+            VALUES ($1, $2, $3, $4, $5, $6)
             """,
             todo_id,
             user_id,
             agent_run_id,
             action,
             detail,
-            __import__("json").dumps(metadata or {}),
+            metadata or {},
         )

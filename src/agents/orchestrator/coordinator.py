@@ -404,8 +404,8 @@ class AgentCoordinator:
             return
         try:
             await self.db.execute(
-                "UPDATE sub_tasks SET execution_events = $2::jsonb WHERE id = $1",
-                subtask_id, json.dumps(events),
+                "UPDATE sub_tasks SET execution_events = $2 WHERE id = $1",
+                subtask_id, events,
             )
         except Exception:
             logger.debug("[%s] Failed to persist execution events for %s", self.todo_id[:8], subtask_id[:8], exc_info=True)
@@ -675,9 +675,9 @@ class AgentCoordinator:
             if metadata:
                 await self.db.execute(
                     "INSERT INTO project_chat_messages (project_id, user_id, role, content, metadata_json, session_id) "
-                    "VALUES ($1, $2, $3, $4, $5::jsonb, $6)",
+                    "VALUES ($1, $2, $3, $4, $5, $6)",
                     self._chat_project_id, self._chat_user_id, role, content,
-                    json.dumps(metadata), session_id,
+                    metadata, session_id,
                 )
             else:
                 await self.db.execute(
@@ -690,8 +690,8 @@ class AgentCoordinator:
             if metadata:
                 await self.db.execute(
                     "INSERT INTO chat_messages (todo_id, role, content, metadata_json) "
-                    "VALUES ($1, $2, $3, $4::jsonb)",
-                    self.todo_id, role, content, json.dumps(metadata),
+                    "VALUES ($1, $2, $3, $4)",
+                    self.todo_id, role, content, metadata,
                 )
             else:
                 await self.db.execute(

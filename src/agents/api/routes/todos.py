@@ -103,7 +103,7 @@ async def create_todo(
             task_type, ai_provider_id, ai_model, state, scheduled_at,
             rules_override_json, max_iterations
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::jsonb, $13)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
         RETURNING *
         """,
         project_id,
@@ -117,7 +117,7 @@ async def create_todo(
         body.ai_model,
         initial_state,
         scheduled_at,
-        json.dumps(body.rules_override_json) if body.rules_override_json else None,
+        body.rules_override_json,
         body.max_iterations,
     )
 
@@ -456,7 +456,7 @@ async def approve_plan(todo_id: str, user: CurrentUser, db: DB, redis: Redis, ev
                 todo_id, title, description, agent_role,
                 execution_order, input_context, review_loop, target_repo
             )
-            VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8::jsonb)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
             RETURNING id
             """,
             todo_id,
@@ -464,9 +464,9 @@ async def approve_plan(todo_id: str, user: CurrentUser, db: DB, redis: Redis, ev
             st.get("description", ""),
             st["agent_role"],
             st.get("execution_order", 0),
-            json.dumps(st.get("context", {})),
+            st.get("context", {}),
             review_loop,
-            json.dumps(target_repo) if target_repo else None,
+            target_repo,
         )
         sub_task_ids.append(str(row["id"]))
 

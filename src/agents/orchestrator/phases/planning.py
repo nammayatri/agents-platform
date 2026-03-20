@@ -1069,7 +1069,7 @@ class PlanningPhase:
                         execution_order, input_context,
                         review_loop, target_repo
                     )
-                    VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8::jsonb)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
                     RETURNING id
                     """,
                     coord.todo_id,
@@ -1077,9 +1077,9 @@ class PlanningPhase:
                     st.get("description", ""),
                     st["agent_role"],
                     st.get("execution_order", 0),
-                    json.dumps(st.get("context", {})),
+                    st.get("context", {}),
                     bool(st.get("review_loop", False)),
-                    json.dumps(target_repo) if target_repo else None,
+                    target_repo,
                 )
                 st_id = str(row["id"])
                 sub_task_ids.append(st_id)

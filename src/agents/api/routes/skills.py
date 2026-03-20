@@ -145,14 +145,14 @@ async def create_mcp_server(body: McpServerInput, user: CurrentUser, db: DB):
     row = await db.fetchrow(
         """
         INSERT INTO mcp_servers (owner_id, name, description, command, args, env_json, transport, url)
-        VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8) RETURNING *
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *
         """,
         user["id"],
         body.name,
         body.description,
         body.command,
         body.args,
-        json.dumps(body.env_json),
+        body.env_json,
         body.transport,
         body.url,
     )
@@ -172,16 +172,10 @@ async def update_mcp_server(server_id: str, body: McpServerUpdate, user: Current
         return dict(existing)
 
     # Handle env_json serialization
-    if "env_json" in updates:
-        updates["env_json"] = json.dumps(updates["env_json"])
-
     set_parts = []
     values = []
     for i, (k, v) in enumerate(updates.items()):
-        if k == "env_json":
-            set_parts.append(f"{k} = ${i+2}::jsonb")
-        else:
-            set_parts.append(f"{k} = ${i+2}")
+        set_parts.append(f"{k} = ${i+2}")
         values.append(v)
 
     row = await db.fetchrow(
@@ -243,9 +237,9 @@ async def discover_mcp_tools(server_id: str, user: CurrentUser, db: DB):
 
         # Store discovered tools
         await db.execute(
-            "UPDATE mcp_servers SET tools_json = $2::jsonb, updated_at = NOW() WHERE id = $1",
+            "UPDATE mcp_servers SET tools_json = $2, updated_at = NOW() WHERE id = $1",
             server_id,
-            json.dumps(tools),
+            tools,
         )
 
         result = {"status": "ok", "tools": tools}
