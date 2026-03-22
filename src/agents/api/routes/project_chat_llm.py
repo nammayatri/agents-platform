@@ -230,24 +230,49 @@ def _build_execution_metadata(tool_events: list[dict], response) -> dict:
 
 # ── Intent Detection ────────────────────────────────────────────────
 
-INTENT_DETECTION_PROMPT = """\
-Classify the user's message into one of these chat modes:
-- "chat" — General questions, project discussion, asking about code/architecture, anything informational
-- "plan" — Strategic planning, building execution plans, feature scoping, "let's plan", "how should we build"
-- "debug" — Bug investigation, error diagnosis, performance issues, "why is X broken", "there's a bug"
-- "create_task" — Explicitly asking to create/add a task or work item ("create a task for", "add a task to")
+import re as _re
 
-Current mode: {current_mode}
-Recent conversation:
-{recent_context}
+# Keyword patterns for instant classification (no LLM call needed).
+# Checked in order — first match wins.
+_KEYWORD_RULES: list[tuple[str, "_re.Pattern[str]"]] = [
+    ("create_task", _re.compile(
+        r"\b(create|add|make|new|open)\b.{0,15}\b(task|ticket|issue|todo|work\s*item)\b",
+        _re.IGNORECASE,
+    )),
+    ("debug", _re.compile(
+        r"\b(debug|bug|error|crash|broken|failing|exception|traceback|stack\s*trace|why\s+is.*(?:broken|failing|wrong|slow))\b",
+        _re.IGNORECASE,
+    )),
+    # Only match "plan" when it's an action request, not a reference to
+    # an existing plan (e.g. "the plan wasn't right").  Require either:
+    #   - a verb+plan combo: "let's plan", "create a plan", "make a plan", "build a plan", "need a plan"
+    #   - plan as a verb: "plan this", "plan the", "plan for", "plan out"
+    #   - dedicated planning words: architect, roadmap, strategy
+    ("plan", _re.compile(
+        r"(?:"
+        r"let'?s\s+plan"
+        r"|(?:create|make|build|need|want|write)\s+(?:a\s+)?plan"
+        r"|\bplan\s+(?:this|the|for|out|how)\b"
+        r"|\b(architect|roadmap|strategy|how\s+should\s+we\s+build)\b"
+        r")",
+        _re.IGNORECASE,
+    )),
+]
 
-Rules:
-- If the message is a natural follow-up or continuation of the current mode, keep the current mode.
-- Only switch when the user's intent clearly changes to a different mode.
-- "create_task" requires explicit task creation language. Do not infer it from general requests.
-- Default to "chat" when uncertain.
+_VALID_MODES = {"chat", "plan", "debug", "create_task"}
 
-Respond with ONLY a JSON object, nothing else: {{"mode": "...", "confidence": 0.0-1.0}}"""
+# Minimal prompt — ask for a single word, no JSON overhead.
+_INTENT_PROMPT = """\
+Classify into: chat, plan, debug, create_task. Current: {current_mode}.
+Reply with ONE word only."""
+
+
+def _keyword_classify(message: str) -> str | None:
+    """Try to classify the message using keyword patterns. Returns mode or None."""
+    for mode, pattern in _KEYWORD_RULES:
+        if pattern.search(message):
+            return mode
+    return None
 
 
 async def detect_intent(
@@ -257,55 +282,59 @@ async def detect_intent(
     current_routing_mode: str,
     recent_messages: list[dict],
 ) -> tuple[str, float]:
-    """Detect the intent of a user message using the fast model.
+    """Detect the intent of a user message.
 
-    Returns (detected_mode, confidence). Mode is one of chat/plan/debug/create_task.
-    Falls back to (current_routing_mode, 0.0) on any failure.
+    Fast path: keyword patterns resolve instantly (no LLM call).
+    Slow path: one fast-model LLM call for ambiguous messages.
+
+    Returns (detected_mode, confidence).
     """
+    # ── Fast path: keyword match ──────────────────────────────────
+    kw_mode = _keyword_classify(user_message)
+    if kw_mode:
+        logger.info("detect_intent: keyword match → %s", kw_mode)
+        return kw_mode, 1.0
+
+    # ── Fast path: short follow-up keeps current mode ─────────────
+    # Messages under 40 chars with no mode-switching signals are
+    # almost always continuations ("yes", "continue", "ok do it").
+    if len(user_message) < 40 and current_routing_mode in _VALID_MODES:
+        return current_routing_mode, 0.8
+
+    # ── Slow path: LLM classification ─────────────────────────────
     from agents.schemas.agent import LLMMessage
 
-    # Build minimal recent context (last 3 messages, truncated)
-    context_lines = []
-    for msg in recent_messages[-3:]:
-        role = msg.get("role", "?")
-        content = (msg.get("content") or "")[:100]
-        context_lines.append(f"{role}: {content}")
-    recent_context = "\n".join(context_lines) if context_lines else "(new conversation)"
-
-    prompt = INTENT_DETECTION_PROMPT.format(
-        current_mode=current_routing_mode,
-        recent_context=recent_context,
-    )
-
-    messages = [
-        LLMMessage(role="user", content=user_message),
-    ]
+    prompt = _INTENT_PROMPT.format(current_mode=current_routing_mode)
 
     fast_model = provider.fast_model or provider.default_model
-    response = await provider.send_message(
-        messages,
-        model=fast_model,
-        max_tokens=50,
-        temperature=0.0,
-        system_prompt=prompt,
-    )
+    try:
+        response = await provider.send_message(
+            [LLMMessage(role="user", content=user_message)],
+            model=fast_model,
+            max_tokens=10,
+            temperature=0.0,
+            system_prompt=prompt,
+        )
+    except Exception as exc:
+        logger.warning("detect_intent: LLM call failed (%s), keeping %s", exc, current_routing_mode)
+        return current_routing_mode, 0.0
 
     try:
-        text = response.content.strip()
-        # Strip markdown fences if present
-        if text.startswith("```"):
-            text = text.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
-        data = json.loads(text)
-        mode = data.get("mode", current_routing_mode)
-        confidence = float(data.get("confidence", 0.5))
+        raw = response.content.strip().lower().strip('"').strip("'").strip()
+        # Handle JSON responses: {"mode": "chat"} or just "chat"
+        if raw.startswith("{"):
+            data = json.loads(raw)
+            mode = str(data.get("mode", current_routing_mode)).lower().strip()
+        else:
+            # Plain word response — take the first token
+            mode = raw.split()[0] if raw else current_routing_mode
 
-        valid_modes = {"chat", "plan", "debug", "create_task"}
-        if mode not in valid_modes:
-            return current_routing_mode, 0.0
-
-        return mode, confidence
-    except (json.JSONDecodeError, ValueError, KeyError, TypeError):
-        logger.debug("Intent detection parse failed: %s", response.content[:200])
+        if mode in _VALID_MODES:
+            return mode, 0.7
+        logger.warning("detect_intent: invalid mode %r, keeping %s", mode, current_routing_mode)
+        return current_routing_mode, 0.0
+    except Exception:
+        logger.debug("detect_intent: parse failed: %s", response.content[:100])
         return current_routing_mode, 0.0
 
 
@@ -318,6 +347,7 @@ async def generate_project_response(
     session_id: str | None,
     user_id: str,
     user_message: str,
+    user_display_name: str = "",
     intent: str | None,
     project: dict,
     db,
@@ -372,15 +402,17 @@ async def generate_project_response(
 
     if session_id:
         history = await db.fetch(
-            "SELECT role, content FROM project_chat_messages "
-            "WHERE session_id = $1 ORDER BY created_at DESC LIMIT 30",
+            "SELECT m.role, m.content, u.display_name AS sender_name "
+            "FROM project_chat_messages m JOIN users u ON u.id = m.user_id "
+            "WHERE m.session_id = $1 ORDER BY m.created_at DESC LIMIT 30",
             session_id,
         )
     else:
         history = await db.fetch(
-            "SELECT role, content FROM project_chat_messages "
-            "WHERE project_id = $1 AND user_id = $2 AND session_id IS NULL "
-            "ORDER BY created_at DESC LIMIT 30",
+            "SELECT m.role, m.content, u.display_name AS sender_name "
+            "FROM project_chat_messages m JOIN users u ON u.id = m.user_id "
+            "WHERE m.project_id = $1 AND m.user_id = $2 AND m.session_id IS NULL "
+            "ORDER BY m.created_at DESC LIMIT 30",
             project_id,
             user_id,
         )
@@ -484,10 +516,17 @@ Project: "{project['name']}"
     if skills_ctx:
         system_prompt += skills_ctx
 
+    system_prompt += "\n\nMessages from different users are prefixed with [Name]. Address them by name when relevant."
+
     messages = [LLMMessage(role="system", content=system_prompt)]
     for row in history[:-1]:
-        messages.append(LLMMessage(role=row["role"], content=row["content"]))
-    messages.append(LLMMessage(role="user", content=user_message))
+        content = row["content"]
+        if row["role"] == "user" and row.get("sender_name"):
+            content = f"[{row['sender_name']}]: {content}"
+        messages.append(LLMMessage(role=row["role"], content=content))
+    # Current message with user identity
+    current_content = f"[{user_display_name}]: {user_message}" if user_display_name else user_message
+    messages.append(LLMMessage(role="user", content=current_content))
 
     logger.info(
         "[chat] session=%s mode=%s dep_repos=%s system_prompt_tail:\n...%s",
@@ -576,6 +615,7 @@ Project: "{project['name']}"
         tools=tools_arg,
         tool_executor=_execute_tool,
         max_rounds=70,
+        nudge_tools=False,
         on_activity=on_activity,
         on_tool_event=_on_tool_event,
         on_inject_check=_check_inject,
@@ -587,14 +627,32 @@ Project: "{project['name']}"
     if on_token and hasattr(on_token, "flush"):
         await on_token.flush()
 
+    # Guard against empty responses
+    if not content or not content.strip():
+        logger.warning("[chat] empty response, retrying without streaming session=%s", session_id)
+        content, response = await run_tool_loop(
+            provider, messages,
+            tools=tools_arg,
+            tool_executor=_execute_tool,
+            max_rounds=70,
+            nudge_tools=False,
+            on_activity=on_activity,
+            on_tool_event=_on_tool_event,
+            **send_kwargs,
+        )
+    if not content or not content.strip():
+        content = "I wasn't able to generate a response. Could you rephrase your request?"
+
     if redis and _inject_key:
         while await redis.lpop(_inject_key):
             pass
 
-    # Summarize findings when tools were used (raw content has thinking noise)
+    # Summarize findings when the agent explored extensively.
+    # Skip for short interactions (< 3 tool rounds or short output) to
+    # avoid an extra LLM call that adds latency without much value.
     rounds = sum(1 for e in tool_events if e.get("type") == "llm_thinking")
     raw_output = None
-    if rounds > 0 and content:
+    if rounds >= 3 and content and len(content) > 4000:
         raw_output = content
         content = await _summarize_findings(
             provider, user_message, content,
@@ -752,6 +810,7 @@ async def generate_plan_response(
     session_id: str,
     user_id: str,
     user_message: str,
+    user_display_name: str = "",
     project: dict,
     session: dict,
     db,
@@ -931,10 +990,13 @@ async def generate_plan_response(
     if skills_ctx:
         system_prompt += skills_ctx
 
+    system_prompt += "\n\nMessages from different users are prefixed with [Name]. Address them by name when relevant."
+
     # ── Load & compact chat history ──────────────────────────────────
     history = await db.fetch(
-        "SELECT role, content FROM project_chat_messages "
-        "WHERE session_id = $1 ORDER BY created_at DESC LIMIT 40",
+        "SELECT m.role, m.content, u.display_name AS sender_name "
+        "FROM project_chat_messages m JOIN users u ON u.id = m.user_id "
+        "WHERE m.session_id = $1 ORDER BY m.created_at DESC LIMIT 40",
         session_id,
     )
     history = list(reversed(history))
@@ -951,8 +1013,12 @@ async def generate_plan_response(
 
     messages = [LLMMessage(role="system", content=system_prompt)]
     for row in history[:-1]:
-        messages.append(LLMMessage(role=row["role"], content=row["content"]))
-    messages.append(LLMMessage(role="user", content=user_message))
+        content = row["content"]
+        if row["role"] == "user" and row.get("sender_name"):
+            content = f"[{row['sender_name']}]: {content}"
+        messages.append(LLMMessage(role=row["role"], content=content))
+    current_content = f"[{user_display_name}]: {user_message}" if user_display_name else user_message
+    messages.append(LLMMessage(role="user", content=current_content))
 
     # ── Tool executor ────────────────────────────────────────────────
     mcp_exec = McpToolExecutor(db)
@@ -984,7 +1050,7 @@ async def generate_plan_response(
         provider, messages,
         tools=tools_arg,
         tool_executor=_execute_tool,
-        max_rounds=70,
+        max_rounds=30,
         on_activity=on_activity,
         on_tool_event=_on_tool_event,
         on_inject_check=_check_inject,
@@ -994,6 +1060,21 @@ async def generate_plan_response(
 
     if on_token and hasattr(on_token, "flush"):
         await on_token.flush()
+
+    # Guard against empty responses — retry once without streaming
+    if not content or not content.strip():
+        logger.warning("[plan_mode] empty response, retrying without streaming session=%s", session_id)
+        content, response = await run_tool_loop(
+            provider, messages,
+            tools=tools_arg,
+            tool_executor=_execute_tool,
+            max_rounds=30,
+            on_activity=on_activity,
+            on_tool_event=_on_tool_event,
+            **plan_send_kwargs,
+        )
+    if not content or not content.strip():
+        content = "I wasn't able to generate a response. Could you rephrase your request?"
 
     # Drain unconsumed inject messages
     if redis:
@@ -1312,6 +1393,7 @@ async def generate_debug_response(
     session_id: str,
     user_id: str,
     user_message: str,
+    user_display_name: str = "",
     project: dict,
     db,
     event_bus=None,
@@ -1464,16 +1546,23 @@ async def generate_debug_response(
     )
 
     history = await db.fetch(
-        "SELECT role, content FROM project_chat_messages "
-        "WHERE session_id = $1 ORDER BY created_at DESC LIMIT 30",
+        "SELECT m.role, m.content, u.display_name AS sender_name "
+        "FROM project_chat_messages m JOIN users u ON u.id = m.user_id "
+        "WHERE m.session_id = $1 ORDER BY m.created_at DESC LIMIT 30",
         session_id,
     )
     history = list(reversed(history))
 
+    system_prompt += "\n\nMessages from different users are prefixed with [Name]. Address them by name when relevant."
+
     messages = [LLMMessage(role="system", content=system_prompt)]
     for row in history[:-1]:
-        messages.append(LLMMessage(role=row["role"], content=row["content"]))
-    messages.append(LLMMessage(role="user", content=user_message))
+        content = row["content"]
+        if row["role"] == "user" and row.get("sender_name"):
+            content = f"[{row['sender_name']}]: {content}"
+        messages.append(LLMMessage(role=row["role"], content=content))
+    current_content = f"[{user_display_name}]: {user_message}" if user_display_name else user_message
+    messages.append(LLMMessage(role="user", content=current_content))
 
     from agents.providers.base import run_tool_loop
 
@@ -1510,7 +1599,8 @@ async def generate_debug_response(
         provider, messages,
         tools=tools_arg,
         tool_executor=_execute_tool,
-        max_rounds=70,
+        max_rounds=20,
+        nudge_tools=False,
         on_activity=on_activity,
         on_tool_event=_on_tool_event,
         on_inject_check=_check_inject,
@@ -1521,14 +1611,30 @@ async def generate_debug_response(
     if on_token and hasattr(on_token, "flush"):
         await on_token.flush()
 
+    # Guard against empty responses
+    if not content or not content.strip():
+        logger.warning("[debug] empty response, retrying without streaming session=%s", session_id)
+        content, response = await run_tool_loop(
+            provider, messages,
+            tools=tools_arg,
+            tool_executor=_execute_tool,
+            max_rounds=20,
+            nudge_tools=False,
+            on_activity=on_activity,
+            on_tool_event=_on_tool_event,
+            **send_kwargs,
+        )
+    if not content or not content.strip():
+        content = "I wasn't able to generate a response. Could you rephrase your request?"
+
     if redis:
         while await redis.lpop(_inject_key):
             pass
 
-    # Summarize findings when tools were used
+    # Summarize findings when the agent explored extensively
     rounds = sum(1 for e in tool_events if e.get("type") == "llm_thinking")
     raw_output = None
-    if rounds > 0 and content:
+    if rounds >= 3 and content and len(content) > 4000:
         raw_output = content
         content = await _summarize_findings(
             provider, user_message, content,
@@ -1591,6 +1697,7 @@ async def generate_create_task_response(
     session_id: str,
     user_id: str,
     user_message: str,
+    user_display_name: str = "",
     project: dict,
     db,
     event_bus=None,
@@ -1606,7 +1713,7 @@ async def generate_create_task_response(
     provider = await registry.resolve_for_project(project_id, user_id)
 
     action_tools = get_actions_as_tools("project")
-    action_tools = [t for t in (action_tools or []) if "create_task" in t.get("function", {}).get("name", "")]
+    action_tools = [t for t in (action_tools or []) if "create_task" in t.get("name", "")]
 
     project_ctx_parts = []
     if project.get("description"):
@@ -1665,16 +1772,23 @@ async def generate_create_task_response(
     )
 
     history = await db.fetch(
-        "SELECT role, content FROM project_chat_messages "
-        "WHERE session_id = $1 ORDER BY created_at DESC LIMIT 20",
+        "SELECT m.role, m.content, u.display_name AS sender_name "
+        "FROM project_chat_messages m JOIN users u ON u.id = m.user_id "
+        "WHERE m.session_id = $1 ORDER BY m.created_at DESC LIMIT 20",
         session_id,
     )
     history = list(reversed(history))
 
+    system_prompt += "\n\nMessages from different users are prefixed with [Name]. Address them by name when relevant."
+
     messages = [LLMMessage(role="system", content=system_prompt)]
     for row in history[:-1]:
-        messages.append(LLMMessage(role=row["role"], content=row["content"]))
-    messages.append(LLMMessage(role="user", content=user_message))
+        content = row["content"]
+        if row["role"] == "user" and row.get("sender_name"):
+            content = f"[{row['sender_name']}]: {content}"
+        messages.append(LLMMessage(role=row["role"], content=content))
+    current_content = f"[{user_display_name}]: {user_message}" if user_display_name else user_message
+    messages.append(LLMMessage(role="user", content=current_content))
 
     from agents.providers.base import run_tool_loop
 
@@ -1737,6 +1851,7 @@ async def generate_create_task_response(
         tools=action_tools if action_tools else None,
         tool_executor=_execute_tool,
         max_rounds=8,
+        nudge_tools=False,
         on_activity=on_activity,
         on_tool_event=_on_tool_event,
         on_token=on_token,
@@ -1745,6 +1860,22 @@ async def generate_create_task_response(
 
     if on_token and hasattr(on_token, "flush"):
         await on_token.flush()
+
+    # Guard against empty responses
+    if not content or not content.strip():
+        logger.warning("[create_task] empty response, retrying without streaming session=%s", session_id)
+        content, response = await run_tool_loop(
+            provider, messages,
+            tools=action_tools if action_tools else None,
+            tool_executor=_execute_tool,
+            max_rounds=8,
+            nudge_tools=False,
+            on_activity=on_activity,
+            on_tool_event=_on_tool_event,
+            **send_kwargs,
+        )
+    if not content or not content.strip():
+        content = "I wasn't able to generate a response. Could you rephrase your request?"
 
     execution_meta = _build_execution_metadata(tool_events, response)
     if metadata is None:

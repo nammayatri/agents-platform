@@ -347,7 +347,7 @@ export interface GitProviderConfig {
 export interface ProviderConfig {
   id: string
   owner_id?: string
-  provider_type: 'anthropic' | 'openai' | 'self_hosted'
+  provider_type: 'anthropic' | 'openai' | 'self_hosted' | 'claude_code'
   display_name: string
   api_base_url?: string
   default_model: string
@@ -355,6 +355,7 @@ export interface ProviderConfig {
   max_tokens: number
   temperature: number
   is_active: boolean
+  extra_config?: Record<string, unknown>
 }
 
 export interface ProgressUpdate {
@@ -403,6 +404,8 @@ export interface ChatSession {
   ai_model?: string
   linked_todo_id?: string
   is_active: boolean
+  creator_name?: string
+  creator_avatar_url?: string | null
   created_at: string
   updated_at: string
 }
@@ -524,6 +527,8 @@ export interface ProjectChatMessage {
   user_id: string
   role: 'user' | 'assistant' | 'system'
   content: string
+  sender_name?: string
+  sender_avatar_url?: string | null
   metadata_json?: {
     action?: string
     task_id?: string
@@ -702,6 +707,7 @@ export interface ProviderCreatePayload {
   api_base_url?: string
   default_model: string
   fast_model?: string
+  extra_config?: Record<string, unknown>
 }
 
 export interface ProviderUpdatePayload {
@@ -711,6 +717,7 @@ export interface ProviderUpdatePayload {
   api_base_url?: string
   default_model?: string
   fast_model?: string
+  extra_config?: Record<string, unknown>
 }
 
 export interface GitProviderPayload {

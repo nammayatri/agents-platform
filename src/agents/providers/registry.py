@@ -15,6 +15,7 @@ import asyncpg
 from agents.infra.crypto import decrypt
 from agents.providers.anthropic import AnthropicProvider
 from agents.providers.base import AIProvider
+from agents.providers.claude_code import ClaudeCodeProvider
 from agents.providers.openai_provider import OpenAIProvider
 from agents.providers.self_hosted import SelfHostedProvider
 
@@ -151,6 +152,14 @@ class ProviderRegistry:
                     api_base_url=config["api_base_url"],
                     default_model=config["default_model"],
                     api_key=api_key,
+                    fast_model=config["fast_model"],
+                )
+            case "claude_code":
+                if not api_key:
+                    raise ValueError("Claude Code provider requires an OAuth token")
+                provider = ClaudeCodeProvider(
+                    auth_token=api_key,
+                    default_model=config["default_model"],
                     fast_model=config["fast_model"],
                 )
             case _:

@@ -1134,9 +1134,10 @@ class SubtaskLifecycle:
                 await coord._post_system_message("**PR creation failed:** git provider returned no PR data.")
 
             return pr_info
-        except Exception:
+        except Exception as exc:
             logger.error("[%s] Failed to finalize subtask workspace", coord.todo_id, exc_info=True)
-            await coord._post_system_message("**PR creation failed:** unexpected error. Check server logs.")
+            err_detail = str(exc)[:500]
+            await coord._post_system_message(f"**PR creation failed:** {err_detail}")
             return None
 
     # ------------------------------------------------------------------

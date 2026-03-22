@@ -1,11 +1,12 @@
 import { useEffect, useRef, useState } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
-import { Plus, X, PanelLeft, ArrowLeft, Bot, Send, Syringe, ChevronDown, ChevronRight, Loader2 } from 'lucide-react'
+import { Plus, Trash2, PanelLeft, ArrowLeft, Bot, Send, Syringe, ChevronDown, ChevronRight, Loader2, Link2, Users } from 'lucide-react'
 import { projectChat, projects as projectsApi, providers as providersApi } from '../services/api'
 import PlanReviewCard from '../components/chat/PlanReviewCard'
 import ReviewFeedbackCard from '../components/chat/ReviewFeedbackCard'
 import { useChatSessionWebSocket } from '../hooks/useChatSessionWebSocket'
-import type { Project, ChatSession, ProjectChatMessage, ModelInfo, ChatMode, ChatExecutionInfo } from '../types'
+import { useAuthStore } from '../stores/authStore'
+import type { Project, ChatSession, ProjectChatMessage, ProjectMember, ModelInfo, ChatMode, ChatExecutionInfo } from '../types'
 
 const chatModes: { key: ChatMode; label: string; hint: string }[] = [
   { key: 'auto', label: 'Auto', hint: 'Automatically detects your intent' },
@@ -196,6 +197,7 @@ function RawOutputToggle({ content }: { content: string }) {
 export default function ProjectChatPage() {
   const { projectId } = useParams<{ projectId: string }>()
   const navigate = useNavigate()
+  const currentUser = useAuthStore((s) => s.user)
   const [project, setProject] = useState<Project | null>(null)
   const [sessions, setSessions] = useState<ChatSession[]>([])
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null)
@@ -205,15 +207,23 @@ export default function ProjectChatPage() {
   const [showModeDropdown, setShowModeDropdown] = useState(false)
   const [showSidebar, setShowSidebar] = useState(true)
   const [creatingSession, setCreatingSession] = useState(false)
+  const [members, setMembers] = useState<ProjectMember[]>([])
+  const [filterUserId, setFilterUserId] = useState<string>('all')
   const messagesEnd = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLTextAreaElement>(null)
   const deletedSessionIdsRef = useRef<Set<string>>(new Set())
   const { activity, streamingText, completedStreaming, isStreaming, clearActivity, resetStreaming, incomingMessage, clearIncomingMessage } = useChatSessionWebSocket(activeSessionId)
+  const [deleteDialog, setDeleteDialog] = useState<{
+    sessionId: string
+    sessionTitle: string
+    linkedTodoId?: string
+  } | null>(null)
   const [showFeedbackFor, setShowFeedbackFor] = useState<string | null>(null)
   const [feedbackInput, setFeedbackInput] = useState('')
   const [chatModels, setChatModels] = useState<ModelInfo[]>([])
   const [selectedModel, setSelectedModel] = useState('')
   const [approvedTaskPlans, setApprovedTaskPlans] = useState<Set<string>>(new Set())
+  const [discardedTaskPlans, setDiscardedTaskPlans] = useState<Set<string>>(new Set())
   const [taskPlanFeedbackFor, setTaskPlanFeedbackFor] = useState<string | null>(null)
   const [taskPlanFeedback, setTaskPlanFeedback] = useState('')
 
@@ -221,6 +231,13 @@ export default function ProjectChatPage() {
     if (!projectId) return
     projectsApi.get(projectId).then((p) => setProject(p as Project))
     loadSessions()
+    // Load project members for the filter dropdown
+    projectsApi.members.list(projectId).then((res) => {
+      const all: ProjectMember[] = []
+      if (res.owner) all.push(res.owner as ProjectMember)
+      if (res.members) all.push(...(res.members as ProjectMember[]))
+      setMembers(all)
+    }).catch(() => setMembers([]))
   }, [projectId])
 
   // Load available models when project's provider is known
@@ -283,11 +300,11 @@ export default function ProjectChatPage() {
       const msgs = data.messages || []
       setMessages(msgs)
 
-      // Pre-populate approvedTaskPlans from message history
+      // Pre-populate approvedTaskPlans and discardedTaskPlans from message history
       const approved = new Set<string>()
+      const discarded = new Set<string>()
       for (const msg of msgs) {
         const meta = parseMeta(msg)
-        // If a task_plan_ready message is followed by a task_created or system "Plan approved", mark it
         if (meta?.action === 'task_plan_ready') {
           const hasApproval = msgs.some((m) => {
             const mm = parseMeta(m)
@@ -297,10 +314,17 @@ export default function ProjectChatPage() {
                 (m.role === 'system' && m.content.includes('Plan approved')))
             )
           })
+          const hasDiscard = msgs.some((m) =>
+            m.created_at > msg.created_at &&
+            m.role === 'system' &&
+            m.content.includes('Plan discarded')
+          )
           if (hasApproval) approved.add(msg.id)
+          else if (hasDiscard) discarded.add(msg.id)
         }
       }
       setApprovedTaskPlans(approved)
+      setDiscardedTaskPlans(discarded)
     } catch {
       setMessages([])
     }
@@ -354,15 +378,25 @@ export default function ProjectChatPage() {
     setShowModeDropdown(false)
   }
 
-  async function deleteSession(sessionId: string) {
-    if (!projectId) return
+  function promptDeleteSession(sessionId: string) {
+    const session = sessions.find((s) => s.id === sessionId)
+    if (!session) return
+    setDeleteDialog({
+      sessionId,
+      sessionTitle: session.title,
+      linkedTodoId: session.linked_todo_id || undefined,
+    })
+  }
+
+  async function confirmDeleteSession() {
+    if (!projectId || !deleteDialog) return
+    const { sessionId } = deleteDialog
+    setDeleteDialog(null)
     try {
       await projectChat.sessions.delete(projectId, sessionId)
-      // Track deletion so in-flight loadSessions() won't restore it
       deletedSessionIdsRef.current.add(sessionId)
       setSessions((prev) => {
         const remaining = prev.filter((s) => s.id !== sessionId)
-        // Auto-select next session if we're deleting the active one
         if (activeSessionId === sessionId && remaining.length > 0) {
           const next = remaining[0]
           setActiveSessionId(next.id)
@@ -374,7 +408,15 @@ export default function ProjectChatPage() {
         return remaining
       })
     } catch {
-      // ignore
+      // Backend rejected — likely linked to a task we didn't know about
+      const session = sessions.find((s) => s.id === sessionId)
+      if (session) {
+        setDeleteDialog({
+          sessionId,
+          sessionTitle: session.title,
+          linkedTodoId: session.linked_todo_id || 'unknown',
+        })
+      }
     }
   }
 
@@ -392,9 +434,11 @@ export default function ProjectChatPage() {
     const tempUserMsg: ProjectChatMessage = {
       id: `temp-${Date.now()}`,
       project_id: projectId,
-      user_id: '',
+      user_id: currentUser?.id || '',
       role: 'user',
       content,
+      sender_name: currentUser?.display_name || '',
+      sender_avatar_url: currentUser?.avatar_url || null,
       created_at: new Date().toISOString(),
     }
     setMessages((prev) => [...prev, tempUserMsg])
@@ -545,9 +589,9 @@ export default function ProjectChatPage() {
         created_at: new Date().toISOString(),
       }
       setMessages((prev) => [...prev, discardMsg])
-      // Mark the plan message as handled so buttons disappear
+      // Mark the plan message as discarded so buttons disappear
       if (latestTaskPlanMsgId) {
-        setApprovedTaskPlans((prev) => new Set(prev).add(latestTaskPlanMsgId))
+        setDiscardedTaskPlans((prev) => new Set(prev).add(latestTaskPlanMsgId))
       }
       // Send feedback as a new message so the LLM generates a new plan
       await handleSend(`The previous plan wasn't right. Here's what needs to change: ${feedback.trim()}`)
@@ -602,10 +646,10 @@ export default function ProjectChatPage() {
 
   const handleClear = async () => {
     if (!projectId) return
-    if (!confirm('Clear chat history?')) return
     if (activeSessionId) {
-      await deleteSession(activeSessionId)
+      promptDeleteSession(activeSessionId)
     } else {
+      if (!confirm('Clear chat history?')) return
       await projectChat.clear(projectId)
       setMessages([])
     }
@@ -642,7 +686,7 @@ export default function ProjectChatPage() {
   const latestTaskPlanMsgId = (() => {
     for (let i = messages.length - 1; i >= 0; i--) {
       const m = parseMeta(messages[i])
-      if (m?.action === 'task_plan_ready' && !approvedTaskPlans.has(messages[i].id))
+      if (m?.action === 'task_plan_ready' && !approvedTaskPlans.has(messages[i].id) && !discardedTaskPlans.has(messages[i].id))
         return messages[i].id
     }
     return null
@@ -679,45 +723,146 @@ export default function ProjectChatPage() {
               </button>
             </div>
 
-            <div className="flex-1 overflow-y-auto px-2 pb-2 space-y-0.5">
-              {sessions.map((s) => (
-                <div
-                  key={s.id}
-                  className={`group flex items-center rounded-lg transition-colors ${
-                    activeSessionId === s.id ? 'bg-gray-900' : 'hover:bg-gray-900/50'
-                  }`}
-                >
-                  <button
-                    onClick={() => {
-                      selectSession(s.id)
-                      // Close sidebar on mobile after selecting
-                      if (window.innerWidth < 768) setShowSidebar(false)
-                    }}
-                    className="flex-1 flex items-center gap-2 px-3 py-2 text-left min-w-0"
+            {/* Member filter */}
+            {members.length > 1 && (
+              <div className="px-3 pb-2">
+                <div className="flex items-center gap-1.5">
+                  <Users className="w-3 h-3 text-gray-600" />
+                  <select
+                    value={filterUserId}
+                    onChange={(e) => setFilterUserId(e.target.value)}
+                    className="flex-1 px-2 py-1 bg-gray-900 border border-gray-800 rounded-lg text-[11px] text-gray-400 focus:outline-none focus:border-indigo-500 transition-colors"
                   >
-                    <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${sessionDotColors[(s.chat_mode as ChatMode) || (s.plan_mode ? 'plan' : 'chat')]}`} />
-                    <span
-                      className={`text-xs truncate ${
-                        activeSessionId === s.id ? 'text-white' : 'text-gray-500'
-                      }`}
-                    >
-                      {s.title}
-                    </span>
-                  </button>
-                  <button
-                    onClick={(e) => {
-                      e.stopPropagation()
-                      deleteSession(s.id)
-                    }}
-                    className="block md:hidden md:group-hover:block px-2 text-gray-700 hover:text-red-400 transition-colors"
-                  >
-                    <X className="w-3 h-3" />
-                  </button>
+                    <option value="all">All members</option>
+                    {members.map((m) => (
+                      <option key={m.id} value={m.id}>
+                        {m.display_name}{m.id === currentUser?.id ? ' (me)' : ''}
+                      </option>
+                    ))}
+                  </select>
                 </div>
-              ))}
+              </div>
+            )}
+
+            <div className="flex-1 overflow-y-auto px-2 pb-2 space-y-0.5">
+              {sessions
+                .filter((s) => filterUserId === 'all' || s.user_id === filterUserId)
+                .map((s) => {
+                const isActive = activeSessionId === s.id
+                const isOtherUser = currentUser && s.user_id !== currentUser.id
+                return (
+                  <div
+                    key={s.id}
+                    className={`group flex items-center rounded-lg transition-colors ${
+                      isActive ? 'bg-gray-900' : 'hover:bg-gray-900/50'
+                    }`}
+                  >
+                    <button
+                      onClick={() => {
+                        selectSession(s.id)
+                        if (window.innerWidth < 768) setShowSidebar(false)
+                      }}
+                      className="flex-1 flex items-center gap-2 px-3 py-2 text-left min-w-0"
+                    >
+                      <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${sessionDotColors[(s.chat_mode as ChatMode) || (s.plan_mode ? 'plan' : 'chat')]}`} />
+                      <div className="min-w-0 flex-1">
+                        <span
+                          className={`text-xs truncate block ${
+                            isActive ? 'text-white' : 'text-gray-500'
+                          }`}
+                        >
+                          {s.title}
+                        </span>
+                        {isOtherUser && s.creator_name && (
+                          <span className="text-[10px] text-gray-600 truncate block">
+                            {s.creator_name}
+                          </span>
+                        )}
+                      </div>
+                    </button>
+                    {s.linked_todo_id && (
+                      <Link2 className="w-3 h-3 text-indigo-500/40 shrink-0 mr-0.5" />
+                    )}
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation()
+                        promptDeleteSession(s.id)
+                      }}
+                      className={`shrink-0 px-1.5 py-1 rounded transition-colors ${
+                        isActive
+                          ? 'text-gray-600 hover:text-red-400 hover:bg-red-500/10'
+                          : 'opacity-0 group-hover:opacity-100 text-gray-700 hover:text-red-400 hover:bg-red-500/10'
+                      }`}
+                      title="Delete session"
+                    >
+                      <Trash2 className="w-3.5 h-3.5" />
+                    </button>
+                  </div>
+                )
+              })}
             </div>
           </div>
         </>
+      )}
+
+      {/* Delete session dialog */}
+      {deleteDialog && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60" onClick={() => setDeleteDialog(null)}>
+          <div className="bg-gray-900 border border-gray-800 rounded-xl px-5 py-4 max-w-sm mx-4 space-y-3" onClick={(e) => e.stopPropagation()}>
+            {deleteDialog.linkedTodoId ? (
+              <>
+                <div className="flex items-center gap-2 text-sm text-white font-medium">
+                  <Link2 className="w-4 h-4 text-indigo-400" />
+                  Session linked to a task
+                </div>
+                <p className="text-xs text-gray-400 leading-relaxed">
+                  <span className="text-gray-300 font-medium">{deleteDialog.sessionTitle}</span> is linked to an active task and cannot be deleted.
+                </p>
+                <div className="flex items-center gap-2 pt-1">
+                  <button
+                    onClick={() => {
+                      navigate(`/todos/${deleteDialog.linkedTodoId}`)
+                      setDeleteDialog(null)
+                    }}
+                    className="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-500 rounded-lg text-xs font-medium text-white transition-colors"
+                  >
+                    View Task
+                  </button>
+                  <button
+                    onClick={() => setDeleteDialog(null)}
+                    className="px-3 py-1.5 bg-gray-800 hover:bg-gray-700 rounded-lg text-xs text-gray-400 transition-colors"
+                  >
+                    Cancel
+                  </button>
+                </div>
+              </>
+            ) : (
+              <>
+                <div className="flex items-center gap-2 text-sm text-white font-medium">
+                  <Trash2 className="w-4 h-4 text-red-400" />
+                  Delete chat session
+                </div>
+                <p className="text-xs text-gray-400 leading-relaxed">
+                  <span className="text-gray-300 font-medium">{deleteDialog.sessionTitle}</span> and all its messages will be permanently deleted.
+                </p>
+                <div className="flex items-center gap-2 pt-1">
+                  <button
+                    onClick={confirmDeleteSession}
+                    className="px-3 py-1.5 bg-red-600 hover:bg-red-500 rounded-lg text-xs font-medium text-white transition-colors"
+                  >
+                    Delete
+                  </button>
+                  <button
+                    onClick={() => setDeleteDialog(null)}
+                    className="px-3 py-1.5 bg-gray-800 hover:bg-gray-700 rounded-lg text-xs text-gray-400 transition-colors"
+                  >
+                    Cancel
+                  </button>
+                </div>
+              </>
+            )}
+          </div>
+        </div>
       )}
 
       {/* Main chat area */}
@@ -847,20 +992,32 @@ export default function ProjectChatPage() {
             <div className="px-6 py-4 space-y-4 max-w-3xl mx-auto">
               {messages.map((msg) => {
                 const meta = parseMeta(msg)
+                const isOtherUserMsg = msg.role === 'user' && currentUser && msg.user_id && msg.user_id !== currentUser.id && msg.user_id !== ''
                 return (
                 <div
                   key={msg.id}
-                  className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start gap-2.5'} animate-fade-in`}
+                  className={`flex ${msg.role === 'user' ? (isOtherUserMsg ? 'justify-start gap-2.5' : 'justify-end') : 'justify-start gap-2.5'} animate-fade-in`}
                 >
                   {msg.role === 'assistant' && (
                     <div className="w-6 h-6 rounded-full bg-indigo-500/20 flex items-center justify-center shrink-0 mt-1">
                       <Bot className="w-3.5 h-3.5 text-indigo-400" />
                     </div>
                   )}
+                  {isOtherUserMsg && (
+                    <div className="w-6 h-6 rounded-full bg-gray-800 flex items-center justify-center shrink-0 mt-1 text-[10px] text-gray-400 font-medium overflow-hidden">
+                      {msg.sender_avatar_url ? (
+                        <img src={msg.sender_avatar_url} className="w-6 h-6 rounded-full object-cover" alt="" />
+                      ) : (
+                        (msg.sender_name || '?')[0].toUpperCase()
+                      )}
+                    </div>
+                  )}
                   <div
                     className={`max-w-[80%] rounded-xl px-4 py-2.5 text-sm ${
                       msg.role === 'user'
-                        ? 'bg-indigo-600 text-white'
+                        ? isOtherUserMsg
+                          ? 'bg-gray-900 border border-gray-800 text-gray-300'
+                          : 'bg-indigo-600 text-white'
                         : msg.role === 'system'
                           ? msg.content.startsWith('Error')
                             ? 'bg-red-900/30 text-red-400 border border-red-800/50'
@@ -868,7 +1025,10 @@ export default function ProjectChatPage() {
                           : 'bg-gray-900 border border-gray-800 text-gray-300'
                     }`}
                   >
-                    <div className={`text-[10px] mb-1 font-mono ${msg.role === 'user' ? 'text-indigo-300/50' : 'text-gray-600'}`}>
+                    <div className={`text-[10px] mb-1 font-mono ${msg.role === 'user' ? (isOtherUserMsg ? 'text-gray-600' : 'text-indigo-300/50') : 'text-gray-600'}`}>
+                      {isOtherUserMsg && msg.sender_name && (
+                        <span className="text-gray-500 mr-1.5">{msg.sender_name}</span>
+                      )}
                       {new Date(msg.created_at).toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit' })}
                     </div>
                     {msg.role === 'assistant' ? (
@@ -940,7 +1100,7 @@ export default function ProjectChatPage() {
                           </div>
                         )}
                         {/* Task plan ready — needs user approval */}
-                        {meta?.action === 'task_plan_ready' && !approvedTaskPlans.has(msg.id) && (
+                        {meta?.action === 'task_plan_ready' && !approvedTaskPlans.has(msg.id) && !discardedTaskPlans.has(msg.id) && (
                           <div className="mt-2 bg-gray-950 border border-cyan-500/20 rounded-lg overflow-hidden">
                             <div className="px-3 py-2 border-b border-gray-800/50 flex items-center gap-2">
                               <svg className="w-3.5 h-3.5 text-cyan-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
@@ -1099,6 +1259,15 @@ export default function ProjectChatPage() {
                               <path strokeLinecap="round" strokeLinejoin="round" d="M4.5 12.75l6 6 9-13.5" />
                             </svg>
                             <span className="text-xs text-emerald-400">Plan approved — executing</span>
+                          </div>
+                        )}
+                        {/* Task plan discarded badge */}
+                        {meta?.action === 'task_plan_ready' && discardedTaskPlans.has(msg.id) && (
+                          <div className="flex items-center gap-2 px-3 py-1.5 bg-amber-500/5 border border-amber-500/20 rounded-lg mt-1">
+                            <svg className="w-3.5 h-3.5 text-amber-400 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                              <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
+                            </svg>
+                            <span className="text-xs text-amber-400">Plan discarded — revising</span>
                           </div>
                         )}
                         {/* Plan review verdict */}

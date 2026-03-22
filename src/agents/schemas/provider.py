@@ -2,7 +2,7 @@ from pydantic import BaseModel
 
 
 class ProviderConfigInput(BaseModel):
-    provider_type: str  # 'anthropic' | 'openai' | 'self_hosted'
+    provider_type: str  # 'anthropic' | 'openai' | 'self_hosted' | 'claude_code'
     display_name: str
     api_base_url: str | None = None
     api_key: str | None = None

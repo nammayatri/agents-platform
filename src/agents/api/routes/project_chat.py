@@ -46,13 +46,13 @@ class SessionUpdateInput(BaseModel):
 
 @router.get("/projects/{project_id}/chat/sessions")
 async def list_sessions(project_id: str, user: CurrentUser, db: DB):
-    """List all chat sessions for a project."""
+    """List all chat sessions for a project (shared across members)."""
     await check_project_access(db, project_id, user)
     rows = await db.fetch(
-        "SELECT * FROM project_chat_sessions WHERE project_id = $1 AND user_id = $2 "
-        "ORDER BY updated_at DESC",
+        "SELECT s.*, u.display_name AS creator_name, u.avatar_url AS creator_avatar_url "
+        "FROM project_chat_sessions s JOIN users u ON u.id = s.user_id "
+        "WHERE s.project_id = $1 ORDER BY s.updated_at DESC",
         project_id,
-        user["id"],
     )
     return [dict(r) for r in rows]
 
@@ -83,10 +83,12 @@ async def create_session(
 
 @router.get("/projects/{project_id}/chat/sessions/{session_id}")
 async def get_session(project_id: str, session_id: str, user: CurrentUser, db: DB):
-    """Get a session with its messages."""
+    """Get a session with its messages (includes sender info)."""
     session = await _load_session(session_id, project_id, user, db)
     messages = await db.fetch(
-        "SELECT * FROM project_chat_messages WHERE session_id = $1 ORDER BY created_at ASC",
+        "SELECT m.*, u.display_name AS sender_name, u.avatar_url AS sender_avatar_url "
+        "FROM project_chat_messages m JOIN users u ON u.id = m.user_id "
+        "WHERE m.session_id = $1 ORDER BY m.created_at ASC",
         session_id,
     )
     return {**session, "messages": [dict(m) for m in messages]}
@@ -140,8 +142,43 @@ async def set_chat_mode(
 
 @router.delete("/projects/{project_id}/chat/sessions/{session_id}")
 async def delete_session(project_id: str, session_id: str, user: CurrentUser, db: DB):
-    """Delete a session and all its messages."""
-    await _load_session(session_id, project_id, user, db)
+    """Delete a session and all its messages.
+
+    Only the session creator or project owner can delete.
+    Refuses deletion if the session is linked to a task (either via
+    session.linked_todo_id or todo_items.chat_session_id).
+    """
+    user_role = await check_project_access(db, project_id, user)
+    session = await _load_session(session_id, project_id, user, db)
+
+    # Only creator or project owner can delete
+    if str(session["user_id"]) != str(user["id"]) and user_role != "owner":
+        raise HTTPException(status_code=403, detail="Only session creator or project owner can delete")
+
+    # Check both directions of session ↔ task linking
+    linked_todo_id = session.get("linked_todo_id")
+    if not linked_todo_id:
+        linked = await db.fetchrow(
+            "SELECT id FROM todo_items WHERE chat_session_id = $1 LIMIT 1",
+            session_id,
+        )
+        if linked:
+            linked_todo_id = str(linked["id"])
+
+    if linked_todo_id:
+        todo = await db.fetchrow(
+            "SELECT id, title FROM todo_items WHERE id = $1", linked_todo_id,
+        )
+        if todo:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "message": f"Cannot delete: this session is linked to task \"{todo['title']}\"",
+                    "linked_task_id": str(todo["id"]),
+                    "linked_task_title": todo["title"],
+                },
+            )
+
     await db.execute("DELETE FROM project_chat_messages WHERE session_id = $1", session_id)
     await db.execute("DELETE FROM project_chat_sessions WHERE id = $1", session_id)
     return {"status": "deleted"}
@@ -203,93 +240,84 @@ async def send_session_message(
         if chat_mode == "chat" and dict(session).get("plan_mode"):
             chat_mode = "plan"
 
-        # Resolve routing mode — for "auto", run intent detection
+        # Resolve routing mode
         routing_mode = chat_mode
         mode_auto_switched = False
 
         if chat_mode == "auto":
-            last_routing = dict(session).get("last_routing_mode") or "chat"
-            try:
-                from agents.providers.registry import ProviderRegistry
+            last_mode = dict(session).get("last_routing_mode") or "chat"
 
-                provider = await ProviderRegistry(db).resolve_for_project(
-                    project_id, str(user["id"]),
-                )
-                recent = await db.fetch(
+            # Try keyword classification first (instant, no LLM call).
+            # Only resolve provider + call LLM if keywords are ambiguous.
+            from agents.api.routes.project_chat_llm import _keyword_classify
+            kw_mode = _keyword_classify(body.content)
+            if kw_mode:
+                detected_mode, confidence = kw_mode, 1.0
+                logger.info("intent: keyword → %s session=%s", kw_mode, session_id)
+            elif len(body.content) < 40:
+                detected_mode, confidence = last_mode, 0.8
+                logger.info("intent: short follow-up, keeping %s session=%s", last_mode, session_id)
+            else:
+                from agents.providers.registry import ProviderRegistry
+                registry = ProviderRegistry(db)
+                provider = await registry.resolve_for_project(project_id, str(user["id"]))
+
+                if redis:
+                    await redis.publish(
+                        f"chat:session:{session_id}:activity",
+                        json.dumps({"type": "activity", "activity": "Routing..."}),
+                    )
+
+                recent_msgs = await db.fetch(
                     "SELECT role, content FROM project_chat_messages "
                     "WHERE session_id = $1 ORDER BY created_at DESC LIMIT 3",
                     session_id,
                 )
-                detected, confidence = await detect_intent(
+                detected_mode, confidence = await detect_intent(
                     provider=provider,
                     user_message=body.content,
-                    current_routing_mode=last_routing,
-                    recent_messages=[dict(r) for r in reversed(recent)],
+                    current_routing_mode=last_mode,
+                    recent_messages=[dict(m) for m in reversed(recent_msgs)],
                 )
-                if confidence >= 0.7:
-                    routing_mode = detected
-                else:
-                    routing_mode = last_routing
-
-                if routing_mode != last_routing:
-                    mode_auto_switched = True
-                await db.execute(
-                    "UPDATE project_chat_sessions SET last_routing_mode = $2, updated_at = NOW() WHERE id = $1",
-                    session_id, routing_mode,
+                logger.info(
+                    "intent: LLM → %s conf=%.2f (last=%s) session=%s",
+                    detected_mode, confidence, last_mode, session_id,
                 )
-            except Exception:
-                logger.warning("Intent detection failed, using last_routing=%s", last_routing)
-                routing_mode = last_routing
 
+            routing_mode = detected_mode
+            if routing_mode != last_mode:
+                mode_auto_switched = True
+
+        # Dispatch to the resolved handler
+        logger.info("dispatching to handler: mode=%s session=%s", routing_mode, session_id)
+        kw: dict = dict(
+            project_id=project_id,
+            session_id=session_id,
+            user_id=str(user["id"]),
+            user_message=body.content,
+            user_display_name=user.get("display_name", ""),
+            project=dict(project),
+            db=db,
+            event_bus=event_bus,
+            redis=redis,
+            model_override=model_override,
+        )
         if routing_mode == "plan":
-            assistant_msg = await generate_plan_response(
-                project_id=project_id,
-                session_id=session_id,
-                user_id=str(user["id"]),
-                user_message=body.content,
-                project=dict(project),
-                session=dict(session),
-                db=db,
-                event_bus=event_bus,
-                redis=redis,
-                model_override=model_override,
-            )
+            kw["session"] = dict(session)
+            assistant_msg = await generate_plan_response(**kw)
         elif routing_mode == "debug":
-            assistant_msg = await generate_debug_response(
-                project_id=project_id,
-                session_id=session_id,
-                user_id=str(user["id"]),
-                user_message=body.content,
-                project=dict(project),
-                db=db,
-                event_bus=event_bus,
-                redis=redis,
-                model_override=model_override,
-            )
+            assistant_msg = await generate_debug_response(**kw)
         elif routing_mode == "create_task":
-            assistant_msg = await generate_create_task_response(
-                project_id=project_id,
-                session_id=session_id,
-                user_id=str(user["id"]),
-                user_message=body.content,
-                project=dict(project),
-                db=db,
-                event_bus=event_bus,
-                redis=redis,
-                model_override=model_override,
-            )
+            assistant_msg = await generate_create_task_response(**kw)
         else:
-            assistant_msg = await generate_project_response(
-                project_id=project_id,
-                session_id=session_id,
-                user_id=str(user["id"]),
-                user_message=body.content,
-                intent=body.intent,
-                project=dict(project),
-                db=db,
-                event_bus=event_bus,
-                redis=redis,
-                model_override=model_override,
+            kw["intent"] = body.intent
+            assistant_msg = await generate_project_response(**kw)
+
+        # Update sticky routing mode
+        if chat_mode == "auto":
+            await db.execute(
+                "UPDATE project_chat_sessions SET last_routing_mode = $2, updated_at = NOW() WHERE id = $1",
+                session_id, routing_mode,
             )
 
         # Update session timestamp
@@ -297,9 +325,19 @@ async def send_session_message(
             "UPDATE project_chat_sessions SET updated_at = NOW() WHERE id = $1", session_id
         )
 
+        # Enrich messages with sender info
+        user_msg_dict = dict(user_msg)
+        user_msg_dict["sender_name"] = user.get("display_name", "")
+        user_msg_dict["sender_avatar_url"] = user.get("avatar_url")
+
+        assistant_msg_dict = dict(assistant_msg)
+        # Assistant messages inherit the user_id of the requester but represent the AI
+        assistant_msg_dict["sender_name"] = "AI"
+        assistant_msg_dict["sender_avatar_url"] = None
+
         return {
-            "user_message": dict(user_msg),
-            "assistant_message": dict(assistant_msg),
+            "user_message": user_msg_dict,
+            "assistant_message": assistant_msg_dict,
             "routing_mode": routing_mode,
             "mode_auto_switched": mode_auto_switched,
         }
@@ -315,8 +353,11 @@ async def send_session_message(
             f"Error: {str(e)}",
             session_id,
         )
+        user_msg_dict = dict(user_msg)
+        user_msg_dict["sender_name"] = user.get("display_name", "")
+        user_msg_dict["sender_avatar_url"] = user.get("avatar_url")
         return {
-            "user_message": dict(user_msg),
+            "user_message": user_msg_dict,
             "assistant_message": dict(err_msg),
         }
 
@@ -567,8 +608,8 @@ async def inject_session_message(
     await check_project_access(db, project_id, user)
 
     session = await db.fetchrow(
-        "SELECT id FROM project_chat_sessions WHERE id = $1 AND project_id = $2 AND user_id = $3",
-        session_id, project_id, user["id"],
+        "SELECT id FROM project_chat_sessions WHERE id = $1 AND project_id = $2",
+        session_id, project_id,
     )
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
@@ -698,6 +739,8 @@ async def _check_project_access_local(project_id: str, user: dict, db) -> dict:
 
 
 async def _load_session(session_id: str, project_id: str, user: dict, db) -> dict:
+    """Load a session — any project member can access (shared sessions)."""
+    await check_project_access(db, project_id, user)
     session = await db.fetchrow(
         "SELECT * FROM project_chat_sessions WHERE id = $1 AND project_id = $2",
         session_id,
@@ -705,6 +748,4 @@ async def _load_session(session_id: str, project_id: str, user: dict, db) -> dic
     )
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
-    if str(session["user_id"]) != str(user["id"]) and user["role"] != "admin":
-        raise HTTPException(status_code=403)
     return dict(session)

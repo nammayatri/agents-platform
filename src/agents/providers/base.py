@@ -655,6 +655,7 @@ async def run_tool_loop(
     parallel_tools: bool = True,
     compaction_strategy: str = "llm",  # "llm" or "string"
     cancel_event: "asyncio.Event | None" = None,
+    nudge_tools: bool = True,
     **send_kwargs: Any,
 ) -> tuple[str, LLMResponse]:
     """Standard tool-call loop with content accumulation.
@@ -752,7 +753,8 @@ async def run_tool_loop(
     # Nudge: if tools were provided but the model wrote text instead of calling
     # them, inject a correction and retry once.  This catches models (e.g.
     # kimi-latest) that describe what they *would* do instead of acting.
-    if tools and not response.tool_calls and response.content:
+    # Disabled for interactive chat modes where a direct text answer is valid.
+    if nudge_tools and tools and not response.tool_calls and response.content:
         logger.info("tool_loop: model produced text without tool calls, nudging")
         if on_activity:
             await on_activity("Nudging agent to use tools...")

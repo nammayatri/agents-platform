@@ -15,7 +15,8 @@ async def list_providers(user: CurrentUser, db: DB):
     rows = await db.fetch(
         """
         SELECT id, owner_id, provider_type, display_name, api_base_url,
-               default_model, fast_model, max_tokens, temperature, is_active
+               default_model, fast_model, max_tokens, temperature, is_active,
+               extra_config
         FROM ai_provider_configs
         WHERE owner_id = $1 OR owner_id IS NULL
         ORDER BY created_at DESC
@@ -27,8 +28,8 @@ async def list_providers(user: CurrentUser, db: DB):
 
 @router.post("", status_code=status.HTTP_201_CREATED)
 async def create_provider(body: ProviderConfigInput, user: CurrentUser, db: DB):
-    api_key_enc = encrypt(body.api_key) if body.api_key else None
-    import json
+    api_key_clean = body.api_key.strip() if body.api_key else None
+    api_key_enc = encrypt(api_key_clean) if api_key_clean else None
 
     row = await db.fetchrow(
         """
@@ -39,7 +40,8 @@ async def create_provider(body: ProviderConfigInput, user: CurrentUser, db: DB):
         )
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
         RETURNING id, owner_id, provider_type, display_name, api_base_url,
-                  default_model, fast_model, max_tokens, temperature, is_active
+                  default_model, fast_model, max_tokens, temperature, is_active,
+                  extra_config
         """,
         user["id"],
         body.provider_type,
@@ -65,8 +67,8 @@ async def update_provider(provider_id: str, body: ProviderConfigInput, user: Cur
     if existing["owner_id"] and str(existing["owner_id"]) != str(user["id"]):
         raise HTTPException(status_code=403)
 
-    api_key_enc = encrypt(body.api_key) if body.api_key else None
-    import json
+    api_key_clean = body.api_key.strip() if body.api_key else None
+    api_key_enc = encrypt(api_key_clean) if api_key_clean else None
 
     row = await db.fetchrow(
         """
@@ -77,7 +79,8 @@ async def update_provider(provider_id: str, body: ProviderConfigInput, user: Cur
             extra_config = $10
         WHERE id = $1
         RETURNING id, owner_id, provider_type, display_name, api_base_url,
-                  default_model, fast_model, max_tokens, temperature, is_active
+                  default_model, fast_model, max_tokens, temperature, is_active,
+                  extra_config
         """,
         provider_id,
         body.provider_type,

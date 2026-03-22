@@ -11,6 +11,7 @@ const providerDefaults: Record<string, { model: string; fast: string }> = {
   anthropic: { model: 'claude-sonnet-4-20250514', fast: 'claude-haiku-3-20250311' },
   openai: { model: 'gpt-4o', fast: 'gpt-4o-mini' },
   self_hosted: { model: '', fast: '' },
+  claude_code: { model: 'sonnet', fast: 'haiku' },
 }
 
 export default function ProvidersTab({ isAdmin: _isAdmin }: Props) {
@@ -187,6 +188,7 @@ export default function ProvidersTab({ isAdmin: _isAdmin }: Props) {
                   <option value="anthropic">Anthropic (Claude)</option>
                   <option value="openai">OpenAI</option>
                   <option value="self_hosted">Self-Hosted</option>
+                  <option value="claude_code">Claude Code (OAuth)</option>
                 </select>
                 <input
                   className={inputClass}
@@ -196,11 +198,16 @@ export default function ProvidersTab({ isAdmin: _isAdmin }: Props) {
                 />
                 <input
                   className={inputClass}
-                  placeholder="API Key (leave blank to keep current)"
+                  placeholder={providerForm.provider_type === 'claude_code' ? 'OAuth Token (leave blank to keep current)' : 'API Key (leave blank to keep current)'}
                   type="password"
                   value={providerForm.api_key}
                   onChange={(e) => setProviderForm({ ...providerForm, api_key: e.target.value })}
                 />
+                {providerForm.provider_type === 'claude_code' && (
+                  <div className="text-[11px] text-gray-600">
+                    Uses Claude Code CLI with ANTHROPIC_AUTH_TOKEN. Requires claude CLI in the server's PATH.
+                  </div>
+                )}
                 {providerForm.provider_type === 'self_hosted' && (
                   <input
                     className={inputClass}
@@ -258,6 +265,7 @@ export default function ProvidersTab({ isAdmin: _isAdmin }: Props) {
             <option value="anthropic">Anthropic (Claude)</option>
             <option value="openai">OpenAI</option>
             <option value="self_hosted">Self-Hosted</option>
+            <option value="claude_code">Claude Code (OAuth)</option>
           </select>
           <input
             className={inputClass}
@@ -267,11 +275,16 @@ export default function ProvidersTab({ isAdmin: _isAdmin }: Props) {
           />
           <input
             className={inputClass}
-            placeholder="API Key"
+            placeholder={providerForm.provider_type === 'claude_code' ? 'OAuth Token (sk-ant-oat01-...)' : 'API Key'}
             type="password"
             value={providerForm.api_key}
             onChange={(e) => setProviderForm({ ...providerForm, api_key: e.target.value })}
           />
+          {providerForm.provider_type === 'claude_code' && (
+            <div className="text-[11px] text-gray-600">
+              Uses Claude Code CLI with ANTHROPIC_AUTH_TOKEN. Requires claude CLI in the server's PATH.
+            </div>
+          )}
           {providerForm.provider_type === 'self_hosted' && (
             <input
               className={inputClass}
