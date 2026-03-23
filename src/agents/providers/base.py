@@ -526,6 +526,37 @@ async def _execute_with_cancel(
     return None  # Cancelled
 
 
+# Maximum tool result size kept in the LLM conversation messages.
+# Larger results are truncated before being appended.  The full result
+# is still logged and emitted as events — this only affects what the
+# LLM sees on subsequent rounds.  ~15K chars ≈ 4K tokens.
+MAX_TOOL_RESULT_IN_CONTEXT = 15_000
+
+
+def _truncate_tool_result(text: str) -> str:
+    """Truncate a tool result to keep message memory bounded."""
+    if len(text) <= MAX_TOOL_RESULT_IN_CONTEXT:
+        return text
+    return text[:MAX_TOOL_RESULT_IN_CONTEXT] + "\n... (truncated, showing first 15K chars)"
+
+
+def _trim_old_tool_results(messages: list[LLMMessage], keep_full: int = 6) -> None:
+    """Trim tool results in older messages to short previews.
+
+    Keeps the most recent ``keep_full`` tool-result messages at full size.
+    Older ones are trimmed to 300 chars per result, freeing memory from
+    file contents / search outputs that the LLM no longer needs in detail.
+    """
+    tr_indices = [i for i, m in enumerate(messages) if m.tool_results]
+    if len(tr_indices) <= keep_full:
+        return
+    for idx in tr_indices[:-keep_full]:
+        for tr in messages[idx].tool_results:
+            content = tr.get("content", "")
+            if len(content) > 300:
+                tr["content"] = content[:300] + "\n... (trimmed)"
+
+
 async def _execute_tools_parallel(
     tool_calls: list[dict],
     tool_executor: ToolExecutor,
@@ -583,7 +614,7 @@ async def _execute_tools_parallel(
             if on_tool_event:
                 await on_tool_event({"type": "tool_result", "name": tc_name, "result_preview": _smart_result_preview(tc_name, result_text), "chars": len(result_text), "parallel": True})
 
-            return {"tool_use_id": tc["id"], "content": result_text}
+            return {"tool_use_id": tc["id"], "content": _truncate_tool_result(result_text)}
 
         read_results = await _aio.gather(*[_run_read(tc) for tc in reads], return_exceptions=True)
         for i, r in enumerate(read_results):
@@ -634,7 +665,7 @@ async def _execute_tools_parallel(
         if on_tool_event:
             await on_tool_event({"type": "tool_result", "name": tc_name, "result_preview": _smart_result_preview(tc_name, result_text), "chars": len(result_text)})
 
-        tool_results.append({"tool_use_id": tc["id"], "content": result_text})
+        tool_results.append({"tool_use_id": tc["id"], "content": _truncate_tool_result(result_text)})
 
     return tool_results, cancelled
 
@@ -896,7 +927,7 @@ async def run_tool_loop(
                     result_text = await tool_executor(tc_name, tc_args)
                 result_preview = _smart_result_preview(tc_name, result_text)
                 logger.debug("tool_loop: round %d — %s result (%d chars): %s", loop_count, tc_name, len(result_text), result_preview[:200])
-                tool_results.append({"tool_use_id": tc["id"], "content": result_text})
+                tool_results.append({"tool_use_id": tc["id"], "content": _truncate_tool_result(result_text)})
 
                 # Fire structured tool_result event
                 if on_tool_event:
@@ -920,6 +951,9 @@ async def run_tool_loop(
                 break
 
         messages.append(LLMMessage(role="user", content="", tool_results=tool_results))
+
+        # Trim older tool results to save memory (keep recent ones full)
+        _trim_old_tool_results(messages, keep_full=6)
 
         # --- Doom loop detection with escalation ---
         doom.record_round(response.tool_calls)
@@ -1028,7 +1062,7 @@ async def run_tool_loop(
         # Context overflow guard — compact old tool rounds if approaching limit
         if response.tokens_input > 0:
             ctx_window = provider.get_context_window(response.model or provider.default_model)
-            if ctx_window and response.tokens_input > ctx_window * 0.85:
+            if ctx_window and response.tokens_input > ctx_window * 0.60:
                 logger.warning(
                     "tool_loop: context at %.0f%% (%d/%d tokens), compacting",
                     100 * response.tokens_input / ctx_window,
@@ -1040,6 +1074,12 @@ async def run_tool_loop(
                     messages[:] = _compact_messages_for_overflow(messages)
                 if on_activity:
                     await on_activity("Compacting context (approaching limit)...")
+            elif loop_count > 0 and loop_count % 15 == 0 and len(messages) > 10:
+                # Periodic compaction by message count to prevent unbounded growth
+                logger.info("tool_loop: periodic compaction at round %d (%d messages)", loop_count, len(messages))
+                messages[:] = _compact_messages_for_overflow(messages)
+                if on_activity:
+                    await on_activity("Compacting context (periodic cleanup)...")
 
     truncated = loop_count >= max_rounds and bool(response.tool_calls)
     if truncated:

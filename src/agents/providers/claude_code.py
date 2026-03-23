@@ -194,9 +194,12 @@ class ClaudeCodeProvider(AIProvider):
             "--output-format", "json",
             "--no-session-persistence",
             "--max-turns", "1",
-            # Suppress Claude Code's built-in tools so the model only
-            # sees the app's tools (defined in the system prompt text).
-            "--allowedTools", "",
+            # Disable ALL built-in tools so the model only sees the app's
+            # tools (defined in the system prompt text).  --tools ""
+            # fully removes built-in tool definitions from the model's
+            # context, unlike --allowedTools "" which still lets the model
+            # attempt tool use (resulting in empty responses).
+            "--tools", "",
         ]
 
         use_model = model or self.default_model
@@ -476,9 +479,53 @@ class ClaudeCodeProvider(AIProvider):
             app_tool_names = {t["name"] for t in tools}
             tool_calls = [tc for tc in tool_calls if tc["name"] in app_tool_names]
 
+        # Retry when the CLI consumed tool calls internally (--allowedTools "")
+        # leaving empty content and no valid app tool calls.  This happens when
+        # the model decides to use its native tools (Read, Bash, etc.) instead
+        # of answering with text or using app-defined tools.
+        cli_stop = result.get("stop_reason", "")
+        if not content and not tool_calls and cli_stop == "tool_use":
+            logger.warning(
+                "claude_code: CLI consumed tool calls internally, "
+                "retrying with tool-suppression instruction",
+            )
+            retry_prompt = (
+                user_prompt
+                + "\n\n[IMPORTANT: Your previous response attempted to use tools "
+                "that are not available. You must respond with TEXT ONLY. "
+                "Do not attempt to use Read, Write, Edit, Bash, Glob, Grep, "
+                "or any other built-in tool. Answer directly in your response.]"
+            )
+            retry_result = await self._run_cli(
+                retry_prompt,
+                model=model or self.default_model,
+                system_prompt=sys_prompt,
+                max_tokens=max_tokens,
+            )
+            retry_content = retry_result.get("result", "")
+            retry_usage = self._extract_usage(retry_result)
+            retry_cost = retry_result.get("total_cost_usd", 0.0) or retry_result.get("cost_usd", 0.0)
+
+            # Accumulate usage
+            usage["input_tokens"] += retry_usage["input_tokens"]
+            usage["output_tokens"] += retry_usage["output_tokens"]
+            usage["cached_tokens"] += retry_usage["cached_tokens"]
+            cost += retry_cost
+
+            if retry_content:
+                # Re-parse in case retry also contains app tool calls
+                if tools:
+                    content, tool_calls = self._parse_tool_calls(retry_content)
+                    tool_calls = [tc for tc in tool_calls if tc["name"] in app_tool_names]
+                else:
+                    content = retry_content
+
         stop_reason = result.get("stop_reason", "end_turn") or "end_turn"
         if tool_calls:
             stop_reason = "tool_use"
+        elif stop_reason == "tool_use":
+            # CLI reported tool_use but all tool calls were filtered out
+            stop_reason = "end_turn"
 
         used_model = model or self.default_model
         # Try to get actual model from modelUsage

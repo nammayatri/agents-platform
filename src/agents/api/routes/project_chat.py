@@ -227,6 +227,7 @@ async def send_session_message(
         session_id,
     )
 
+    placeholder_id = None
     try:
         model_override = body.model or dict(session).get("ai_model")
 
@@ -258,8 +259,8 @@ async def send_session_message(
                 detected_mode, confidence = last_mode, 0.8
                 logger.info("intent: short follow-up, keeping %s session=%s", last_mode, session_id)
             else:
-                from agents.providers.registry import ProviderRegistry
-                registry = ProviderRegistry(db)
+                from agents.providers.registry import get_registry
+                registry = get_registry(db)
                 provider = await registry.resolve_for_project(project_id, str(user["id"]))
 
                 if redis:
@@ -288,6 +289,19 @@ async def send_session_message(
             if routing_mode != last_mode:
                 mode_auto_switched = True
 
+        # Insert placeholder assistant message so page refresh shows "Generating..."
+        placeholder_msg = await db.fetchrow(
+            """
+            INSERT INTO project_chat_messages
+              (project_id, user_id, role, content, metadata_json, session_id)
+            VALUES ($1, $2, 'assistant', '', $3, $4) RETURNING *
+            """,
+            project_id, user["id"],
+            json.dumps({"status": "generating"}),
+            session_id,
+        )
+        placeholder_id = str(placeholder_msg["id"])
+
         # Dispatch to the resolved handler
         logger.info("dispatching to handler: mode=%s session=%s", routing_mode, session_id)
         kw: dict = dict(
@@ -301,6 +315,7 @@ async def send_session_message(
             event_bus=event_bus,
             redis=redis,
             model_override=model_override,
+            placeholder_id=placeholder_id,
         )
         if routing_mode == "plan":
             kw["session"] = dict(session)
@@ -335,6 +350,24 @@ async def send_session_message(
         assistant_msg_dict["sender_name"] = "AI"
         assistant_msg_dict["sender_avatar_url"] = None
 
+        # Notify WebSocket subscribers that the assistant message is ready
+        # (handles page-refresh mid-generation: the refreshed page will get this event)
+        if redis and session_id:
+            await redis.publish(
+                f"chat:session:{session_id}:activity",
+                json.dumps({
+                    "type": "chat_message",
+                    "message": {
+                        "id": str(assistant_msg_dict["id"]),
+                        "role": "assistant",
+                        "content": assistant_msg_dict["content"],
+                        "metadata_json": assistant_msg_dict.get("metadata_json"),
+                        "sender_name": "AI",
+                        "created_at": str(assistant_msg_dict.get("created_at", "")),
+                    },
+                }),
+            )
+
         return {
             "user_message": user_msg_dict,
             "assistant_message": assistant_msg_dict,
@@ -343,6 +376,12 @@ async def send_session_message(
         }
     except Exception as e:
         logger.error("Project chat error: %s", e)
+        # Update placeholder with the error instead of leaving it as "generating"
+        if placeholder_id:
+            await db.execute(
+                "UPDATE project_chat_messages SET content = $2, metadata_json = $3, updated_at = NOW() WHERE id = $1",
+                placeholder_id, f"Error: {str(e)}", json.dumps({"status": "error"}),
+            )
         err_msg = await db.fetchrow(
             """
             INSERT INTO project_chat_messages (project_id, user_id, role, content, session_id)

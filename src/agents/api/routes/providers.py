@@ -110,9 +110,9 @@ async def delete_provider(provider_id: str, user: CurrentUser, db: DB):
 
 @router.post("/{provider_id}/test")
 async def test_provider(provider_id: str, user: CurrentUser, db: DB):
-    from agents.providers.registry import ProviderRegistry
+    from agents.providers.registry import get_registry
 
-    registry = ProviderRegistry(db)
+    registry = get_registry(db)
     try:
         provider = await registry.instantiate(provider_id)
     except Exception as e:
@@ -128,7 +128,7 @@ async def test_provider(provider_id: str, user: CurrentUser, db: DB):
 @router.get("/{provider_id}/models")
 async def list_provider_models(provider_id: str, user: CurrentUser, db: DB):
     """List available models for a provider."""
-    from agents.providers.registry import ProviderRegistry
+    from agents.providers.registry import get_registry
 
     config = await db.fetchrow(
         "SELECT id, owner_id FROM ai_provider_configs WHERE id = $1", provider_id
@@ -138,7 +138,7 @@ async def list_provider_models(provider_id: str, user: CurrentUser, db: DB):
     if config["owner_id"] and str(config["owner_id"]) != str(user["id"]):
         raise HTTPException(status_code=403)
 
-    registry = ProviderRegistry(db)
+    registry = get_registry(db)
     try:
         provider = await registry.instantiate(provider_id)
         models = await provider.list_models()

@@ -167,3 +167,19 @@ class ProviderRegistry:
 
         self._cache[provider_id] = (provider, time.monotonic())
         return provider
+
+
+# ── Singleton accessor ──────────────────────────────────────────────
+# Reuse a single ProviderRegistry per db pool to share the provider
+# cache (and its HTTP clients) across requests instead of creating
+# a fresh registry per API call.
+
+_registry: ProviderRegistry | None = None
+
+
+def get_registry(db: asyncpg.Pool) -> ProviderRegistry:
+    """Return a shared ProviderRegistry, creating one if needed."""
+    global _registry
+    if _registry is None or _registry.db is not db:
+        _registry = ProviderRegistry(db)
+    return _registry

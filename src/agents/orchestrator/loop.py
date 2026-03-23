@@ -19,12 +19,13 @@ import redis.asyncio as aioredis
 
 from agents.config.settings import settings
 from agents.infra.notifier import Notifier
-from agents.orchestrator.coordinator import AgentCoordinator
 from agents.orchestrator.events import EventBus, TaskEvent
+from agents.orchestrator.run_context import RunContext
+from agents.orchestrator.scheduler import TaskScheduler
 from agents.orchestrator.locks import LockManager
 from agents.orchestrator.state_machine import transition_todo
 from agents.orchestrator.workspace import WorkspaceManager
-from agents.providers.registry import ProviderRegistry
+from agents.providers.registry import ProviderRegistry, get_registry
 
 logger = logging.getLogger(__name__)
 
@@ -42,7 +43,7 @@ class EventDrivenOrchestrator:
         self.redis = redis
         self.event_bus = event_bus
         self.locks = LockManager(db_pool, worker_id, settings.orchestrator_lock_ttl)
-        self.provider_registry = ProviderRegistry(db_pool)
+        self.provider_registry = get_registry(db_pool)
         self.notifier = Notifier(db_pool)
         self.workspace_mgr = WorkspaceManager(db_pool, settings.workspace_root)
         self.active_tasks: dict[str, asyncio.Task] = {}
@@ -324,14 +325,21 @@ class EventDrivenOrchestrator:
         logger.info("_run_todo START: %s (state=%s, sub_state=%s, title=%s)",
                      todo_id[:8], todo.get("state"), todo.get("sub_state"), todo.get("title"))
         try:
-            coordinator = AgentCoordinator(
+            from agents.providers.mcp_executor import McpToolExecutor
+            from agents.providers.tools_registry import ToolsRegistry
+
+            ctx = RunContext(
                 todo_id=todo_id,
                 db=self.db,
                 redis=self.redis,
+                workspace_mgr=self.workspace_mgr,
                 provider_registry=self.provider_registry,
+                mcp_executor=McpToolExecutor(self.db),
+                tools_registry=ToolsRegistry(self.db),
                 notifier=self.notifier,
             )
-            await coordinator.run()
+            scheduler = TaskScheduler(todo_id=todo_id, ctx=ctx)
+            await scheduler.run()
             # Log final state after run
             final = await self.db.fetchrow(
                 "SELECT state, sub_state FROM todo_items WHERE id = $1", todo_id

@@ -355,7 +355,7 @@ async def undo_last_agent_action(user: CurrentUser, db: DB):
 @router.post("/agents/chat")
 async def send_agent_chat(body: AgentChatInput, user: CurrentUser, db: DB):
     """Send a message to the agent builder AI. The AI has tools to create/update agents."""
-    from agents.providers.registry import ProviderRegistry
+    from agents.providers.registry import get_registry
     from agents.schemas.agent import LLMMessage
 
     # Store user message
@@ -380,7 +380,7 @@ async def send_agent_chat(body: AgentChatInput, user: CurrentUser, db: DB):
         if not row:
             raise ValueError("No AI provider configured")
 
-        registry = ProviderRegistry(db)
+        registry = get_registry(db)
         provider = await registry.instantiate(str(row["id"]))
 
         # Load existing custom agents for context

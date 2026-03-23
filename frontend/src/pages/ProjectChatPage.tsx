@@ -264,19 +264,33 @@ export default function ProjectChatPage() {
   }, [messages, isStreaming, completedStreaming])
 
   // Handle incoming chat messages from the coordinator via WebSocket
-  // (e.g., task_plan_ready after re-planning, system messages during execution)
+  // (e.g., task_plan_ready after re-planning, completed assistant responses after page refresh)
   useEffect(() => {
     if (!incomingMessage || !projectId) return
     const msg: ProjectChatMessage = {
-      id: `ws-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      id: incomingMessage.id || `ws-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
       project_id: projectId,
       user_id: '',
       role: (incomingMessage.role as 'user' | 'assistant' | 'system') || 'system',
       content: incomingMessage.content,
       metadata_json: incomingMessage.metadata_json as ProjectChatMessage['metadata_json'],
-      created_at: new Date().toISOString(),
+      sender_name: incomingMessage.sender_name,
+      created_at: incomingMessage.created_at || new Date().toISOString(),
     }
-    setMessages((prev) => [...prev, msg])
+    setMessages((prev) => {
+      // Replace any "generating" placeholder with the real assistant message
+      const hasPlaceholder = prev.some((m) => {
+        const meta = parseMeta(m)
+        return m.role === 'assistant' && meta?.status === 'generating'
+      })
+      if (hasPlaceholder && msg.role === 'assistant') {
+        return prev.map((m) => {
+          const meta = parseMeta(m)
+          return m.role === 'assistant' && meta?.status === 'generating' ? msg : m
+        })
+      }
+      return [...prev, msg]
+    })
     clearIncomingMessage()
   }, [incomingMessage, projectId, clearIncomingMessage])
 
@@ -1034,6 +1048,22 @@ export default function ProjectChatPage() {
               {messages.map((msg) => {
                 const meta = parseMeta(msg)
                 const isOtherUserMsg = msg.role === 'user' && currentUser && msg.user_id && msg.user_id !== currentUser.id && msg.user_id !== ''
+                // Placeholder message while LLM is generating
+                if (msg.role === 'assistant' && meta?.status === 'generating') {
+                  return (
+                    <div key={msg.id} className="flex justify-start gap-2.5 animate-fade-in">
+                      <div className="w-6 h-6 rounded-full bg-indigo-500/20 flex items-center justify-center shrink-0 mt-1">
+                        <Bot className="w-3.5 h-3.5 text-indigo-400" />
+                      </div>
+                      <div className="bg-gray-900 border border-gray-800 rounded-xl px-4 py-2.5 text-sm">
+                        <span className="inline-flex items-center gap-2 text-gray-500">
+                          <Loader2 className="w-3 h-3 animate-spin text-indigo-400" />
+                          <span className="text-gray-400">Generating response...</span>
+                        </span>
+                      </div>
+                    </div>
+                  )
+                }
                 return (
                 <div
                   key={msg.id}

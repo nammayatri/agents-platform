@@ -142,11 +142,11 @@ async def _direct_chat_response(
     """Generate an immediate AI response to any user chat message."""
     from agents.api.chat_actions import execute_action, get_actions_as_tools, is_action_tool
     from agents.providers.mcp_executor import McpToolExecutor
-    from agents.providers.registry import ProviderRegistry
+    from agents.providers.registry import get_registry
     from agents.providers.tools_registry import ToolsRegistry
 
     try:
-        registry = ProviderRegistry(db)
+        registry = get_registry(db)
         provider = await registry.resolve_for_todo(todo_id)
 
         todo = await db.fetchrow("SELECT * FROM todo_items WHERE id = $1", todo_id)

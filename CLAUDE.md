@@ -178,3 +178,33 @@ Never ship a frontend change that references a column/table/endpoint that doesn'
 ### Access Checks
 - Centralized in `deps.py`: `check_project_access()` (any member) and `check_project_owner()` (owner-only)
 - All route handlers use these instead of inline checks
+
+---
+
+## Code Quality Principles
+
+### No Patchwork Fixes
+- When a bug is reported, trace it to the root cause — don't just add a guard or workaround at the symptom site
+- Understand *why* the wrong value reaches a point before deciding *where* to fix it
+- If a flag isn't being respected, trace the full data flow: DB → API → settings load → decision point
+
+### Architecture Over Band-Aids
+- When touching code, evaluate whether the current structure is the right one
+- If a file is growing into a monolith (300+ lines of mixed concerns), refactor into focused modules before adding more
+- Prefer registry/dispatch patterns over long if/elif chains
+- Extract shared utilities into a single canonical location — never duplicate logic across files
+
+### Orchestrator Architecture
+- **Handler registry pattern** (`handlers/__init__.py`): maps role → handler function. Open one file to see all events
+- **HandlerContext** (`handlers/_base.py`): dependency-inverted context passed to all handlers instead of raw coordinator references
+- **Handlers are stateless functions**, not classes — receive `(ctx, sub_task, provider, workspace_path)`
+- **Three-phase internal convention** per handler: validate → handle → next_action (section comments, not ABC)
+- **Shared utilities** (`handlers/_shared.py`): single source of truth for cross-handler logic (dep propagation, git resolution, guardrails, workspace finalization, etc.)
+- **Facade** (`phases/subtask_lifecycle.py`): thin wrapper that builds HandlerContext and delegates — keeps the public API stable for callers
+- When adding a new agent role: add handler file, register in `__init__.py`, add facade delegate — no other files change
+
+### Keep It Simple
+- Don't add abstraction layers until there's a clear need (2+ consumers or a measurable complexity problem)
+- Three similar lines of code are better than a premature abstraction
+- Dead code gets deleted, not commented out
+- If a function is only used in one place, it belongs in that file — not in a shared utils module

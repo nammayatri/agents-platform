@@ -16,7 +16,7 @@ import asyncpg
 
 from agents.config.settings import settings
 from agents.orchestrator.workspace import WorkspaceManager
-from agents.providers.registry import ProviderRegistry
+from agents.providers.registry import get_registry
 from agents.schemas.agent import LLMMessage
 
 logger = logging.getLogger(__name__)
@@ -154,7 +154,7 @@ class ProjectAnalyzer:
     def __init__(self, db: asyncpg.Pool, redis=None):
         self.db = db
         self.redis = redis
-        self.registry = ProviderRegistry(db)
+        self.registry = get_registry(db)
         self.workspace_mgr = WorkspaceManager(db, settings.workspace_root)
 
     async def _publish_progress(self, project_id: str, step: str, detail: str) -> None:

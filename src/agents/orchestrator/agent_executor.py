@@ -843,7 +843,7 @@ class AgentExecutor:
                     "stuck_check": None,
                     "tokens_used": total_tokens,
                     "tool_loop_truncated": tool_loop_truncated,
-                    "llm_response": response.content.strip()[:2000] if response.content else None,
+                    "llm_response": response.content.strip()[:500] if response.content else None,
                 }
                 iteration_log.append(entry)
 

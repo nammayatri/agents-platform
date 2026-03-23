@@ -496,6 +496,7 @@ class AgentCoordinator:
             project_dir, "tasks", str(self.todo_id), f"dep_{dep_name}",
         )
         dep_repo_dir = os.path.join(dep_task_dir, "repo")
+        short_id = str(self.todo_id)[:8]
 
         # Import git utilities up front (used by both reuse and fresh-clone paths)
         from agents.utils.git_utils import (
@@ -546,7 +547,6 @@ class AgentCoordinator:
             raise RuntimeError(f"Failed to clone dependency repo: {out}")
 
         # Create task branch
-        short_id = str(self.todo_id)[:8]
         task_branch = f"task/{short_id}-{dep_name}"
         await run_git_command(
             "checkout", "-b", task_branch, cwd=dep_repo_dir,
@@ -924,7 +924,7 @@ class AgentCoordinator:
                     files.append({"status": parts[0], "path": parts[1]})
 
         return {
-            "diff": diff_output[:500_000],  # cap at 500KB
+            "diff": diff_output[:100_000],  # cap at 100KB
             "stats": stat_output.strip(),
             "files": files,
         }

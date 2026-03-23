@@ -1,9 +1,12 @@
 import { useEffect, useRef, useState, useCallback } from 'react'
 
 export interface WSChatMessage {
+  id?: string
   role: string
   content: string
   metadata_json?: Record<string, unknown>
+  sender_name?: string
+  created_at?: string
 }
 
 /**

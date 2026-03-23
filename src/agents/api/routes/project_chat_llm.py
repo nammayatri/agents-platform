@@ -354,15 +354,16 @@ async def generate_project_response(
     event_bus=None,
     redis=None,
     model_override: str | None = None,
+    placeholder_id: str | None = None,
 ) -> dict:
     """Generate an AI response for a project-level chat message."""
     from agents.agents.registry import get_builtin_tool_schemas
     from agents.providers.mcp_executor import McpToolExecutor
-    from agents.providers.registry import ProviderRegistry
+    from agents.providers.registry import get_registry
     from agents.providers.tools_registry import ToolsRegistry
     from agents.schemas.agent import LLMMessage
 
-    registry = ProviderRegistry(db)
+    registry = get_registry(db)
     provider = await registry.resolve_for_project(project_id, user_id)
 
     planner_config = await resolve_planner_config(db, user_id)
@@ -668,17 +669,23 @@ Project: "{project['name']}"
     if raw_output:
         metadata["raw_output"] = raw_output[:20000]
 
-    msg_row = await db.fetchrow(
-        """
-        INSERT INTO project_chat_messages (project_id, user_id, role, content, metadata_json, session_id)
-        VALUES ($1, $2, 'assistant', $3, $4, $5) RETURNING *
-        """,
-        project_id,
-        user_id,
-        content,
-        metadata,
-        session_id,
-    )
+    if placeholder_id:
+        msg_row = await db.fetchrow(
+            """
+            UPDATE project_chat_messages
+            SET content = $2, metadata_json = $3, updated_at = NOW()
+            WHERE id = $1 RETURNING *
+            """,
+            placeholder_id, content, metadata,
+        )
+    else:
+        msg_row = await db.fetchrow(
+            """
+            INSERT INTO project_chat_messages (project_id, user_id, role, content, metadata_json, session_id)
+            VALUES ($1, $2, 'assistant', $3, $4, $5) RETURNING *
+            """,
+            project_id, user_id, content, metadata, session_id,
+        )
     return dict(msg_row)
 
 
@@ -817,6 +824,7 @@ async def generate_plan_response(
     event_bus=None,
     redis=None,
     model_override: str | None = None,
+    placeholder_id: str | None = None,
 ) -> dict:
     """Generate an AI response in plan mode.
 
@@ -827,11 +835,11 @@ async def generate_plan_response(
     from agents.agents.registry import get_builtin_tool_schemas
     from agents.providers.base import run_tool_loop
     from agents.providers.mcp_executor import McpToolExecutor
-    from agents.providers.registry import ProviderRegistry
+    from agents.providers.registry import get_registry
     from agents.providers.tools_registry import ToolsRegistry
     from agents.schemas.agent import LLMMessage
 
-    registry = ProviderRegistry(db)
+    registry = get_registry(db)
     provider = await registry.resolve_for_project(project_id, user_id)
 
     planner_config = await resolve_planner_config(db, user_id)
@@ -1161,17 +1169,23 @@ async def generate_plan_response(
         metadata = {}
     metadata["execution"] = execution_meta
 
-    msg_row = await db.fetchrow(
-        """
-        INSERT INTO project_chat_messages (project_id, user_id, role, content, metadata_json, session_id)
-        VALUES ($1, $2, 'assistant', $3, $4, $5) RETURNING *
-        """,
-        project_id,
-        user_id,
-        content,
-        metadata,
-        session_id,
-    )
+    if placeholder_id:
+        msg_row = await db.fetchrow(
+            """
+            UPDATE project_chat_messages
+            SET content = $2, metadata_json = $3, updated_at = NOW()
+            WHERE id = $1 RETURNING *
+            """,
+            placeholder_id, content, metadata,
+        )
+    else:
+        msg_row = await db.fetchrow(
+            """
+            INSERT INTO project_chat_messages (project_id, user_id, role, content, metadata_json, session_id)
+            VALUES ($1, $2, 'assistant', $3, $4, $5) RETURNING *
+            """,
+            project_id, user_id, content, metadata, session_id,
+        )
     return dict(msg_row)
 
 
@@ -1399,15 +1413,16 @@ async def generate_debug_response(
     event_bus=None,
     redis=None,
     model_override: str | None = None,
+    placeholder_id: str | None = None,
 ) -> dict:
     """Generate an AI response in debug mode."""
     from agents.agents.registry import get_builtin_tool_schemas
     from agents.providers.mcp_executor import McpToolExecutor
-    from agents.providers.registry import ProviderRegistry
+    from agents.providers.registry import get_registry
     from agents.providers.tools_registry import ToolsRegistry
     from agents.schemas.agent import LLMMessage
 
-    registry = ProviderRegistry(db)
+    registry = get_registry(db)
     provider = await registry.resolve_for_project(project_id, user_id)
 
     tools_reg = ToolsRegistry(db)
@@ -1647,17 +1662,23 @@ async def generate_debug_response(
     if raw_output:
         metadata["raw_output"] = raw_output[:20000]
 
-    msg_row = await db.fetchrow(
-        """
-        INSERT INTO project_chat_messages (project_id, user_id, role, content, metadata_json, session_id)
-        VALUES ($1, $2, 'assistant', $3, $4, $5) RETURNING *
-        """,
-        project_id,
-        user_id,
-        content,
-        metadata,
-        session_id,
-    )
+    if placeholder_id:
+        msg_row = await db.fetchrow(
+            """
+            UPDATE project_chat_messages
+            SET content = $2, metadata_json = $3, updated_at = NOW()
+            WHERE id = $1 RETURNING *
+            """,
+            placeholder_id, content, metadata,
+        )
+    else:
+        msg_row = await db.fetchrow(
+            """
+            INSERT INTO project_chat_messages (project_id, user_id, role, content, metadata_json, session_id)
+            VALUES ($1, $2, 'assistant', $3, $4, $5) RETURNING *
+            """,
+            project_id, user_id, content, metadata, session_id,
+        )
     return dict(msg_row)
 
 
@@ -1703,13 +1724,14 @@ async def generate_create_task_response(
     event_bus=None,
     redis=None,
     model_override: str | None = None,
+    placeholder_id: str | None = None,
 ) -> dict:
     """Generate a response in create-task mode."""
-    from agents.providers.registry import ProviderRegistry
+    from agents.providers.registry import get_registry
     from agents.providers.tools_registry import ToolsRegistry
     from agents.schemas.agent import LLMMessage
 
-    registry = ProviderRegistry(db)
+    registry = get_registry(db)
     provider = await registry.resolve_for_project(project_id, user_id)
 
     action_tools = get_actions_as_tools("project")
@@ -1882,15 +1904,21 @@ async def generate_create_task_response(
         metadata = {}
     metadata["execution"] = execution_meta
 
-    msg_row = await db.fetchrow(
-        """
-        INSERT INTO project_chat_messages (project_id, user_id, role, content, metadata_json, session_id)
-        VALUES ($1, $2, 'assistant', $3, $4, $5) RETURNING *
-        """,
-        project_id,
-        user_id,
-        content,
-        metadata,
-        session_id,
-    )
+    if placeholder_id:
+        msg_row = await db.fetchrow(
+            """
+            UPDATE project_chat_messages
+            SET content = $2, metadata_json = $3, updated_at = NOW()
+            WHERE id = $1 RETURNING *
+            """,
+            placeholder_id, content, metadata,
+        )
+    else:
+        msg_row = await db.fetchrow(
+            """
+            INSERT INTO project_chat_messages (project_id, user_id, role, content, metadata_json, session_id)
+            VALUES ($1, $2, 'assistant', $3, $4, $5) RETURNING *
+            """,
+            project_id, user_id, content, metadata, session_id,
+        )
     return dict(msg_row)

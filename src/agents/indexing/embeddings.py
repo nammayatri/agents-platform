@@ -177,6 +177,14 @@ class EmbeddingIndex:
             self.save(self._cache_dir)
 
         self._initialized = True
+
+        # Strip full chunk content to save memory — only the first 500 chars
+        # are needed for search result snippets.  Full text was only needed
+        # for embedding generation (already done above).
+        for chunk in self._chunks:
+            if len(chunk.content) > 500:
+                chunk.content = chunk.content[:500]
+
         logger.info(
             "embeddings: indexed %d chunks from %d files (%d changed)",
             len(self._chunks), len(files), len(changed_files),
@@ -252,6 +260,10 @@ class EmbeddingIndex:
             import faiss
             self._index = faiss.read_index(idx_path)
             self._chunks = self._load_chunks()
+            # Strip chunk content to save memory (only snippets needed for results)
+            for chunk in self._chunks:
+                if len(chunk.content) > 500:
+                    chunk.content = chunk.content[:500]
             self._initialized = bool(self._chunks)
             return self._initialized
         except Exception as e:

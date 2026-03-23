@@ -14,8 +14,26 @@ from agents.indexing.embeddings import EmbeddingIndex, SearchResult
 
 logger = logging.getLogger(__name__)
 
-# Singleton index cache: workspace_path -> EmbeddingIndex
-_index_cache: dict[str, EmbeddingIndex] = {}
+# LRU index cache: cache_key -> EmbeddingIndex
+# Capped to prevent unbounded memory growth (each index holds FAISS vectors
+# + chunk metadata, typically 40-120MB per project).
+from collections import OrderedDict
+
+_MAX_CACHED_INDICES = 3
+_index_cache: OrderedDict[str, EmbeddingIndex] = OrderedDict()
+
+
+def _evict_lru() -> None:
+    """Evict least-recently-used indices beyond the cap."""
+    while len(_index_cache) > _MAX_CACHED_INDICES:
+        oldest_key, idx = _index_cache.popitem(last=False)
+        # Free heavy resources
+        idx._index = None
+        idx._chunks = []
+        if hasattr(idx, "_embeddings"):
+            idx._embeddings = None
+        _stats.pop(oldest_key, None)
+        logger.info("semantic_search: evicted index for %s (cache full)", oldest_key)
 
 
 # ── Index stats tracking ──────────────────────────────────────────
@@ -86,6 +104,8 @@ def get_or_build_index(workspace_path: str, *, cache_dir: str | None = None) -> 
     if cache_key in _index_cache:
         idx = _index_cache[cache_key]
         if idx._initialized:
+            # Move to end (most recently used)
+            _index_cache.move_to_end(cache_key)
             stats.cache_hits += 1
             return idx
 
@@ -97,6 +117,7 @@ def get_or_build_index(workspace_path: str, *, cache_dir: str | None = None) -> 
     if os.path.exists(os.path.join(disk_cache, "faiss.idx")):
         if idx.load(disk_cache):
             _index_cache[cache_key] = idx
+            _evict_lru()
             stats.disk_loads += 1
             logger.info("semantic_search: loaded index from disk for %s", disk_cache)
             return idx
@@ -105,6 +126,7 @@ def get_or_build_index(workspace_path: str, *, cache_dir: str | None = None) -> 
     stats.cold_builds += 1
     idx.build_index(workspace_path, cache_dir=cache_dir)
     _index_cache[cache_key] = idx
+    _evict_lru()
     return idx
 
 
