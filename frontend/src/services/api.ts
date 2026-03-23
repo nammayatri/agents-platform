@@ -313,9 +313,20 @@ export const projectChat = {
         { method: 'POST' },
       ),
     acceptTaskPlan: (projectId: string, sessionId: string) =>
-      request<{ user_message: ProjectChatMessage; assistant_message: ProjectChatMessage; task_id: string }>(
+      request<{
+        user_message: ProjectChatMessage
+        assistant_message: ProjectChatMessage
+        task_id: string
+        existing_active_subtasks?: Array<{ id: string; title: string; agent_role: string; status: string }>
+        old_todo_id?: string
+      }>(
         `/projects/${projectId}/chat/sessions/${sessionId}/accept-task-plan`,
         { method: 'POST' },
+      ),
+    cancelSubtasks: (projectId: string, sessionId: string, subtaskIds: string[]) =>
+      request<{ cancelled: string[]; todo_id: string }>(
+        `/projects/${projectId}/chat/sessions/${sessionId}/cancel-subtasks`,
+        { method: 'POST', body: JSON.stringify({ subtask_ids: subtaskIds }) },
       ),
     discardTaskPlan: (projectId: string, sessionId: string, feedback: string) =>
       request<{ status: string }>(

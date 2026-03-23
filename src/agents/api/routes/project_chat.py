@@ -436,6 +436,22 @@ async def accept_task_plan(
     plan_json = task_plan.get("plan_json", {})
     intake_data = task_plan.get("intake_data", {})
 
+    # Collect existing active subtasks from old linked todo (if any)
+    existing_active_subtasks = []
+    old_linked_todo_id = session.get("linked_todo_id")
+    if old_linked_todo_id:
+        rows = await db.fetch(
+            """SELECT id, title, agent_role, status
+               FROM sub_tasks
+               WHERE todo_id = $1 AND status IN ('pending', 'assigned', 'running')
+               ORDER BY execution_order""",
+            old_linked_todo_id,
+        )
+        existing_active_subtasks = [
+            {"id": str(r["id"]), "title": r["title"], "agent_role": r["agent_role"], "status": r["status"]}
+            for r in rows
+        ]
+
     # Create the task in DB
     todo = await db.fetchrow(
         """
@@ -542,11 +558,53 @@ async def accept_task_plan(
         project_id, user["id"], content, metadata, session_id,
     )
 
-    return {
+    result = {
         "user_message": dict(user_msg),
         "assistant_message": dict(assistant_msg),
         "task_id": todo_id,
     }
+    if existing_active_subtasks:
+        result["existing_active_subtasks"] = existing_active_subtasks
+        result["old_todo_id"] = str(old_linked_todo_id)
+    return result
+
+
+class CancelSubtasksInput(BaseModel):
+    subtask_ids: list[str]
+
+
+@router.post("/projects/{project_id}/chat/sessions/{session_id}/cancel-subtasks")
+async def cancel_subtasks(
+    project_id: str, session_id: str, body: CancelSubtasksInput,
+    user: CurrentUser, db: DB,
+):
+    """Cancel selected subtasks on a session's linked task."""
+    session = await _load_session(session_id, project_id, user, db)
+    linked_todo_id = session.get("linked_todo_id")
+    if not linked_todo_id:
+        # Also check old linked todo via todo_items table
+        linked = await db.fetchrow(
+            "SELECT id FROM todo_items WHERE chat_session_id = $1 LIMIT 1",
+            session_id,
+        )
+        if linked:
+            linked_todo_id = str(linked["id"])
+    if not linked_todo_id:
+        raise HTTPException(status_code=400, detail="Session has no linked task")
+
+    cancelled = []
+    for st_id in body.subtask_ids:
+        row = await db.fetchrow(
+            "SELECT id, status FROM sub_tasks WHERE id = $1 AND todo_id = $2",
+            st_id, linked_todo_id,
+        )
+        if row and row["status"] in ("pending", "assigned", "running"):
+            await db.execute(
+                "UPDATE sub_tasks SET status = 'cancelled' WHERE id = $1", st_id,
+            )
+            cancelled.append(st_id)
+
+    return {"cancelled": cancelled, "todo_id": str(linked_todo_id)}
 
 
 class DiscardTaskPlanInput(BaseModel):

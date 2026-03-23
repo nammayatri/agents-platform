@@ -186,8 +186,28 @@ class WorkspaceManager:
         task_repo_dir = os.path.join(task_dir, "repo")
 
         if os.path.isdir(task_repo_dir):
-            logger.info("[workspace] Task workspace exists, fetching latest for todo=%s", todo_id)
+            logger.info("[workspace] Task workspace exists, verifying for todo=%s", todo_id)
+            # Re-authenticate remote in case token expired
+            await ensure_authenticated_remote(task_repo_dir, self.db)
             await run_git_command("fetch", "origin", cwd=task_repo_dir)
+            # Ensure the task branch exists and is checked out
+            branch_name = f"task/{short_id}"
+            rc, current = await run_git_command(
+                "rev-parse", "--abbrev-ref", "HEAD", cwd=task_repo_dir,
+            )
+            current = current.strip() if rc == 0 else ""
+            if current != branch_name:
+                logger.info("[workspace] Checking out task branch %s (was on %s)", branch_name, current)
+                rc, _ = await run_git_command("checkout", branch_name, cwd=task_repo_dir)
+                if rc != 0:
+                    await run_git_command("checkout", "-b", branch_name, cwd=task_repo_dir)
+            # Unshallow if needed (shallow clones can block push)
+            rc_s, is_shallow = await run_git_command(
+                "rev-parse", "--is-shallow-repository", cwd=task_repo_dir,
+            )
+            if rc_s == 0 and is_shallow.strip() == "true":
+                logger.info("[workspace] Unshallowing task repo for todo=%s", todo_id)
+                await run_git_command("fetch", "--unshallow", "origin", cwd=task_repo_dir)
             return task_dir
 
         os.makedirs(task_dir, exist_ok=True)
@@ -211,6 +231,14 @@ class WorkspaceManager:
             "remote", "set-url", "origin", authenticated_url,
             cwd=task_repo_dir,
         )
+
+        # Unshallow the clone so push works cleanly
+        rc_check, is_shallow = await run_git_command(
+            "rev-parse", "--is-shallow-repository", cwd=task_repo_dir,
+        )
+        if rc_check == 0 and is_shallow.strip() == "true":
+            logger.info("[workspace] Unshallowing fresh task clone for todo=%s", todo_id)
+            await run_git_command("fetch", "--unshallow", "origin", cwd=task_repo_dir)
 
         branch_name = f"task/{short_id}"
         logger.info("[workspace] Created task branch=%s for todo=%s", branch_name, todo_id)
@@ -431,6 +459,14 @@ class WorkspaceManager:
                     result["error"] = f"git commit failed: {out}"
                 return result
             logger.info("Committed changes on branch %s", branch)
+
+        # Unshallow if needed — shallow clones can cause push failures
+        rc_s, is_shallow = await run_git_command(
+            "rev-parse", "--is-shallow-repository", cwd=repo_dir,
+        )
+        if rc_s == 0 and is_shallow.strip() == "true":
+            logger.info("Unshallowing before push on branch %s", branch)
+            await run_git_command("fetch", "--unshallow", "origin", cwd=repo_dir)
 
         rc, out = await run_git_command("push", "-u", "origin", branch, cwd=repo_dir)
         if rc != 0:
