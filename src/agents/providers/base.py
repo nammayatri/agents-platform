@@ -174,7 +174,7 @@ def _compact_messages_for_overflow(
             summary_parts.append(f"Response: {m.content[:150]}")
 
     # Keep the last 20 summary entries to stay reasonably compact
-    summary = "Previous exploration summary (compacted):\n" + "\n".join(summary_parts[-20:])
+    summary = "Previous exploration summary (compacted — re-read files or re-run tools if you need details):\n" + "\n".join(summary_parts[-20:])
     return [*head, LLMMessage(role="user", content=summary), *tail]
 
 
@@ -246,7 +246,7 @@ async def _compact_messages_with_llm(
         compacted = list(head)
         compacted.append(LLMMessage(
             role="user",
-            content=f"[CONTEXT SUMMARY — earlier tool interactions compacted]\n{summary}",
+            content=f"[CONTEXT COMPACTED — earlier tool interactions summarized. Re-read files if you need exact content.]\n{summary}",
         ))
         compacted.extend(tail)
 
@@ -534,18 +534,35 @@ MAX_TOOL_RESULT_IN_CONTEXT = 15_000
 
 
 def _truncate_tool_result(text: str) -> str:
-    """Truncate a tool result to keep message memory bounded."""
+    """Truncate a tool result but tell the LLM what was cut and how to get more."""
     if len(text) <= MAX_TOOL_RESULT_IN_CONTEXT:
         return text
-    return text[:MAX_TOOL_RESULT_IN_CONTEXT] + "\n... (truncated, showing first 15K chars)"
+    total = len(text)
+    lines = text.split("\n")
+    kept: list[str] = []
+    char_count = 0
+    for line in lines:
+        if char_count + len(line) + 1 > MAX_TOOL_RESULT_IN_CONTEXT:
+            break
+        kept.append(line)
+        char_count += len(line) + 1
+    remaining_lines = len(lines) - len(kept)
+    result = "\n".join(kept)
+    result += (
+        f"\n\n... (showing {len(kept)} of {len(lines)} lines, {MAX_TOOL_RESULT_IN_CONTEXT} of {total} chars. "
+        f"{remaining_lines} lines not shown. "
+        f"Re-read with offset={len(kept)} if you need the rest.)"
+    )
+    return result
 
 
 def _trim_old_tool_results(messages: list[LLMMessage], keep_full: int = 6) -> None:
     """Trim tool results in older messages to short previews.
 
     Keeps the most recent ``keep_full`` tool-result messages at full size.
-    Older ones are trimmed to 300 chars per result, freeing memory from
-    file contents / search outputs that the LLM no longer needs in detail.
+    Older ones are trimmed to 400 chars per result with a hint to re-request,
+    freeing memory from file contents / search outputs the LLM no longer
+    needs in detail.
     """
     tr_indices = [i for i, m in enumerate(messages) if m.tool_results]
     if len(tr_indices) <= keep_full:
@@ -553,8 +570,14 @@ def _trim_old_tool_results(messages: list[LLMMessage], keep_full: int = 6) -> No
     for idx in tr_indices[:-keep_full]:
         for tr in messages[idx].tool_results:
             content = tr.get("content", "")
-            if len(content) > 300:
-                tr["content"] = content[:300] + "\n... (trimmed)"
+            if len(content) > 500:
+                preview = content[:400]
+                total = len(content)
+                tr["content"] = (
+                    f"{preview}\n\n"
+                    f"... (trimmed from {total} chars — this is an older result. "
+                    f"Re-read the file or re-run the tool if you need the full content.)"
+                )
 
 
 async def _execute_tools_parallel(
@@ -745,7 +768,7 @@ async def run_tool_loop(
     # After first call, drop tool_choice so subsequent rounds use auto
     send_kwargs.pop("tool_choice", None)
 
-    logger.info(
+    logger.debug(
         "tool_loop: initial response stop_reason=%s tool_calls=%d tokens_in=%d tokens_out=%d",
         response.stop_reason,
         len(response.tool_calls) if response.tool_calls else 0,
@@ -786,7 +809,7 @@ async def run_tool_loop(
     # kimi-latest) that describe what they *would* do instead of acting.
     # Disabled for interactive chat modes where a direct text answer is valid.
     if nudge_tools and tools and not response.tool_calls and response.content:
-        logger.info("tool_loop: model produced text without tool calls, nudging")
+        logger.debug("tool_loop: model produced text without tool calls, nudging")
         if on_activity:
             await on_activity("Nudging agent to use tools...")
         messages.append(LLMMessage(
@@ -805,7 +828,7 @@ async def run_tool_loop(
             content_parts.append(response.content)
         response = await _retry_on_rate_limit(_call_llm, on_activity=on_activity)
         nudged = True
-        logger.info(
+        logger.debug(
             "tool_loop: nudge response stop_reason=%s tool_calls=%d",
             response.stop_reason,
             len(response.tool_calls) if response.tool_calls else 0,
@@ -825,7 +848,7 @@ async def run_tool_loop(
         tool_names = [tc["name"] for tc in response.tool_calls]
         tools_called.extend(tool_names)
         total_tool_calls += len(tool_names)
-        logger.info("tool_loop: round %d/%d — calling tools: %s", loop_count, max_rounds, tool_names)
+        logger.debug("tool_loop: round %d/%d — calling tools: %s", loop_count, max_rounds, tool_names)
 
         if on_tool_round:
             await on_tool_round(loop_count, response)
@@ -865,7 +888,7 @@ async def run_tool_loop(
 
                 tc_name = tc["name"]
                 tc_args = _normalize_tool_args(tc.get("arguments", {}))
-                logger.info("tool_loop: round %d — exec %s args_keys=%s", loop_count, tc_name, list(tc_args.keys()))
+                logger.debug("tool_loop: round %d — exec %s args_keys=%s", loop_count, tc_name, list(tc_args.keys()))
 
                 # Validate tool name against known tools
                 if known_tool_names and tc_name not in known_tool_names:
@@ -919,7 +942,7 @@ async def run_tool_loop(
                         cancel_check=on_cancel_check,
                     )
                     if _result is None:
-                        logger.info("tool_loop: tool %s cancelled mid-execution", tc_name)
+                        logger.debug("tool_loop: tool %s cancelled mid-execution", tc_name)
                         response.stop_reason = "cancelled"
                         break
                     result_text = _result
@@ -1020,14 +1043,14 @@ async def run_tool_loop(
                 if on_activity:
                     preview = combined[:80] + ("..." if len(combined) > 80 else "")
                     await on_activity(f"User guidance received: {preview}")
-                logger.info("tool_loop: injected %d user message(s) before round %d",
+                logger.debug("tool_loop: injected %d user message(s) before round %d",
                             len(injected_parts), loop_count + 1)
 
         # Cancellation check between tool rounds
         if on_cancel_check and await on_cancel_check():
             if cancel_event is not None:
                 cancel_event.set()
-            logger.info("tool_loop: cancelled by caller after round %d", loop_count)
+            logger.debug("tool_loop: cancelled by caller after round %d", loop_count)
             response.stop_reason = "cancelled"
             break
 
@@ -1036,7 +1059,7 @@ async def run_tool_loop(
 
         response = await _retry_on_rate_limit(_call_llm, on_activity=on_activity)
 
-        logger.info(
+        logger.debug(
             "tool_loop: round %d response stop_reason=%s tool_calls=%d",
             loop_count, response.stop_reason,
             len(response.tool_calls) if response.tool_calls else 0,
@@ -1086,7 +1109,7 @@ async def run_tool_loop(
         logger.warning("tool_loop: hit max_rounds=%d, stopping with pending tool calls", max_rounds)
         response.stop_reason = "max_tool_rounds"
 
-    logger.info("tool_loop: finished after %d rounds, final content_len=%d", loop_count, len(response.content or ""))
+    logger.debug("tool_loop: finished after %d rounds, final content_len=%d", loop_count, len(response.content or ""))
 
     if on_activity:
         await on_activity(f"Done ({loop_count} tool rounds)")
@@ -1115,6 +1138,11 @@ async def run_tool_loop(
         "total_tool_calls": total_tool_calls,
         "nudged": nudged,
     }
+
+    # Free the (potentially large) conversation messages accumulated during the
+    # tool loop.  Callers only need the returned content + response.
+    messages.clear()
+    content_parts.clear()
 
     return content, response
 

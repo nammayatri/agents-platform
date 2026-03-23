@@ -76,8 +76,11 @@ async def handle_coder_completion(
             if diff_stat:
                 desc_parts.append(f"\n## Git Diff Summary\n```\n{diff_stat}\n```")
             if diff_full:
-                if len(diff_full) > 10_000:
-                    diff_full = diff_full[:10_000] + "\n... (truncated, use git diff to see full changes)"
+                if len(diff_full) > 30_000:
+                    diff_full = diff_full[:30_000] + (
+                        f"\n... (diff truncated at 30K of {len(diff_full)} chars. "
+                        f"Use `run_command(command='git diff HEAD')` to see the full diff.)"
+                    )
                 desc_parts.append(f"\n## Full Diff\n```diff\n{diff_full}\n```")
         except Exception:
             logger.warning("[%s] Failed to capture git diff for reviewer", ctx.todo_id, exc_info=True)

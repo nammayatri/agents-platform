@@ -5,6 +5,7 @@ Each function generates an AI response for a specific chat mode
 (chat, plan, debug, create_task).
 """
 
+import gc
 import json
 import logging
 
@@ -603,6 +604,14 @@ Project: "{project['name']}"
     tool_events: list[dict] = []
 
     async def _on_tool_event(event: dict) -> None:
+        # Cap tool_events to prevent unbounded memory growth during long loops.
+        # Keep all llm_thinking events (small, needed for token stats) but
+        # trim tool_result/tool_start entries to the most recent 200.
+        if len(tool_events) > 500:
+            # Keep llm_thinking events + last 200 others
+            thinking = [e for e in tool_events if e.get("type") == "llm_thinking"]
+            others = [e for e in tool_events if e.get("type") != "llm_thinking"]
+            tool_events[:] = thinking + others[-200:]
         tool_events.append(event)
 
     send_kwargs: dict = {}
@@ -686,7 +695,12 @@ Project: "{project['name']}"
             """,
             project_id, user_id, content, metadata, session_id,
         )
-    return dict(msg_row)
+    # Free large locals and nudge GC after potentially heavy tool loops
+    tool_events.clear()
+    result = dict(msg_row)
+    del msg_row, content, metadata, response
+    gc.collect()
+    return result
 
 
 # ── Plan Mode ────────────────────────────────────────────────────────
@@ -1049,6 +1063,14 @@ async def generate_plan_response(
     tool_events: list[dict] = []
 
     async def _on_tool_event(event: dict) -> None:
+        # Cap tool_events to prevent unbounded memory growth during long loops.
+        # Keep all llm_thinking events (small, needed for token stats) but
+        # trim tool_result/tool_start entries to the most recent 200.
+        if len(tool_events) > 500:
+            # Keep llm_thinking events + last 200 others
+            thinking = [e for e in tool_events if e.get("type") == "llm_thinking"]
+            others = [e for e in tool_events if e.get("type") != "llm_thinking"]
+            tool_events[:] = thinking + others[-200:]
         tool_events.append(event)
 
     # ── Run tool loop ────────────────────────────────────────────────
@@ -1186,7 +1208,11 @@ async def generate_plan_response(
             """,
             project_id, user_id, content, metadata, session_id,
         )
-    return dict(msg_row)
+    tool_events.clear()
+    result = dict(msg_row)
+    del msg_row, content, metadata, response
+    gc.collect()
+    return result
 
 
 # ── Task Creation from Plan ──────────────────────────────────────────
@@ -1604,6 +1630,14 @@ async def generate_debug_response(
     tool_events: list[dict] = []
 
     async def _on_tool_event(event: dict) -> None:
+        # Cap tool_events to prevent unbounded memory growth during long loops.
+        # Keep all llm_thinking events (small, needed for token stats) but
+        # trim tool_result/tool_start entries to the most recent 200.
+        if len(tool_events) > 500:
+            # Keep llm_thinking events + last 200 others
+            thinking = [e for e in tool_events if e.get("type") == "llm_thinking"]
+            others = [e for e in tool_events if e.get("type") != "llm_thinking"]
+            tool_events[:] = thinking + others[-200:]
         tool_events.append(event)
 
     send_kwargs: dict = {}
@@ -1679,7 +1713,11 @@ async def generate_debug_response(
             """,
             project_id, user_id, content, metadata, session_id,
         )
-    return dict(msg_row)
+    tool_events.clear()
+    result = dict(msg_row)
+    del msg_row, content, metadata, response
+    gc.collect()
+    return result
 
 
 # ── Create Task Mode ────────────────────────────────────────────────
@@ -1862,6 +1900,14 @@ async def generate_create_task_response(
     tool_events: list[dict] = []
 
     async def _on_tool_event(event: dict) -> None:
+        # Cap tool_events to prevent unbounded memory growth during long loops.
+        # Keep all llm_thinking events (small, needed for token stats) but
+        # trim tool_result/tool_start entries to the most recent 200.
+        if len(tool_events) > 500:
+            # Keep llm_thinking events + last 200 others
+            thinking = [e for e in tool_events if e.get("type") == "llm_thinking"]
+            others = [e for e in tool_events if e.get("type") != "llm_thinking"]
+            tool_events[:] = thinking + others[-200:]
         tool_events.append(event)
 
     send_kwargs: dict = {}
@@ -1921,4 +1967,8 @@ async def generate_create_task_response(
             """,
             project_id, user_id, content, metadata, session_id,
         )
-    return dict(msg_row)
+    tool_events.clear()
+    result = dict(msg_row)
+    del msg_row, content, metadata, response
+    gc.collect()
+    return result

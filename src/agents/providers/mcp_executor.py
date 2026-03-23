@@ -250,7 +250,7 @@ class McpToolExecutor:
         Returns:
             The tool result as a string.
         """
-        logger.info("execute_tool: %s args=%s", tool_name, {k: (v[:80] + "..." if isinstance(v, str) and len(v) > 80 else v) for k, v in tool_input.items()})
+        logger.debug("execute_tool: %s args=%s", tool_name, {k: (v[:80] + "..." if isinstance(v, str) and len(v) > 80 else v) for k, v in tool_input.items()})
 
         # Find which MCP server owns this tool
         tool_meta = None
@@ -439,7 +439,7 @@ class McpToolExecutor:
         repo_dir = os.path.join(workspace_path, "repo") if workspace_path else ""
         tool_name = tool_meta["name"]
 
-        logger.info("builtin[%s]: workspace=%s repo_dir=%s", tool_name, workspace_path, repo_dir)
+        logger.debug("builtin[%s]: workspace=%s repo_dir=%s", tool_name, workspace_path, repo_dir)
 
         try:
             if tool_name == "read_file":
@@ -460,21 +460,69 @@ class McpToolExecutor:
                 # Try cache first (validates mtime freshness automatically)
                 content = self.file_cache.get(real_path)
                 if content is not None:
-                    logger.info("builtin[read_file]: %s → %d chars (cache hit, repo=%s)", path, len(content), repo_label)
+                    # Apply offset/limit slicing if requested
+                    offset = tool_input.get("offset", 0)
+                    limit = tool_input.get("limit")
+                    if offset > 0 or limit is not None:
+                        all_lines = content.split("\n")
+                        total_lines = len(all_lines)
+                        end = min(offset + limit, total_lines) if limit else total_lines
+                        sliced = all_lines[offset:end]
+                        sliced_content = "\n".join(sliced)
+                        line_header = f"[Lines {offset + 1}-{min(end, total_lines)} of {total_lines}]"
+                        if end < total_lines:
+                            remaining = total_lines - end
+                            sliced_content += f"\n\n... ({remaining} more lines. Use read_file with offset={end} to continue reading.)"
+                        logger.debug("builtin[read_file]: %s → lines %d-%d of %d (cache hit, repo=%s)", path, offset + 1, min(end, total_lines), total_lines, repo_label)
+                        return f"[Repository: {repo_label}] {path} {line_header}\n{sliced_content}"
+                    logger.debug("builtin[read_file]: %s → %d chars (cache hit, repo=%s)", path, len(content), repo_label)
                     return f"[Repository: {repo_label}] {path}\n{content}"
 
                 # Cache miss — read from disk
                 with open(real_path, "r", errors="replace") as f:
                     content = f.read()
-                # Truncate very large files
-                if len(content) > 100_000:
-                    logger.info("builtin[read_file]: %s truncated from %d to 100000 chars", path, len(content))
-                    content = content[:100_000] + "\n... (truncated)"
-                else:
-                    # Cache the full (non-truncated) content
+
+                # Cache full content (before any slicing/truncation)
+                full_char_count = len(content)
+                if full_char_count <= 100_000:
                     self.file_cache.put(real_path, content)
-                logger.info("builtin[read_file]: %s → %d chars (disk, repo=%s)", path, len(content), repo_label)
-                return f"[Repository: {repo_label}] {path}\n{content}"
+
+                # Apply offset/limit slicing if requested
+                offset = tool_input.get("offset", 0)
+                limit = tool_input.get("limit")
+                all_lines = content.split("\n")
+                total_lines = len(all_lines)
+
+                if offset > 0 or limit is not None:
+                    end = min(offset + limit, total_lines) if limit else total_lines
+                    sliced = all_lines[offset:end]
+                    content = "\n".join(sliced)
+                    line_header = f"[Lines {offset + 1}-{min(end, total_lines)} of {total_lines}]"
+                    if end < total_lines:
+                        remaining = total_lines - end
+                        content += f"\n\n... ({remaining} more lines. Use read_file with offset={end} to continue reading.)"
+                    logger.debug("builtin[read_file]: %s → lines %d-%d of %d (repo=%s)", path, offset + 1, min(end, total_lines), total_lines, repo_label)
+                    return f"[Repository: {repo_label}] {path} {line_header}\n{content}"
+
+                # Truncate very large files with informative message
+                if full_char_count > 100_000:
+                    kept_lines = []
+                    char_count = 0
+                    for line in all_lines:
+                        if char_count + len(line) + 1 > 100_000:
+                            break
+                        kept_lines.append(line)
+                        char_count += len(line) + 1
+                    remaining = total_lines - len(kept_lines)
+                    content = "\n".join(kept_lines)
+                    content += (
+                        f"\n\n... ({remaining} more lines not shown, {full_char_count - char_count} more chars. "
+                        f"Use read_file with offset={len(kept_lines)} to continue reading.)"
+                    )
+                    logger.debug("builtin[read_file]: %s truncated — showing %d of %d lines (repo=%s)", path, len(kept_lines), total_lines, repo_label)
+
+                logger.debug("builtin[read_file]: %s → %d chars (disk, repo=%s)", path, len(content), repo_label)
+                return f"[Repository: {repo_label}] {path} [{total_lines} lines total]\n{content}"
 
             elif tool_name == "write_file":
                 path = tool_input.get("path", "")
@@ -491,7 +539,7 @@ class McpToolExecutor:
                 # Update cache with the written content (mtime from disk after write)
                 self.file_cache.put(real_path, content)
                 repo_label = self._identify_repo(workspace_path, real_path)
-                logger.info("builtin[write_file]: %s → %d bytes written (repo=%s)", path, len(content), repo_label)
+                logger.debug("builtin[write_file]: %s → %d bytes written (repo=%s)", path, len(content), repo_label)
                 return json.dumps({"status": "ok", "path": path, "bytes_written": len(content), "repository": repo_label})
 
             elif tool_name == "edit_file":
@@ -521,7 +569,7 @@ class McpToolExecutor:
                         with open(real_path, "w") as f:
                             f.write(new_content)
                         self.file_cache.put(real_path, new_content)
-                        logger.info(
+                        logger.debug(
                             "builtin[edit_file]: %s — replaced %d chars with %d chars (method=%s, confidence=%.2f)",
                             path, len(old_text), len(new_text), match.method, match.confidence,
                         )
@@ -536,18 +584,18 @@ class McpToolExecutor:
                             "repository": repo_label,
                         })
                     except EditMatchError as e:
-                        logger.info("builtin[edit_file]: fuzzy match failed in %s: %s", path, str(e)[:200])
+                        logger.debug("builtin[edit_file]: fuzzy match failed in %s: %s", path, str(e)[:200])
                         return json.dumps({"error": str(e)})
                 except ImportError:
                     # Fallback to exact matching if edit_match module not available
                     count = content.count(old_text)
                     if count == 0:
-                        logger.info("builtin[edit_file]: old_text not found in %s", path)
+                        logger.debug("builtin[edit_file]: old_text not found in %s", path)
                         return json.dumps({
                             "error": "old_text not found in the file. Make sure it matches exactly (including whitespace/indentation).",
                         })
                     if count > 1:
-                        logger.info("builtin[edit_file]: old_text matched %d times in %s", count, path)
+                        logger.debug("builtin[edit_file]: old_text matched %d times in %s", count, path)
                         return json.dumps({
                             "error": f"old_text matched {count} times — it must be unique. Include more surrounding context to make it unique.",
                         })
@@ -556,7 +604,7 @@ class McpToolExecutor:
                         f.write(new_content)
                     self.file_cache.put(real_path, new_content)
                     repo_label = self._identify_repo(workspace_path, real_path)
-                    logger.info("builtin[edit_file]: %s — replaced %d chars with %d chars (repo=%s)", path, len(old_text), len(new_text), repo_label)
+                    logger.debug("builtin[edit_file]: %s — replaced %d chars with %d chars (repo=%s)", path, len(old_text), len(new_text), repo_label)
                     return json.dumps({
                         "status": "ok",
                         "path": path,
@@ -585,7 +633,7 @@ class McpToolExecutor:
                         "name": e,
                         "type": "directory" if os.path.isdir(full_e) else "file",
                     })
-                logger.info("builtin[list_directory]: %s → %d entries (repo=%s)", path or "/", len(result), repo_label)
+                logger.debug("builtin[list_directory]: %s → %d entries (repo=%s)", path or "/", len(result), repo_label)
                 return json.dumps({"repository": repo_label, "path": path or "/", "entries": result})
 
             elif tool_name == "search_files":
@@ -605,7 +653,7 @@ class McpToolExecutor:
                     return json.dumps({"error": f"Directory not found: {search_path}"})
 
                 repo_label = self._identify_repo(workspace_path, real_search)
-                logger.info("builtin[search_files]: pattern=%s path=%s glob=%s repo=%s", pattern, search_path or "/", file_glob, repo_label)
+                logger.debug("builtin[search_files]: pattern=%s path=%s glob=%s repo=%s", pattern, search_path or "/", file_glob, repo_label)
                 cmd = ["grep", "-rn", "--include", file_glob, pattern, "."]
                 proc = await asyncio.create_subprocess_exec(
                     *cmd,
@@ -616,20 +664,35 @@ class McpToolExecutor:
                 try:
                     stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=30)
                     output = stdout.decode(errors="replace")
-                    if len(output) > 50_000:
-                        logger.info("builtin[search_files]: output truncated from %d to 50000 chars", len(output))
-                        output = output[:50_000] + "\n... (truncated)"
-                    match_count = output.count("\n") if output else 0
-                    logger.info("builtin[search_files]: %d matching lines, %d chars", match_count, len(output))
-                    header = f"[Repository: {repo_label}] Search results for '{pattern}':\n"
-                    return (header + output) if output else f"[Repository: {repo_label}] No matches found."
+                    if not output:
+                        return f"[Repository: {repo_label}] No matches found."
+
+                    # Apply offset/max_results pagination
+                    max_results = tool_input.get("max_results", 200)
+                    skip = tool_input.get("offset", 0)
+                    lines = [l for l in output.strip().split("\n") if l.strip()]
+                    total_matches = len(lines)
+                    lines = lines[skip:skip + max_results]
+                    output = "\n".join(lines)
+
+                    if skip + max_results < total_matches:
+                        remaining = total_matches - skip - max_results
+                        output += (
+                            f"\n\n... ({remaining} more matches not shown. "
+                            f"Use search_files with offset={skip + max_results} to see next page.)"
+                        )
+
+                    showing = f" (showing {skip + 1}-{skip + len(lines)} of {total_matches})" if skip > 0 or total_matches > len(lines) else ""
+                    logger.debug("builtin[search_files]: %d total matches, showing %d%s", total_matches, len(lines), f" (offset={skip})" if skip else "")
+                    header = f"[Repository: {repo_label}] Search results for '{pattern}'{showing}:\n"
+                    return header + output
                 except asyncio.CancelledError:
                     try:
                         proc.kill()
                     except ProcessLookupError:
                         pass
                     await proc.wait()
-                    logger.info("builtin[search_files]: cancelled, subprocess killed")
+                    logger.debug("builtin[search_files]: cancelled, subprocess killed")
                     raise
                 except asyncio.TimeoutError:
                     proc.kill()
@@ -651,7 +714,7 @@ class McpToolExecutor:
                 # Intercept bare "cd <path>" (no &&/;) — useless in subprocess
                 bare_cd = _re.match(r'^cd(\s+\S+)?\s*$', actual_command)
                 if bare_cd:
-                    logger.info("builtin[run_command]: intercepted bare cd")
+                    logger.debug("builtin[run_command]: intercepted bare cd")
                     return json.dumps({
                         "exit_code": 0,
                         "output": "Your working directory is already the repo root. "
@@ -680,7 +743,7 @@ class McpToolExecutor:
                         })
                     if os.path.isdir(resolved):
                         effective_cwd = resolved
-                    logger.info("builtin[run_command]: cd to subdir=%s cmd=%s", cd_target, actual_command[:100])
+                    logger.debug("builtin[run_command]: cd to subdir=%s cmd=%s", cd_target, actual_command[:100])
 
                 # Check against blocked command patterns
                 for _bp, _br in _BLOCKED_COMMANDS:
@@ -698,10 +761,10 @@ class McpToolExecutor:
                         "output": f"Command blocked (safety analysis): {safety['reason']}",
                     })
                 elif safety["risk_level"] == "moderate":
-                    logger.info("builtin[run_command]: moderate risk: %s — %s",
+                    logger.debug("builtin[run_command]: moderate risk: %s — %s",
                                 actual_command[:200], safety["reason"])
 
-                logger.info("builtin[run_command]: cmd=%s cwd=%s", actual_command[:200], effective_cwd)
+                logger.debug("builtin[run_command]: cmd=%s cwd=%s", actual_command[:200], effective_cwd)
                 proc = await asyncio.create_subprocess_shell(
                     actual_command,
                     cwd=effective_cwd,
@@ -712,13 +775,17 @@ class McpToolExecutor:
                     stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=120)
                     output = stdout.decode(errors="replace")
                     if len(output) > 50_000:
-                        logger.info("builtin[run_command]: output truncated from %d to 50000 chars", len(output))
-                        output = output[:50_000] + "\n... (truncated)"
+                        total_len = len(output)
+                        logger.info("builtin[run_command]: output truncated from %d to 50000 chars", total_len)
+                        output = output[:50_000] + (
+                            f"\n\n... (output truncated at 50K of {total_len} chars. "
+                            f"Pipe through head/tail/grep to get specific sections.)"
+                        )
                     # Strip absolute repo path from output so LLM never sees it
                     if repo_dir:
                         output = output.replace(repo_dir + "/", "").replace(repo_dir, ".")
                     repo_label = self._identify_repo(workspace_path, os.path.realpath(repo_dir))
-                    logger.info("builtin[run_command]: exit_code=%d output_len=%d cmd=%s repo=%s",
+                    logger.debug("builtin[run_command]: exit_code=%d output_len=%d cmd=%s repo=%s",
                                 proc.returncode, len(output), actual_command[:100], repo_label)
                     return json.dumps({
                         "exit_code": proc.returncode,
@@ -731,7 +798,7 @@ class McpToolExecutor:
                     except ProcessLookupError:
                         pass
                     await proc.wait()
-                    logger.info("builtin[run_command]: cancelled, subprocess killed cmd=%s", actual_command[:100])
+                    logger.debug("builtin[run_command]: cancelled, subprocess killed cmd=%s", actual_command[:100])
                     raise
                 except asyncio.TimeoutError:
                     proc.kill()
@@ -759,7 +826,7 @@ class McpToolExecutor:
                         result_text, meta = execute_semantic_search(
                             repo_dir, query, top_k=top_k, cache_dir=index_dir,
                         )
-                    logger.info(
+                    logger.debug(
                         "builtin[semantic_search]: query=%s top_k=%d results=%d top_score=%.3f latency=%dms source=%s",
                         query[:100], top_k,
                         meta.get("results_count", 0),
@@ -769,7 +836,7 @@ class McpToolExecutor:
                     )
                     return result_text
                 except ImportError:
-                    logger.info("builtin[semantic_search]: module not available, falling back to search_files hint")
+                    logger.debug("builtin[semantic_search]: module not available, falling back to search_files hint")
                     return json.dumps({
                         "error": "Semantic search is not available (missing dependencies). Use search_files tool instead.",
                     })
@@ -779,7 +846,7 @@ class McpToolExecutor:
 
             elif tool_name == "task_complete":
                 summary = tool_input.get("summary", "")
-                logger.info("builtin[task_complete]: agent signaled done: %s", summary[:200])
+                logger.debug("builtin[task_complete]: agent signaled done: %s", summary[:200])
                 return json.dumps({"status": "acknowledged", "summary": summary})
 
             else:
@@ -917,7 +984,7 @@ class McpToolExecutor:
             session_id = init_headers.get("mcp-session-id")
             if session_id:
                 headers = {**headers, "mcp-session-id": session_id}
-                logger.info("MCP streamable-http: session_id=%s", session_id)
+                logger.debug("MCP streamable-http: session_id=%s", session_id)
 
             # Initialized notification (fire-and-forget)
             try:
@@ -982,7 +1049,7 @@ class McpToolExecutor:
             timeout=httpx.Timeout(60.0, connect=30.0), follow_redirects=True,
             verify=False,
         ) as client:
-            logger.info("SSE: connecting to %s", url)
+            logger.debug("SSE: connecting to %s", url)
             req = client.build_request("GET", url, headers={"Accept": "text/event-stream"})
             resp = await client.send(req, stream=True)
             resp.raise_for_status()
@@ -991,11 +1058,11 @@ class McpToolExecutor:
             try:
                 # Wait for endpoint
                 etype, edata = await asyncio.wait_for(events.get(), timeout=15)
-                logger.info("SSE: first event type=%s data=%s", etype, edata[:200] if edata else "")
+                logger.debug("SSE: first event type=%s data=%s", etype, edata[:200] if edata else "")
                 if etype != "endpoint":
                     return json.dumps({"error": f"Expected endpoint event, got {etype}: {edata}"})
                 post_url = edata if edata.startswith("http") else base_url + edata
-                logger.info("SSE: post_url=%s", post_url)
+                logger.debug("SSE: post_url=%s", post_url)
 
                 # Initialize
                 await client.post(post_url, json={
