@@ -497,14 +497,36 @@ class AgentCoordinator:
         )
         dep_repo_dir = os.path.join(dep_task_dir, "repo")
 
+        # Import git utilities up front (used by both reuse and fresh-clone paths)
+        from agents.utils.git_utils import (
+            ensure_authenticated_remote,
+            resolve_git_credentials,
+            run_git_command,
+        )
+        from agents.orchestrator.git_providers.factory import build_clone_url
+
         if os.path.isdir(dep_repo_dir):
+            # Re-authenticate and verify branch on reused workspace
+            await ensure_authenticated_remote(dep_repo_dir, self.db)
+            await run_git_command("fetch", "origin", cwd=dep_repo_dir)
+            task_branch = f"task/{short_id}-{dep_name}"
+            rc, current = await run_git_command(
+                "rev-parse", "--abbrev-ref", "HEAD", cwd=dep_repo_dir,
+            )
+            current = current.strip() if rc == 0 else ""
+            if current != task_branch:
+                rc, _ = await run_git_command("checkout", task_branch, cwd=dep_repo_dir)
+                if rc != 0:
+                    await run_git_command("checkout", "-b", task_branch, cwd=dep_repo_dir)
+            # Unshallow if needed
+            rc_s, is_shallow = await run_git_command(
+                "rev-parse", "--is-shallow-repository", cwd=dep_repo_dir,
+            )
+            if rc_s == 0 and is_shallow.strip() == "true":
+                await run_git_command("fetch", "--unshallow", "origin", cwd=dep_repo_dir)
             return dep_task_dir
 
         os.makedirs(dep_task_dir, exist_ok=True)
-
-        # Resolve credentials using the same utilities as workspace.py
-        from agents.utils.git_utils import resolve_git_credentials, run_git_command
-        from agents.orchestrator.git_providers.factory import build_clone_url
 
         git_provider_id = target_repo.get("git_provider_id")
         if git_provider_id:
@@ -517,7 +539,7 @@ class AgentCoordinator:
         branch = target_repo.get("default_branch") or "main"
 
         rc, out = await run_git_command(
-            "clone", "--depth", "1", "--branch", branch, clone_url, dep_repo_dir,
+            "clone", "--branch", branch, clone_url, dep_repo_dir,
             cwd=settings.workspace_root,
         )
         if rc != 0:

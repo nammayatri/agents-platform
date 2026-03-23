@@ -226,6 +226,13 @@ export default function ProjectChatPage() {
   const [discardedTaskPlans, setDiscardedTaskPlans] = useState<Set<string>>(new Set())
   const [taskPlanFeedbackFor, setTaskPlanFeedbackFor] = useState<string | null>(null)
   const [taskPlanFeedback, setTaskPlanFeedback] = useState('')
+  const [cancelDialog, setCancelDialog] = useState<{
+    subtasks: Array<{ id: string; title: string; agent_role: string; status: string }>
+    sessionId: string
+    oldTodoId: string
+  } | null>(null)
+  const [cancelSelection, setCancelSelection] = useState<Set<string>>(new Set())
+  const [cancelling, setCancelling] = useState(false)
 
   useEffect(() => {
     if (!projectId) return
@@ -560,6 +567,15 @@ export default function ProjectChatPage() {
       if (latestTaskPlanMsgId) {
         setApprovedTaskPlans((prev) => new Set(prev).add(latestTaskPlanMsgId))
       }
+      // Show cancel dialog if there are existing active subtasks on old linked todo
+      if (result.existing_active_subtasks && result.existing_active_subtasks.length > 0 && result.old_todo_id) {
+        setCancelDialog({
+          subtasks: result.existing_active_subtasks,
+          sessionId: activeSessionId,
+          oldTodoId: result.old_todo_id,
+        })
+        setCancelSelection(new Set(result.existing_active_subtasks.map((s) => s.id)))
+      }
     } catch (err) {
       const errorMsg: ProjectChatMessage = {
         id: `error-${Date.now()}`,
@@ -572,6 +588,31 @@ export default function ProjectChatPage() {
       setMessages((prev) => [...prev, errorMsg])
     } finally {
       setSending(false)
+    }
+  }
+
+  const handleCancelSubtasks = async () => {
+    if (!projectId || !cancelDialog || cancelling) return
+    setCancelling(true)
+    try {
+      const ids = [...cancelSelection]
+      if (ids.length > 0) {
+        await projectChat.sessions.cancelSubtasks(projectId, cancelDialog.sessionId, ids)
+      }
+      setCancelDialog(null)
+      setCancelSelection(new Set())
+    } catch (err) {
+      const errorMsg: ProjectChatMessage = {
+        id: `error-${Date.now()}`,
+        project_id: projectId!,
+        user_id: '',
+        role: 'system',
+        content: `Error cancelling subtasks: ${err instanceof Error ? err.message : 'Unknown error'}`,
+        created_at: new Date().toISOString(),
+      }
+      setMessages((prev) => [...prev, errorMsg])
+    } finally {
+      setCancelling(false)
     }
   }
 
@@ -1261,6 +1302,65 @@ export default function ProjectChatPage() {
                             <span className="text-xs text-emerald-400">Plan approved — executing</span>
                           </div>
                         )}
+                        {/* Cancel existing subtasks dialog — shown after task plan approval */}
+                        {meta?.action === 'task_plan_ready' && approvedTaskPlans.has(msg.id) && cancelDialog && (
+                          <div className="mt-2 bg-gray-950 border border-red-500/20 rounded-lg overflow-hidden">
+                            <div className="px-3 py-2 border-b border-gray-800/50 flex items-center gap-2">
+                              <svg className="w-3.5 h-3.5 text-red-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                                <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126zM12 15.75h.007v.008H12v-.008z" />
+                              </svg>
+                              <span className="text-xs font-medium text-red-400">Active subtasks on previous task</span>
+                              <span className="text-[10px] text-gray-600 ml-auto">
+                                {cancelSelection.size}/{cancelDialog.subtasks.length} selected
+                              </span>
+                            </div>
+                            <div className="px-3 py-2 space-y-1">
+                              {cancelDialog.subtasks.map((st) => (
+                                <label key={st.id} className="flex items-center gap-2 py-1 px-1 hover:bg-gray-800/30 rounded cursor-pointer">
+                                  <input
+                                    type="checkbox"
+                                    checked={cancelSelection.has(st.id)}
+                                    onChange={() => {
+                                      setCancelSelection((prev) => {
+                                        const next = new Set(prev)
+                                        if (next.has(st.id)) next.delete(st.id); else next.add(st.id)
+                                        return next
+                                      })
+                                    }}
+                                    className="rounded border-gray-700 bg-gray-900 text-red-500 focus:ring-red-500/20 w-3.5 h-3.5"
+                                  />
+                                  <span className="px-1.5 py-0.5 bg-gray-800 rounded text-[10px] text-gray-500 font-mono shrink-0">
+                                    {st.agent_role}
+                                  </span>
+                                  <span className="text-xs text-gray-400 flex-1 truncate">{st.title}</span>
+                                  <span className={`text-[10px] px-1.5 py-0.5 rounded ${
+                                    st.status === 'running' ? 'bg-blue-500/10 text-blue-400' :
+                                    st.status === 'assigned' ? 'bg-amber-500/10 text-amber-400' :
+                                    'bg-gray-800 text-gray-500'
+                                  }`}>
+                                    {st.status}
+                                  </span>
+                                </label>
+                              ))}
+                            </div>
+                            <div className="px-3 py-2 border-t border-gray-800/50 flex items-center gap-2">
+                              <button
+                                onClick={handleCancelSubtasks}
+                                disabled={cancelling || cancelSelection.size === 0}
+                                className="px-3 py-1.5 bg-red-600 hover:bg-red-500 disabled:opacity-40 rounded-lg text-xs font-medium text-white transition-colors"
+                              >
+                                {cancelling ? 'Cancelling...' : `Cancel ${cancelSelection.size} subtask${cancelSelection.size !== 1 ? 's' : ''}`}
+                              </button>
+                              <button
+                                onClick={() => { setCancelDialog(null); setCancelSelection(new Set()) }}
+                                disabled={cancelling}
+                                className="px-3 py-1.5 bg-gray-800 hover:bg-gray-700 disabled:opacity-40 rounded-lg text-xs text-gray-400 transition-colors"
+                              >
+                                Keep All
+                              </button>
+                            </div>
+                          </div>
+                        )}
                         {/* Task plan discarded badge */}
                         {meta?.action === 'task_plan_ready' && discardedTaskPlans.has(msg.id) && (
                           <div className="flex items-center gap-2 px-3 py-1.5 bg-amber-500/5 border border-amber-500/20 rounded-lg mt-1">
@@ -1374,7 +1474,7 @@ export default function ProjectChatPage() {
                   </div>
                 </div>
               )})}
-              {sending && (
+              {(sending || activity || isStreaming) && (
                 <div className="flex justify-start">
                   <div className="max-w-[80%]">
                     <div className="bg-gray-900 border border-gray-800 rounded-xl px-4 py-2.5 text-sm">
@@ -1396,7 +1496,7 @@ export default function ProjectChatPage() {
                   </div>
                 </div>
               )}
-              {!sending && completedStreaming && (
+              {!sending && !activity && !isStreaming && completedStreaming && (
                 <div className="flex justify-start">
                   <div className="max-w-[80%]">
                     <StreamingPanel liveText="" completedText={completedStreaming} isStreaming={false} />

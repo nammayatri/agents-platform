@@ -127,9 +127,9 @@ class SubtaskLifecycle:
             )
             await coord._post_system_message(
                 f"**Review chain capped at {MAX_REVIEW_ROUNDS} rounds.** "
-                "Creating merge sub-task with current state."
+                "Creating PR sub-task with current state."
             )
-            await self.create_merge_subtask(st, chain_id)
+            await self.create_pr_creator_subtask(st, chain_id)
             return
 
         if role == "coder":
@@ -310,6 +310,7 @@ class SubtaskLifecycle:
                 desc_parts.append("\n## Files Changed\n" + "\n".join(f"- {f}" for f in files_changed))
 
         # Capture git diff from workspace
+        has_diff = False
         if workspace_path:
             try:
                 repo_dir = os.path.join(workspace_path, "repo")
@@ -332,6 +333,8 @@ class SubtaskLifecycle:
                     diff_stat = await _git(["diff", "--stat", "HEAD~1", "HEAD"])
                     diff_full = await _git(["diff", "HEAD~1", "HEAD"])
 
+                has_diff = bool(diff_stat or diff_full)
+
                 if diff_stat:
                     desc_parts.append(f"\n## Git Diff Summary\n```\n{diff_stat}\n```")
                 if diff_full:
@@ -341,8 +344,58 @@ class SubtaskLifecycle:
             except Exception:
                 logger.warning("[%s] Failed to capture git diff for reviewer", coord.todo_id, exc_info=True)
 
+        # Fail coder if no changes on disk — don't create a reviewer for empty work
+        has_files_from_output = bool(
+            coder_output.get("files_changed") if isinstance(coder_output, dict) else False
+        )
+        if workspace_path and not has_diff and not has_files_from_output:
+            logger.warning(
+                "[%s] No changes on disk for coder %s in chain %s — failing coder",
+                coord.todo_id, coder_st["id"], chain_id,
+            )
+            await coord.db.execute(
+                "UPDATE sub_tasks SET status = 'failed', output_result = $2 WHERE id = $1",
+                coder_st["id"],
+                json.dumps({"error": "No changes written to disk. The coder described changes but did not write any files."}),
+            )
+            await coord._post_system_message(
+                f"**Review loop:** Coder sub-task '{coder_st['title']}' failed — no changes found on disk. "
+                f"Creating retry coder."
+            )
+            # Create a retry coder with explicit instructions to write files
+            retry_desc = (
+                f"RETRY: The previous coder for '{coder_st['title']}' described changes but did not "
+                "write any files to disk. You MUST use the write_file tool to actually create or "
+                "modify files. After writing, verify your changes exist by using read_file.\n\n"
+                f"Original task:\n{coder_st.get('description', '')}"
+            )
+            row = await coord.db.fetchrow(
+                """
+                INSERT INTO sub_tasks (
+                    todo_id, title, description, agent_role,
+                    execution_order, depends_on, review_loop, review_chain_id, target_repo
+                )
+                VALUES ($1, $2, $3, 'coder', $4, $5, TRUE, $6, $7)
+                RETURNING id
+                """,
+                coord.todo_id,
+                f"Retry: {coder_st['title']}",
+                retry_desc,
+                (coder_st.get("execution_order") or 0) + 1,
+                [str(coder_st["id"])],
+                chain_id,
+                target_repo_json,
+            )
+            retry_id = str(row["id"])
+            logger.info("Created retry coder %s for chain %s (no disk changes)", retry_id, chain_id)
+            await self._propagate_dependencies(str(coder_st["id"]), [retry_id])
+            return
+
         desc_parts.append(
             "\n## Instructions\n"
+            "IMPORTANT: First verify that actual code changes exist. If the diff above is "
+            "empty or missing, you MUST reject with verdict 'needs_changes' and note that "
+            "no files were written to disk.\n\n"
             "Review the diff above carefully. For each issue found, specify the exact "
             "file path and line number.\n\n"
             "You MUST output a JSON verdict at the end of your response:\n"
@@ -587,7 +640,12 @@ class SubtaskLifecycle:
     # ------------------------------------------------------------------
 
     async def create_merge_subtask(self, approved_st: dict, chain_id) -> None:
-        """Create a merge_agent sub-task after reviewer approval."""
+        """Create a merge sub-task after reviewer approval.
+
+        Respects ``require_merge_approval`` project setting:
+        - True  → creates ``merge_observer`` (watch only, don't merge)
+        - False → creates ``merge_agent`` (auto-merge)
+        """
         coord = self._coord
         chain_tasks = await coord.db.fetch(
             "SELECT id FROM sub_tasks WHERE todo_id = $1 AND "
@@ -603,26 +661,48 @@ class SubtaskLifecycle:
         target_repo_json = approved_st.get("target_repo")
         if isinstance(target_repo_json, str):
             target_repo_json = json.loads(target_repo_json)
+
+        # Check merge policy
+        todo = await coord._load_todo()
+        proj = await coord.db.fetchrow(
+            "SELECT settings_json FROM projects WHERE id = $1",
+            todo["project_id"],
+        )
+        merge_settings = (proj or {}).get("settings_json") or {}
+        if isinstance(merge_settings, str):
+            merge_settings = json.loads(merge_settings)
+        require_merge_approval = merge_settings.get("require_merge_approval", False)
+
+        if require_merge_approval:
+            role = "merge_observer"
+            title = "Watch for PR merge"
+            description = "Monitor the PR until it is merged externally. Do not merge — only observe."
+        else:
+            role = "merge_agent"
+            title = "Merge PR for review chain"
+            description = "Merge the approved PR. Check CI status, merge, and run post-merge builds if configured."
+
         row = await coord.db.fetchrow(
             """
             INSERT INTO sub_tasks (
                 todo_id, title, description, agent_role,
                 execution_order, depends_on, review_chain_id, target_repo
             )
-            VALUES ($1, $2, $3, 'merge_agent', $4, $5, $6, $7)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
             RETURNING id
             """,
             coord.todo_id,
-            "Merge PR for review chain",
-            "Merge the approved PR. Check CI status, merge, and run post-merge builds if configured.",
+            title,
+            description,
+            role,
             (approved_st.get("execution_order") or 0) + 1,
             depends_on,
             chain_id,
             target_repo_json,
         )
-        logger.info("Created merge_agent sub-task %s for chain %s (depends on %d tasks)", row["id"], chain_id, len(depends_on))
+        logger.info("Created %s sub-task %s for chain %s (depends on %d tasks)", role, row["id"], chain_id, len(depends_on))
         await coord._post_system_message(
-            "**Review loop:** Reviewer approved. Created merge sub-task."
+            f"**Review loop:** Reviewer approved. Created {'merge observer' if require_merge_approval else 'merge'} sub-task."
         )
 
     async def create_pr_creator_subtask(self, approved_st: dict, chain_id=None) -> None:
