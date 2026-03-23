@@ -1252,6 +1252,53 @@ export default function TodoDetailPage() {
                           )
                         })()}
 
+                        {/* Command outputs from execution events */}
+                        {(() => {
+                          const cmdEvents = (st.execution_events || []).filter(
+                            (e) => e.name === 'run_command' && (e.type === 'tool_result' || e.type === 'tool_start')
+                          )
+                          // Pair tool_start + tool_result for each command
+                          const cmds: Array<{ command?: string; output?: string; error?: boolean; ts?: number }> = []
+                          for (const ev of cmdEvents) {
+                            if (ev.type === 'tool_start') {
+                              cmds.push({ command: ev.command || ev.args_summary, ts: ev.ts })
+                            } else if (ev.type === 'tool_result') {
+                              // Try to attach to the last command without output
+                              const last = cmds.length > 0 ? cmds[cmds.length - 1] : null
+                              if (last && !last.output) {
+                                last.output = ev.result_preview
+                                last.error = ev.error
+                              } else {
+                                cmds.push({ command: ev.command || ev.args_summary, output: ev.result_preview, error: ev.error, ts: ev.ts })
+                              }
+                            }
+                          }
+                          if (cmds.length === 0) return null
+                          return (
+                            <details>
+                              <summary className="text-[10px] text-gray-600 uppercase tracking-wider cursor-pointer hover:text-gray-500">
+                                Command Outputs ({cmds.length})
+                              </summary>
+                              <div className="mt-1.5 max-h-72 overflow-y-auto space-y-1.5">
+                                {cmds.map((cmd, ci) => (
+                                  <div key={ci} className="bg-gray-950 rounded border border-gray-800/50 overflow-hidden">
+                                    <div className={`px-2.5 py-1.5 text-[11px] font-mono flex items-start gap-1.5 ${cmd.error ? 'text-red-400/80' : 'text-cyan-400/80'}`}>
+                                      <span className="text-gray-600 select-none shrink-0">$</span>
+                                      <span className="break-all">{cmd.command || 'run_command'}</span>
+                                    </div>
+                                    {cmd.output && (
+                                      <pre className={`px-2.5 py-1.5 text-[11px] font-mono whitespace-pre-wrap leading-relaxed border-t border-gray-800/50 max-h-40 overflow-y-auto ${cmd.error ? 'text-red-300/50' : 'text-gray-500'}`}>
+                                        {cmd.output.slice(0, 3000)}
+                                        {cmd.output.length > 3000 && '\n... truncated ...'}
+                                      </pre>
+                                    )}
+                                  </div>
+                                ))}
+                              </div>
+                            </details>
+                          )
+                        })()}
+
                         {/* Raw LLM content (truncated, collapsible) */}
                         {st.output_result?.raw_content && (
                           <details>
