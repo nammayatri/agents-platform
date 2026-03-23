@@ -376,11 +376,11 @@ async def send_session_message(
         }
     except Exception as e:
         logger.error("Project chat error: %s", e)
-        # Update placeholder with the error instead of leaving it as "generating"
+        # Remove the placeholder so it doesn't linger as "generating"
         if placeholder_id:
             await db.execute(
-                "UPDATE project_chat_messages SET content = $2, metadata_json = $3, updated_at = NOW() WHERE id = $1",
-                placeholder_id, f"Error: {str(e)}", json.dumps({"status": "error"}),
+                "DELETE FROM project_chat_messages WHERE id = $1",
+                placeholder_id,
             )
         err_msg = await db.fetchrow(
             """
@@ -680,8 +680,8 @@ async def delete_session_message(
     )
     if not msg:
         raise HTTPException(status_code=404, detail="Message not found")
-    if str(msg["user_id"]) != str(user["id"]) and user["role"] != "admin":
-        raise HTTPException(status_code=403)
+    # Any project member can remove messages from context
+    await check_project_access(db, project_id, user)
 
     metadata = safe_json(msg.get("metadata_json"))
     task_id = metadata.get("task_id")

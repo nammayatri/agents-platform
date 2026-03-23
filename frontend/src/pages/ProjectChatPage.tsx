@@ -1,6 +1,6 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useRef, useState, useCallback } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
-import { Plus, Trash2, PanelLeft, ArrowLeft, Bot, Send, Syringe, ChevronDown, ChevronRight, Loader2, Link2, Users } from 'lucide-react'
+import { Plus, Trash2, PanelLeft, ArrowLeft, Bot, Send, Syringe, ChevronDown, ChevronRight, Loader2, Link2, Users, X } from 'lucide-react'
 import { projectChat, projects as projectsApi, providers as providersApi } from '../services/api'
 import PlanReviewCard from '../components/chat/PlanReviewCard'
 import ReviewFeedbackCard from '../components/chat/ReviewFeedbackCard'
@@ -104,6 +104,59 @@ function ExecutionDetails({ execution }: { execution: ChatExecutionInfo }) {
         </div>
       )}
     </div>
+  )
+}
+
+/** Hold-to-delete button: hold for 1s to remove a message from the chat/LLM context. */
+function HoldToDeleteButton({ onDelete }: { onDelete: () => void }) {
+  const [holding, setHolding] = useState(false)
+  const [progress, setProgress] = useState(0)
+  const timerRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  const startRef = useRef(0)
+
+  const start = useCallback(() => {
+    setHolding(true)
+    setProgress(0)
+    startRef.current = Date.now()
+    timerRef.current = setInterval(() => {
+      const elapsed = Date.now() - startRef.current
+      const pct = Math.min(elapsed / 1000, 1)
+      setProgress(pct)
+      if (pct >= 1) {
+        cancel()
+        onDelete()
+      }
+    }, 30)
+  }, [onDelete])
+
+  const cancel = useCallback(() => {
+    setHolding(false)
+    setProgress(0)
+    if (timerRef.current) {
+      clearInterval(timerRef.current)
+      timerRef.current = null
+    }
+  }, [])
+
+  useEffect(() => () => { if (timerRef.current) clearInterval(timerRef.current) }, [])
+
+  return (
+    <button
+      onPointerDown={start}
+      onPointerUp={cancel}
+      onPointerLeave={cancel}
+      className={`relative w-5 h-5 rounded-full flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity ${holding ? 'bg-red-500/20' : 'hover:bg-gray-800'}`}
+      title="Hold to remove from context"
+    >
+      <X className={`w-3 h-3 ${holding ? 'text-red-400' : 'text-gray-600 hover:text-gray-400'}`} />
+      {holding && (
+        <svg className="absolute inset-0 w-5 h-5 -rotate-90" viewBox="0 0 20 20">
+          <circle cx="10" cy="10" r="8" fill="none" stroke="currentColor" strokeWidth="2" className="text-red-500/40"
+            strokeDasharray={`${progress * 50.3} 50.3`}
+          />
+        </svg>
+      )}
+    </button>
   )
 }
 
@@ -278,6 +331,10 @@ export default function ProjectChatPage() {
       created_at: incomingMessage.created_at || new Date().toISOString(),
     }
     setMessages((prev) => {
+      // Skip if this message ID already exists (avoid duplicate from HTTP + WebSocket)
+      if (msg.id && prev.some((m) => m.id === msg.id)) {
+        return prev
+      }
       // Replace any "generating" placeholder with the real assistant message
       const hasPlaceholder = prev.some((m) => {
         const meta = parseMeta(m)
@@ -711,7 +768,7 @@ export default function ProjectChatPage() {
   }
 
   const handleDeleteMessage = async (msgId: string) => {
-    if (!projectId || !confirm('Remove this message?')) return
+    if (!projectId) return
     try {
       if (activeSessionId) {
         await projectChat.deleteSessionMessage(projectId, activeSessionId, msgId)
@@ -1067,8 +1124,14 @@ export default function ProjectChatPage() {
                 return (
                 <div
                   key={msg.id}
-                  className={`flex ${msg.role === 'user' ? (isOtherUserMsg ? 'justify-start gap-2.5' : 'justify-end') : 'justify-start gap-2.5'} animate-fade-in`}
+                  className={`group flex items-start ${msg.role === 'user' ? (isOtherUserMsg ? 'justify-start gap-2.5' : 'justify-end') : 'justify-start gap-2.5'} animate-fade-in`}
                 >
+                  {/* Hold-to-delete button (left side for own user messages) */}
+                  {msg.role === 'user' && !isOtherUserMsg && !msg.id.startsWith('temp-') && (
+                    <div className="shrink-0 mt-2">
+                      <HoldToDeleteButton onDelete={() => handleDeleteMessage(msg.id)} />
+                    </div>
+                  )}
                   {msg.role === 'assistant' && (
                     <div className="w-6 h-6 rounded-full bg-indigo-500/20 flex items-center justify-center shrink-0 mt-1">
                       <Bot className="w-3.5 h-3.5 text-indigo-400" />
@@ -1502,6 +1565,12 @@ export default function ProjectChatPage() {
                       <div className="whitespace-pre-wrap">{msg.content}</div>
                     )}
                   </div>
+                  {/* Hold-to-delete button (right side for assistant/system/other-user messages) */}
+                  {(msg.role !== 'user' || isOtherUserMsg) && !msg.id.startsWith('temp-') && !msg.id.startsWith('error-') && !msg.id.startsWith('ws-') && (
+                    <div className="shrink-0 mt-2">
+                      <HoldToDeleteButton onDelete={() => handleDeleteMessage(msg.id)} />
+                    </div>
+                  )}
                 </div>
               )})}
               {(sending || activity || isStreaming) && (
