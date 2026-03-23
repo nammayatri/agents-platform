@@ -853,17 +853,20 @@ class GitProviderUpdate(BaseModel):
 
 
 def _sanitize_git_provider(row: dict) -> dict:
-    """Remove encrypted token, add has_token indicator."""
+    """Remove encrypted token, add has_token and is_shared indicators."""
     result = dict(row)
     has_token = bool(result.pop("token_enc", None))
     result["has_token"] = has_token
+    result["is_shared"] = result.get("owner_id") is None
     return result
 
 
 @router.get("/git-providers")
 async def list_git_providers(user: CurrentUser, db: DB):
     rows = await db.fetch(
-        "SELECT * FROM git_provider_configs WHERE owner_id = $1 ORDER BY created_at DESC",
+        "SELECT * FROM git_provider_configs "
+        "WHERE owner_id = $1 OR owner_id IS NULL "
+        "ORDER BY owner_id NULLS FIRST, created_at DESC",
         user["id"],
     )
     return [_sanitize_git_provider(dict(r)) for r in rows]
@@ -871,13 +874,14 @@ async def list_git_providers(user: CurrentUser, db: DB):
 
 @router.post("/git-providers", status_code=status.HTTP_201_CREATED)
 async def create_git_provider(body: GitProviderInput, user: CurrentUser, db: DB):
+    if user["role"] != "admin":
+        raise HTTPException(status_code=403, detail="Only admins can manage git providers")
     token_enc = encrypt(body.token) if body.token else None
     row = await db.fetchrow(
         """
         INSERT INTO git_provider_configs (owner_id, provider_type, display_name, api_base_url, token_enc)
-        VALUES ($1, $2, $3, $4, $5) RETURNING *
+        VALUES (NULL, $1, $2, $3, $4) RETURNING *
         """,
-        user["id"],
         body.provider_type,
         body.display_name,
         body.api_base_url,
@@ -888,11 +892,11 @@ async def create_git_provider(body: GitProviderInput, user: CurrentUser, db: DB)
 
 @router.put("/git-providers/{gp_id}")
 async def update_git_provider(gp_id: str, body: GitProviderUpdate, user: CurrentUser, db: DB):
+    if user["role"] != "admin":
+        raise HTTPException(status_code=403, detail="Only admins can manage git providers")
     existing = await db.fetchrow("SELECT * FROM git_provider_configs WHERE id = $1", gp_id)
     if not existing:
         raise HTTPException(status_code=404, detail="Git provider not found")
-    if str(existing["owner_id"]) != str(user["id"]):
-        raise HTTPException(status_code=403, detail="Access denied")
 
     updates = {k: v for k, v in body.model_dump().items() if v is not None}
     if not updates:
@@ -929,8 +933,6 @@ async def test_git_provider(gp_id: str, user: CurrentUser, db: DB):
     row = await db.fetchrow("SELECT * FROM git_provider_configs WHERE id = $1", gp_id)
     if not row:
         raise HTTPException(status_code=404, detail="Git provider not found")
-    if str(row["owner_id"]) != str(user["id"]):
-        raise HTTPException(status_code=403, detail="Access denied")
 
     token = decrypt(row["token_enc"]) if row.get("token_enc") else None
     if not token:
@@ -1006,13 +1008,13 @@ async def test_git_provider(gp_id: str, user: CurrentUser, db: DB):
 
 @router.delete("/git-providers/{gp_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_git_provider(gp_id: str, user: CurrentUser, db: DB):
+    if user["role"] != "admin":
+        raise HTTPException(status_code=403, detail="Only admins can manage git providers")
     existing = await db.fetchrow(
-        "SELECT owner_id FROM git_provider_configs WHERE id = $1", gp_id
+        "SELECT id FROM git_provider_configs WHERE id = $1", gp_id
     )
     if not existing:
         raise HTTPException(status_code=404, detail="Git provider not found")
-    if str(existing["owner_id"]) != str(user["id"]):
-        raise HTTPException(status_code=403, detail="Access denied")
     await db.execute("DELETE FROM git_provider_configs WHERE id = $1", gp_id)
 
 
@@ -1025,7 +1027,9 @@ async def list_all_repos(user: CurrentUser, db: DB):
     import httpx
 
     rows = await db.fetch(
-        "SELECT * FROM git_provider_configs WHERE owner_id = $1 AND is_active = TRUE ORDER BY created_at",
+        "SELECT * FROM git_provider_configs "
+        "WHERE (owner_id = $1 OR owner_id IS NULL) AND is_active = TRUE "
+        "ORDER BY created_at",
         user["id"],
     )
 

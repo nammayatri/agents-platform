@@ -334,12 +334,13 @@ export interface ProjectEnablement {
 
 export interface GitProviderConfig {
   id: string
-  owner_id: string
+  owner_id: string | null
   provider_type: GitProviderType
   display_name: string
   api_base_url?: string
   has_token: boolean
   is_active: boolean
+  is_shared?: boolean
   created_at: string
   updated_at: string
 }
