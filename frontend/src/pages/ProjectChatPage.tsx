@@ -539,6 +539,8 @@ export default function ProjectChatPage() {
     try {
       await projectChat.sessions.delete(projectId, sessionId)
       deletedSessionIdsRef.current.add(sessionId)
+      // Clean up sessionStorage for this session
+      try { sessionStorage.removeItem(`chat_ws:${sessionId}`) } catch {}
       setSessions((prev) => {
         const remaining = prev.filter((s) => s.id !== sessionId)
         if (activeSessionIdRef.current === sessionId && remaining.length > 0) {

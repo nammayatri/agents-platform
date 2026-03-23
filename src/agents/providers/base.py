@@ -174,7 +174,7 @@ def _compact_messages_for_overflow(
             summary_parts.append(f"Response: {m.content[:150]}")
 
     # Keep the last 20 summary entries to stay reasonably compact
-    summary = "Previous exploration summary (compacted):\n" + "\n".join(summary_parts[-20:])
+    summary = "Previous exploration summary (compacted — re-read files or re-run tools if you need details):\n" + "\n".join(summary_parts[-20:])
     return [*head, LLMMessage(role="user", content=summary), *tail]
 
 
@@ -246,7 +246,7 @@ async def _compact_messages_with_llm(
         compacted = list(head)
         compacted.append(LLMMessage(
             role="user",
-            content=f"[CONTEXT SUMMARY — earlier tool interactions compacted]\n{summary}",
+            content=f"[CONTEXT COMPACTED — earlier tool interactions summarized. Re-read files if you need exact content.]\n{summary}",
         ))
         compacted.extend(tail)
 
@@ -534,18 +534,35 @@ MAX_TOOL_RESULT_IN_CONTEXT = 15_000
 
 
 def _truncate_tool_result(text: str) -> str:
-    """Truncate a tool result to keep message memory bounded."""
+    """Truncate a tool result but tell the LLM what was cut and how to get more."""
     if len(text) <= MAX_TOOL_RESULT_IN_CONTEXT:
         return text
-    return text[:MAX_TOOL_RESULT_IN_CONTEXT] + "\n... (truncated, showing first 15K chars)"
+    total = len(text)
+    lines = text.split("\n")
+    kept: list[str] = []
+    char_count = 0
+    for line in lines:
+        if char_count + len(line) + 1 > MAX_TOOL_RESULT_IN_CONTEXT:
+            break
+        kept.append(line)
+        char_count += len(line) + 1
+    remaining_lines = len(lines) - len(kept)
+    result = "\n".join(kept)
+    result += (
+        f"\n\n... (showing {len(kept)} of {len(lines)} lines, {MAX_TOOL_RESULT_IN_CONTEXT} of {total} chars. "
+        f"{remaining_lines} lines not shown. "
+        f"Re-read with offset={len(kept)} if you need the rest.)"
+    )
+    return result
 
 
 def _trim_old_tool_results(messages: list[LLMMessage], keep_full: int = 6) -> None:
     """Trim tool results in older messages to short previews.
 
     Keeps the most recent ``keep_full`` tool-result messages at full size.
-    Older ones are trimmed to 300 chars per result, freeing memory from
-    file contents / search outputs that the LLM no longer needs in detail.
+    Older ones are trimmed to 400 chars per result with a hint to re-request,
+    freeing memory from file contents / search outputs the LLM no longer
+    needs in detail.
     """
     tr_indices = [i for i, m in enumerate(messages) if m.tool_results]
     if len(tr_indices) <= keep_full:
@@ -553,8 +570,14 @@ def _trim_old_tool_results(messages: list[LLMMessage], keep_full: int = 6) -> No
     for idx in tr_indices[:-keep_full]:
         for tr in messages[idx].tool_results:
             content = tr.get("content", "")
-            if len(content) > 300:
-                tr["content"] = content[:300] + "\n... (trimmed)"
+            if len(content) > 500:
+                preview = content[:400]
+                total = len(content)
+                tr["content"] = (
+                    f"{preview}\n\n"
+                    f"... (trimmed from {total} chars — this is an older result. "
+                    f"Re-read the file or re-run the tool if you need the full content.)"
+                )
 
 
 async def _execute_tools_parallel(
@@ -1115,6 +1138,11 @@ async def run_tool_loop(
         "total_tool_calls": total_tool_calls,
         "nudged": nudged,
     }
+
+    # Free the (potentially large) conversation messages accumulated during the
+    # tool loop.  Callers only need the returned content + response.
+    messages.clear()
+    content_parts.clear()
 
     return content, response
 

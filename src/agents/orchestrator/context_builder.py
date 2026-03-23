@@ -264,7 +264,7 @@ class ContextBuilder:
                 out = r.get("output_result", {})
                 summary = out.get("approach", "") or out.get("summary", "") if isinstance(out, dict) else ""
                 prev_items.append(
-                    f"- [{r.get('agent_role', '?')}] {r.get('title', '?')}: {summary[:300]}"
+                    f"- [{r.get('agent_role', '?')}] {r.get('title', '?')}: {summary[:600]}"
                 )
             prev_context = "\n\nCompleted sub-tasks:\n" + "\n".join(prev_items)
 
@@ -587,7 +587,9 @@ class ContextBuilder:
                         learnings_block += " \u2014 " + "; ".join(entry["learnings"])
                     learnings_block += "\n"
                     if entry.get("error_output"):
-                        err = entry["error_output"][:500]
+                        err = entry["error_output"]
+                        if len(err) > 1500:
+                            err = err[:1500] + f"\n... ({len(entry['error_output']) - 1500} more chars — run the failing command to see full output)"
                         learnings_block += f"  Error: {err}\n"
                 system += learnings_block
             except Exception:
@@ -601,7 +603,9 @@ class ContextBuilder:
                         learnings_block += " \u2014 " + "; ".join(entry["learnings"])
                     learnings_block += "\n"
                     if entry.get("error_output"):
-                        err = entry["error_output"][:500]
+                        err = entry["error_output"]
+                        if len(err) > 1500:
+                            err = err[:1500] + f"\n... ({len(entry['error_output']) - 1500} more chars — run the failing command to see full output)"
                         learnings_block += f"  Error: {err}\n"
                 system += learnings_block
 
@@ -613,7 +617,7 @@ class ContextBuilder:
                 out = r.get("output_result", {})
                 summary = out.get("approach", "") or out.get("summary", "") if isinstance(out, dict) else ""
                 prev_items.append(
-                    f"- [{r.get('agent_role', '?')}] {r.get('title', '?')}: {summary[:300]}"
+                    f"- [{r.get('agent_role', '?')}] {r.get('title', '?')}: {summary[:600]}"
                 )
             prev_context = "\n\nCompleted sub-tasks:\n" + "\n".join(prev_items)
 

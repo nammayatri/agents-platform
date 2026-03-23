@@ -55,7 +55,7 @@ async def handle_reviewer_completion(
                 "task_id": ctx.todo_id,
                 "subtask_title": sub_task.get("title", ""),
                 "verdict": "approved",
-                "feedback": output.get("content", "")[:500] if isinstance(output, dict) else "",
+                "feedback": output.get("content", "")[:1500] if isinstance(output, dict) else "",
                 "summary": output.get("summary", "") if isinstance(output, dict) else "",
             },
         )
@@ -90,13 +90,13 @@ async def handle_reviewer_completion(
     await ctx.post_system_message(
         f"**Code review: Changes requested**\n\n"
         + (f"{review_summary}\n\n" if review_summary else "")
-        + (issues_text if issues_text else reviewer_feedback[:1500]),
+        + (issues_text if issues_text else reviewer_feedback[:3000]),
         metadata={
             "action": "code_review_verdict",
             "task_id": ctx.todo_id,
             "subtask_title": sub_task.get("title", ""),
             "verdict": "needs_changes",
-            "feedback": reviewer_feedback[:2000],
+            "feedback": reviewer_feedback[:4000],
             "issues": structured_issues[:20],
             "summary": review_summary,
         },

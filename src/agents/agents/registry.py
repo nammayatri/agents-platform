@@ -51,11 +51,13 @@ _register_tool(BuiltinToolDef(
         "type": "object",
         "properties": {
             "path": {"type": "string", "description": "File path relative to repo root (use ../deps/{name}/path for dependency repos)"},
+            "offset": {"type": "integer", "description": "Start reading from this line number (0-based). Use to read remaining content after truncation."},
+            "limit": {"type": "integer", "description": "Max number of lines to return. Defaults to entire file."},
         },
         "required": ["path"],
     },
-    prompt_hint="Read a file's contents. Args: path (relative to repo root, or ../deps/{name}/path for deps)",
-    example='read_file(path="src/main.py")  # or read_file(path="../deps/auth-lib/src/index.ts")',
+    prompt_hint="Read a file's contents. Args: path, offset (optional, 0-based line), limit (optional, max lines). Use offset to read remaining content after truncation.",
+    example='read_file(path="src/main.py")  # or read_file(path="src/main.py", offset=200, limit=100)',
 ))
 
 _register_tool(BuiltinToolDef(
@@ -103,11 +105,13 @@ _register_tool(BuiltinToolDef(
             "pattern": {"type": "string", "description": "Search pattern (regex supported)"},
             "path": {"type": "string", "description": "Directory to search in, relative to repo root (empty for root, ../deps/{name}/ for deps)"},
             "file_glob": {"type": "string", "description": "File glob filter, e.g. '*.py', '*.ts' (optional)"},
+            "max_results": {"type": "integer", "description": "Max matching lines to return (default 200). Use with offset to paginate."},
+            "offset": {"type": "integer", "description": "Skip this many matching lines before returning results. Use to see more results after truncation."},
         },
         "required": ["pattern"],
     },
-    prompt_hint="Grep for a pattern across files. Args: pattern, path (optional, ../deps/{name}/ for deps), file_glob (optional)",
-    example='search_files(pattern="def handle_", file_glob="*.py")  # or search_files(pattern="export", path="../deps/shared-types/")',
+    prompt_hint="Grep for a pattern across files. Args: pattern, path (optional), file_glob (optional), max_results (optional, default 200), offset (optional, for pagination)",
+    example='search_files(pattern="def handle_", file_glob="*.py")  # or search_files(pattern="export", offset=200)',
 ))
 
 _register_tool(BuiltinToolDef(

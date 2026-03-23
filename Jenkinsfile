@@ -9,7 +9,7 @@ pipeline {
         AWS_REGION       = 'ap-south-1'
         ECR_REGISTRY     = '463356420488.dkr.ecr.ap-south-1.amazonaws.com'
         ECR_REPO         = 'agent-platform'
-        IMAGE_TAG        = "${env.GIT_COMMIT?.take(8) ?: 'latest'}"
+        IMAGE_TAG        = "${env.GIT_COMMIT?.take(8) ?: 'unknown'}"
     }
 
     stages {
@@ -36,7 +36,6 @@ pipeline {
                             docker build \
                               -f Dockerfile.backend \
                               -t $ECR_REGISTRY/$ECR_REPO:backend-$IMAGE_TAG \
-                              -t $ECR_REGISTRY/$ECR_REPO:backend-latest \
                               .
                         '''
                     }
@@ -47,7 +46,6 @@ pipeline {
                             docker build \
                               -f Dockerfile.frontend \
                               -t $ECR_REGISTRY/$ECR_REPO:frontend-$IMAGE_TAG \
-                              -t $ECR_REGISTRY/$ECR_REPO:frontend-latest \
                               .
                         '''
                     }
@@ -61,7 +59,6 @@ pipeline {
                     steps {
                         sh '''
                             docker push $ECR_REGISTRY/$ECR_REPO:backend-$IMAGE_TAG
-                            docker push $ECR_REGISTRY/$ECR_REPO:backend-latest
                         '''
                     }
                 }
@@ -69,7 +66,6 @@ pipeline {
                     steps {
                         sh '''
                             docker push $ECR_REGISTRY/$ECR_REPO:frontend-$IMAGE_TAG
-                            docker push $ECR_REGISTRY/$ECR_REPO:frontend-latest
                         '''
                     }
                 }
@@ -81,9 +77,7 @@ pipeline {
         always {
             sh '''
                 docker rmi $ECR_REGISTRY/$ECR_REPO:backend-$IMAGE_TAG || true
-                docker rmi $ECR_REGISTRY/$ECR_REPO:backend-latest || true
                 docker rmi $ECR_REGISTRY/$ECR_REPO:frontend-$IMAGE_TAG || true
-                docker rmi $ECR_REGISTRY/$ECR_REPO:frontend-latest || true
             '''
         }
         success {

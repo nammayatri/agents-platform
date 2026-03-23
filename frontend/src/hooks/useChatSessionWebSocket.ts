@@ -148,10 +148,13 @@ export function useChatSessionWebSocket(sessionId: string | null) {
         const data = JSON.parse(event.data)
         if (data.type === 'activity' && data.activity) {
           setActivity(data.activity)
-          // Append to activity log (dedup consecutive identical entries)
+          // Append to activity log (dedup consecutive identical entries, cap at 200)
           const log = activityLogRef.current
           if (log.length === 0 || log[log.length - 1] !== data.activity) {
-            const newLog = [...log, data.activity]
+            const MAX_LOG = 200
+            const newLog = log.length >= MAX_LOG
+              ? [...log.slice(log.length - MAX_LOG + 1), data.activity]
+              : [...log, data.activity]
             activityLogRef.current = newLog
             setActivityLog(newLog)
             persistState(boundSessionId, newLog, completedStreamingRef.current)
@@ -164,11 +167,16 @@ export function useChatSessionWebSocket(sessionId: string | null) {
           setActivity(null)
         } else if (data.type === 'token_done') {
           // Round complete: move live text to completed, clear live buffer
+          // Cap at ~100 KB to prevent unbounded memory growth
           if (streamingRef.current) {
+            const MAX_COMPLETED = 100_000
             const text = streamingRef.current
-            const newCompleted = completedStreamingRef.current
+            let newCompleted = completedStreamingRef.current
               ? completedStreamingRef.current + '\n' + text
               : text
+            if (newCompleted.length > MAX_COMPLETED) {
+              newCompleted = newCompleted.slice(newCompleted.length - MAX_COMPLETED)
+            }
             completedStreamingRef.current = newCompleted
             setCompletedStreaming(newCompleted)
           }
