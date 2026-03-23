@@ -147,6 +147,11 @@ export default function TodoDetailPage() {
       if (next.has(id)) next.delete(id); else next.add(id)
       return next
     })
+    setExpandedDetails((prev) => {
+      const next = new Set(prev)
+      if (next.has(id)) next.delete(id); else next.add(id)
+      return next
+    })
   }
 
   useEffect(() => {
@@ -854,14 +859,12 @@ export default function TodoDetailPage() {
                   <div key={st.id} className="bg-gray-900 rounded-lg border border-gray-800/50 overflow-hidden animate-fade-in">
                     {/* Sub-task header */}
                     <div
-                      className={`p-3 ${hasIterations ? 'cursor-pointer hover:bg-gray-800/30' : ''}`}
-                      onClick={() => hasIterations && toggleSubTask(st.id)}
+                      className="p-3 cursor-pointer hover:bg-gray-800/30"
+                      onClick={() => toggleSubTask(st.id)}
                     >
                       {/* Row 1: identity */}
                       <div className="flex items-center gap-2">
-                        {hasIterations && (
-                          <span className="text-gray-600 text-[11px] w-3 shrink-0">{isExpanded ? '\u25BC' : '\u25B6'}</span>
-                        )}
+                        <span className="text-gray-600 text-[11px] w-3 shrink-0">{isExpanded ? '\u25BC' : '\u25B6'}</span>
                         <span className={`px-1.5 py-0.5 rounded text-[11px] font-medium text-white ${SUBTASK_COLORS[st.status]}`}>
                           {st.status}
                         </span>

@@ -1181,7 +1181,7 @@ async def _execute_iterative(
                 await _append_progress_log(
                     ctx, job, iteration, "completed", iteration_log,
                 )
-                await _persist_execution_events(st_id=st_id, ctx=ctx, events=_accumulated_events)
+                await _persist_execution_events(subtask_id=st_id, ctx=ctx, events=_accumulated_events)
                 await ctx.report_progress(st_id, 100, f"Completed: {job['title']}")
                 return validated_output, response, dict(run)
 
@@ -1250,7 +1250,7 @@ async def _execute_iterative(
                 await _append_progress_log(
                     ctx, job, iteration, "completed_agent_signal", iteration_log,
                 )
-                await _persist_execution_events(st_id=st_id, ctx=ctx, events=_accumulated_events)
+                await _persist_execution_events(subtask_id=st_id, ctx=ctx, events=_accumulated_events)
                 await ctx.report_progress(st_id, 100, f"Completed: {job['title']}")
                 return validated_output, response, dict(run)
 
@@ -1307,7 +1307,7 @@ async def _execute_iterative(
     await _append_progress_log(
         ctx, job, max_iterations, "failed_max_iterations", iteration_log,
     )
-    await _persist_execution_events(st_id=st_id, ctx=ctx, events=_accumulated_events)
+    await _persist_execution_events(subtask_id=st_id, ctx=ctx, events=_accumulated_events)
     await ctx.transition_subtask(
         st_id, "failed",
         error_message=f"Max iterations ({max_iterations}) reached without passing quality checks",

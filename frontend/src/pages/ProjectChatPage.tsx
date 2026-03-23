@@ -107,8 +107,9 @@ function ExecutionDetails({ execution }: { execution: ChatExecutionInfo }) {
   )
 }
 
-/** Hold-to-delete button: hold for 1s to remove a message from the chat/LLM context. */
+/** Hold-to-delete button: hold for 600ms to remove a message from the chat/LLM context. */
 function HoldToDeleteButton({ onDelete }: { onDelete: () => void }) {
+  const HOLD_MS = 600
   const [holding, setHolding] = useState(false)
   const [progress, setProgress] = useState(0)
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null)
@@ -120,13 +121,13 @@ function HoldToDeleteButton({ onDelete }: { onDelete: () => void }) {
     startRef.current = Date.now()
     timerRef.current = setInterval(() => {
       const elapsed = Date.now() - startRef.current
-      const pct = Math.min(elapsed / 1000, 1)
+      const pct = Math.min(elapsed / HOLD_MS, 1)
       setProgress(pct)
       if (pct >= 1) {
         cancel()
         onDelete()
       }
-    }, 30)
+    }, 16)
   }, [onDelete])
 
   const cancel = useCallback(() => {
@@ -140,20 +141,35 @@ function HoldToDeleteButton({ onDelete }: { onDelete: () => void }) {
 
   useEffect(() => () => { if (timerRef.current) clearInterval(timerRef.current) }, [])
 
+  const r = 9
+  const circ = 2 * Math.PI * r
+
   return (
     <button
       onPointerDown={start}
       onPointerUp={cancel}
       onPointerLeave={cancel}
-      className={`relative w-5 h-5 rounded-full flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity ${holding ? 'bg-red-500/20' : 'hover:bg-gray-800'}`}
+      className={`relative w-5 h-5 rounded-full flex items-center justify-center select-none
+        opacity-0 group-hover:opacity-100 transition-all duration-200
+        ${holding
+          ? 'bg-red-500/15 scale-110'
+          : 'hover:bg-gray-800/80'
+        }`}
       title="Hold to remove from context"
     >
-      <X className={`w-3 h-3 ${holding ? 'text-red-400' : 'text-gray-600 hover:text-gray-400'}`} />
+      <X
+        className={`w-2.5 h-2.5 transition-colors duration-150
+          ${holding ? 'text-red-400' : 'text-gray-600 group-hover:text-gray-500'}`}
+        strokeWidth={2.5}
+      />
       {holding && (
-        <svg className="absolute inset-0 w-5 h-5 -rotate-90" viewBox="0 0 20 20">
-          <circle cx="10" cy="10" r="8" fill="none" stroke="currentColor" strokeWidth="2" className="text-red-500/40"
-            strokeDasharray={`${progress * 50.3} 50.3`}
-          />
+        <svg className="absolute inset-0 w-5 h-5 -rotate-90 pointer-events-none" viewBox="0 0 20 20">
+          <circle cx="10" cy="10" r={r} fill="none" stroke="currentColor" strokeWidth="1.5"
+            className="text-red-500/30" strokeDasharray={`${circ} ${circ}`} />
+          <circle cx="10" cy="10" r={r} fill="none" stroke="currentColor" strokeWidth="1.5"
+            className="text-red-400" strokeLinecap="round"
+            strokeDasharray={`${progress * circ} ${circ}`}
+            style={{ transition: 'stroke-dasharray 30ms linear' }} />
         </svg>
       )}
     </button>
@@ -164,10 +180,12 @@ function StreamingPanel({
   liveText,
   completedText,
   isStreaming,
+  activityLog = [],
 }: {
   liveText: string
   completedText: string
   isStreaming: boolean
+  activityLog?: string[]
 }) {
   const [expanded, setExpanded] = useState(false)
   const scrollRef = useRef<HTMLDivElement>(null)
@@ -188,13 +206,20 @@ function StreamingPanel({
     if (expanded && scrollRef.current) {
       scrollRef.current.scrollTop = scrollRef.current.scrollHeight
     }
-  }, [liveText, expanded])
+  }, [liveText, expanded, activityLog.length])
 
   const fullText = completedText && liveText
     ? completedText + '\n' + liveText
     : liveText || completedText
 
-  if (!fullText) return null
+  const hasContent = fullText || activityLog.length > 0
+  if (!hasContent) return null
+
+  // Summary label
+  const parts: string[] = []
+  if (activityLog.length > 0) parts.push(`${activityLog.length} step${activityLog.length !== 1 ? 's' : ''}`)
+  if (fullText) parts.push(`${fullText.length.toLocaleString()} chars`)
+  const label = isStreaming ? 'Streaming' : 'Thinking trace'
 
   return (
     <div className="mt-1.5 border border-gray-800/50 rounded-lg overflow-hidden bg-gray-950/50">
@@ -203,9 +228,7 @@ function StreamingPanel({
         className="w-full flex items-center gap-1.5 px-2.5 py-1.5 text-[11px] text-gray-600 hover:text-gray-400 transition-colors"
       >
         {expanded ? <ChevronDown className="w-3 h-3" /> : <ChevronRight className="w-3 h-3" />}
-        <span>
-          {isStreaming ? 'Streaming' : 'LLM output'} ({fullText.length.toLocaleString()} chars)
-        </span>
+        <span>{label} ({parts.join(' · ')})</span>
         {isStreaming && (
           <span className="w-1.5 h-1.5 rounded-full bg-indigo-400 animate-pulse" />
         )}
@@ -213,14 +236,26 @@ function StreamingPanel({
       {expanded && (
         <div
           ref={scrollRef}
-          className="max-h-32 overflow-y-auto px-2.5 py-2 border-t border-gray-800/50"
+          className="max-h-40 overflow-y-auto px-2.5 py-2 border-t border-gray-800/50 space-y-2"
         >
-          <pre className="text-[11px] text-gray-500 font-mono whitespace-pre-wrap leading-relaxed">
-            {fullText}
-            {isStreaming && (
-              <span className="inline-block w-1 h-3 bg-gray-600 animate-pulse ml-0.5 align-text-bottom rounded-sm" />
-            )}
-          </pre>
+          {activityLog.length > 0 && (
+            <div className="space-y-0.5">
+              {activityLog.map((entry, i) => (
+                <div key={i} className="flex items-start gap-1.5 text-[11px]">
+                  <span className="text-indigo-400/60 shrink-0 mt-px">›</span>
+                  <span className="text-gray-500">{entry}</span>
+                </div>
+              ))}
+            </div>
+          )}
+          {fullText && (
+            <pre className="text-[11px] text-gray-500 font-mono whitespace-pre-wrap leading-relaxed">
+              {fullText}
+              {isStreaming && (
+                <span className="inline-block w-1 h-3 bg-gray-600 animate-pulse ml-0.5 align-text-bottom rounded-sm" />
+              )}
+            </pre>
+          )}
         </div>
       )}
     </div>
@@ -265,7 +300,7 @@ export default function ProjectChatPage() {
   const messagesEnd = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLTextAreaElement>(null)
   const deletedSessionIdsRef = useRef<Set<string>>(new Set())
-  const { activity, streamingText, completedStreaming, isStreaming, clearActivity, resetStreaming, incomingMessage, clearIncomingMessage } = useChatSessionWebSocket(activeSessionId)
+  const { activity, activityLog, streamingText, completedStreaming, isStreaming, clearActivity, resetStreaming, incomingMessage, clearIncomingMessage } = useChatSessionWebSocket(activeSessionId)
   const [deleteDialog, setDeleteDialog] = useState<{
     sessionId: string
     sessionTitle: string
@@ -316,6 +351,23 @@ export default function ProjectChatPage() {
     messagesEnd.current?.scrollIntoView({ behavior: 'smooth' })
   }, [messages, isStreaming, completedStreaming])
 
+  // When live events start arriving (activity or streaming), drop any "generating"
+  // placeholder from the message list — the real-time indicators take over.
+  useEffect(() => {
+    if (!activity && !isStreaming) return
+    setMessages((prev) => {
+      const hasPlaceholder = prev.some((m) => {
+        const meta = parseMeta(m)
+        return m.role === 'assistant' && meta?.status === 'generating'
+      })
+      if (!hasPlaceholder) return prev
+      return prev.filter((m) => {
+        const meta = parseMeta(m)
+        return !(m.role === 'assistant' && meta?.status === 'generating')
+      })
+    })
+  }, [activity, isStreaming])
+
   // Handle incoming chat messages from the coordinator via WebSocket
   // (e.g., task_plan_ready after re-planning, completed assistant responses after page refresh)
   useEffect(() => {
@@ -333,7 +385,11 @@ export default function ProjectChatPage() {
     setMessages((prev) => {
       // Skip if this message ID already exists (avoid duplicate from HTTP + WebSocket)
       if (msg.id && prev.some((m) => m.id === msg.id)) {
-        return prev
+        // But still remove any stale placeholder
+        return prev.filter((m) => {
+          const meta = parseMeta(m)
+          return !(m.role === 'assistant' && meta?.status === 'generating')
+        })
       }
       // Replace any "generating" placeholder with the real assistant message
       const hasPlaceholder = prev.some((m) => {
@@ -415,6 +471,8 @@ export default function ProjectChatPage() {
   }
 
   function selectSession(sessionId: string | null) {
+    clearActivity()
+    resetStreaming()
     setActiveSessionId(sessionId)
     setMessages([])
     if (sessionId) {
@@ -575,7 +633,16 @@ export default function ProjectChatPage() {
         : result.assistant_message
 
       setMessages((prev) => [
-        ...prev.filter((m) => m.id !== tempUserMsg.id),
+        ...prev.filter((m) => {
+          // Remove temp user message
+          if (m.id === tempUserMsg.id) return false
+          // Remove any generating placeholder (backend already updated it)
+          const meta = parseMeta(m)
+          if (m.role === 'assistant' && meta?.status === 'generating') return false
+          // Remove duplicate if assistant message ID already exists
+          if (m.id === assistantMsg.id) return false
+          return true
+        }),
         result.user_message,
         assistantMsg,
       ])
@@ -1591,14 +1658,14 @@ export default function ProjectChatPage() {
                         </span>
                       )}
                     </div>
-                    <StreamingPanel liveText={streamingText} completedText={completedStreaming} isStreaming={isStreaming} />
+                    <StreamingPanel liveText={streamingText} completedText={completedStreaming} isStreaming={isStreaming} activityLog={activityLog} />
                   </div>
                 </div>
               )}
-              {!sending && !activity && !isStreaming && completedStreaming && (
+              {!sending && !activity && !isStreaming && (completedStreaming || activityLog.length > 0) && (
                 <div className="flex justify-start">
                   <div className="max-w-[80%]">
-                    <StreamingPanel liveText="" completedText={completedStreaming} isStreaming={false} />
+                    <StreamingPanel liveText="" completedText={completedStreaming} isStreaming={false} activityLog={activityLog} />
                   </div>
                 </div>
               )}
