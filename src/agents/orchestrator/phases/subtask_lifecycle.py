@@ -639,71 +639,18 @@ class SubtaskLifecycle:
     # Merge / PR subtask creation
     # ------------------------------------------------------------------
 
-    async def create_merge_subtask(self, approved_st: dict, chain_id) -> None:
-        """Create a merge sub-task after reviewer approval.
-
-        Respects ``require_merge_approval`` project setting:
-        - True  → creates ``merge_observer`` (watch only, don't merge)
-        - False → creates ``merge_agent`` (auto-merge)
-        """
+    async def _requires_merge_approval(self) -> bool:
+        """Check project setting: should we skip auto-merge?"""
         coord = self._coord
-        chain_tasks = await coord.db.fetch(
-            "SELECT id FROM sub_tasks WHERE todo_id = $1 AND "
-            "(review_chain_id = $2 OR id = $2)",
-            coord.todo_id,
-            chain_id,
-        )
-        depends_on = [str(t["id"]) for t in chain_tasks]
-        approved_id = str(approved_st["id"])
-        if approved_id not in depends_on:
-            depends_on.append(approved_id)
-
-        target_repo_json = approved_st.get("target_repo")
-        if isinstance(target_repo_json, str):
-            target_repo_json = json.loads(target_repo_json)
-
-        # Check merge policy
         todo = await coord._load_todo()
         proj = await coord.db.fetchrow(
             "SELECT settings_json FROM projects WHERE id = $1",
             todo["project_id"],
         )
-        merge_settings = (proj or {}).get("settings_json") or {}
-        if isinstance(merge_settings, str):
-            merge_settings = json.loads(merge_settings)
-        require_merge_approval = merge_settings.get("require_merge_approval", False)
-
-        if require_merge_approval:
-            role = "merge_observer"
-            title = "Watch for PR merge"
-            description = "Monitor the PR until it is merged externally. Do not merge — only observe."
-        else:
-            role = "merge_agent"
-            title = "Merge PR for review chain"
-            description = "Merge the approved PR. Check CI status, merge, and run post-merge builds if configured."
-
-        row = await coord.db.fetchrow(
-            """
-            INSERT INTO sub_tasks (
-                todo_id, title, description, agent_role,
-                execution_order, depends_on, review_chain_id, target_repo
-            )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-            RETURNING id
-            """,
-            coord.todo_id,
-            title,
-            description,
-            role,
-            (approved_st.get("execution_order") or 0) + 1,
-            depends_on,
-            chain_id,
-            target_repo_json,
-        )
-        logger.info("Created %s sub-task %s for chain %s (depends on %d tasks)", role, row["id"], chain_id, len(depends_on))
-        await coord._post_system_message(
-            f"**Review loop:** Reviewer approved. Created {'merge observer' if require_merge_approval else 'merge'} sub-task."
-        )
+        settings = (proj or {}).get("settings_json") or {}
+        if isinstance(settings, str):
+            settings = json.loads(settings)
+        return bool(settings.get("require_merge_approval", False))
 
     async def create_pr_creator_subtask(self, approved_st: dict, chain_id=None) -> None:
         """Create a pr_creator sub-task after reviewer approval."""
@@ -1397,9 +1344,6 @@ class SubtaskLifecycle:
 
             pr_url = pr_info.get("url", "N/A")
             await coord._report_progress(st_id, 80, f"PR created: {pr_url}")
-            await coord._post_system_message(
-                f"**PR created:** {pr_url}. Creating merge sub-task."
-            )
 
             # Store head_sha for release pipeline
             pr_number = pr_info.get("number")
@@ -1424,7 +1368,19 @@ class SubtaskLifecycle:
                 except Exception as e:
                     logger.warning("[%s] Failed to store head_sha for PR: %s", coord.todo_id, e)
 
-            # Decide: merge_agent (auto-merge) or merge_observer (watch only)
+            if await self._requires_merge_approval():
+                # No merge subtask — user merges the PR manually
+                await coord._post_system_message(
+                    f"**PR created:** {pr_url}\n\n"
+                    "Auto-merge is disabled. Review and merge the PR manually when ready."
+                )
+                await coord._transition_subtask(
+                    st_id, "completed",
+                    progress_pct=100, progress_message=f"PR: {pr_url}",
+                )
+                return
+
+            # Auto-merge: create merge_agent subtask
             all_coder_ids = [str(sub_task["id"])]
             if coder_st:
                 all_coder_ids.append(str(coder_st["id"]))
@@ -1438,56 +1394,26 @@ class SubtaskLifecycle:
                 coord.todo_id,
             )
 
-            # Check merge policy
-            todo_for_merge = await coord._load_todo()
-            proj_for_merge = await coord.db.fetchrow(
-                "SELECT settings_json FROM projects WHERE id = $1",
-                todo_for_merge["project_id"],
+            await coord._post_system_message(
+                f"**PR created:** {pr_url}. Creating merge sub-task."
             )
-            merge_settings = (proj_for_merge or {}).get("settings_json") or {}
-            if isinstance(merge_settings, str):
-                merge_settings = json.loads(merge_settings)
-            require_merge_approval = merge_settings.get("require_merge_approval", False)
 
-            if require_merge_approval:
-                # Merge not allowed — create observer that watches for external merge
-                merge_row = await coord.db.fetchrow(
-                    """
-                    INSERT INTO sub_tasks (
-                        todo_id, title, description, agent_role,
-                        execution_order, depends_on, target_repo
-                    )
-                    VALUES ($1, $2, $3, 'merge_observer', $4, $5, $6)
-                    RETURNING id
-                    """,
-                    coord.todo_id,
-                    "Watch for PR merge",
-                    "Monitor the PR until it is merged externally. Do not merge — only observe.",
-                    max_order + 1,
-                    all_coder_ids,
-                    target_repo_json,
+            merge_row = await coord.db.fetchrow(
+                """
+                INSERT INTO sub_tasks (
+                    todo_id, title, description, agent_role,
+                    execution_order, depends_on, target_repo
                 )
-                await coord._post_system_message(
-                    f"**PR created:** {pr_url}. Watching for external merge (auto-merge disabled)."
-                )
-            else:
-                # Auto-merge allowed — create merge agent
-                merge_row = await coord.db.fetchrow(
-                    """
-                    INSERT INTO sub_tasks (
-                        todo_id, title, description, agent_role,
-                        execution_order, depends_on, target_repo
-                    )
-                    VALUES ($1, $2, $3, 'merge_agent', $4, $5, $6)
-                    RETURNING id
-                    """,
-                    coord.todo_id,
-                    "Merge PR",
-                    "Merge the PR. Check CI status, merge, and run post-merge builds if configured.",
-                    max_order + 1,
-                    all_coder_ids,
-                    target_repo_json,
-                )
+                VALUES ($1, $2, $3, 'merge_agent', $4, $5, $6)
+                RETURNING id
+                """,
+                coord.todo_id,
+                "Merge PR",
+                "Merge the PR. Check CI status, merge, and run post-merge builds if configured.",
+                max_order + 1,
+                all_coder_ids,
+                target_repo_json,
+            )
 
             # Propagate: tasks depending on pr_creator should also wait for merge
             await self._propagate_dependencies(st_id, [str(merge_row["id"])])
