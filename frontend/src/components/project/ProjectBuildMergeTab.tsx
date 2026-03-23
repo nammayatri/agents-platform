@@ -73,7 +73,7 @@ export default function ProjectBuildMergeTab({
               Require approval before merge
             </span>
             <p className="text-[11px] text-gray-600">
-              When enabled, the merge agent will pause and wait for your approval before merging PRs.
+              When enabled, PRs are created but not auto-merged. You review and merge manually.
             </p>
           </div>
         </label>
