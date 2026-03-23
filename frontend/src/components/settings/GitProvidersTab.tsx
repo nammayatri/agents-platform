@@ -13,7 +13,7 @@ const gitProviderDefaults: Record<string, string> = {
   bitbucket: 'https://api.bitbucket.org',
 }
 
-export default function GitProvidersTab({ isAdmin: _isAdmin }: Props) {
+export default function GitProvidersTab({ isAdmin }: Props) {
   const [gitProviderList, setGitProviderList] = useState<GitProviderConfig[]>([])
   const [showGitProviderForm, setShowGitProviderForm] = useState(false)
   const [editingGitProviderId, setEditingGitProviderId] = useState<string | null>(null)
@@ -106,10 +106,12 @@ export default function GitProvidersTab({ isAdmin: _isAdmin }: Props) {
         <div>
           <h2 className="text-sm font-medium text-gray-300 uppercase tracking-wider">Git Providers</h2>
           <p className="text-xs text-gray-600 mt-1">
-            Configure access to GitHub, GitLab, Bitbucket, or self-hosted git servers.
+            {isAdmin
+              ? 'Configure access to GitHub, GitLab, Bitbucket, or self-hosted git servers.'
+              : 'Git providers are configured by admins and shared with all users.'}
           </p>
         </div>
-        {!showGitProviderForm && (
+        {isAdmin && !showGitProviderForm && (
           <button
             onClick={() => {
               resetGitProviderForm()
@@ -137,6 +139,11 @@ export default function GitProvidersTab({ isAdmin: _isAdmin }: Props) {
                       token set
                     </span>
                   )}
+                  {g.is_shared && (
+                    <span className="px-1.5 py-0.5 bg-indigo-900/30 rounded text-[10px] text-indigo-400">
+                      shared
+                    </span>
+                  )}
                 </div>
                 {g.api_base_url && (
                   <div className="text-xs text-gray-500 mt-0.5 font-mono">{g.api_base_url}</div>
@@ -150,15 +157,19 @@ export default function GitProvidersTab({ isAdmin: _isAdmin }: Props) {
                 >
                   {testingId === g.id ? 'Testing...' : 'Test'}
                 </button>
-                <button
-                  onClick={() => startEditGitProvider(g)}
-                  className="px-2 py-1 text-xs text-indigo-400 hover:text-indigo-300 transition-colors"
-                >
-                  Edit
-                </button>
-                <button onClick={() => handleDeleteGitProvider(g.id)} className={btnDanger}>
-                  Delete
-                </button>
+                {isAdmin && (
+                  <>
+                    <button
+                      onClick={() => startEditGitProvider(g)}
+                      className="px-2 py-1 text-xs text-indigo-400 hover:text-indigo-300 transition-colors"
+                    >
+                      Edit
+                    </button>
+                    <button onClick={() => handleDeleteGitProvider(g.id)} className={btnDanger}>
+                      Delete
+                    </button>
+                  </>
+                )}
               </div>
             </div>
             {testResult && testResult.id === g.id && (
@@ -229,8 +240,8 @@ export default function GitProvidersTab({ isAdmin: _isAdmin }: Props) {
         )}
       </div>
 
-      {/* Add new git provider form */}
-      {showGitProviderForm && !editingGitProviderId && (
+      {/* Add new git provider form (admin only) */}
+      {isAdmin && showGitProviderForm && !editingGitProviderId && (
         <div className="p-4 bg-gray-900 border border-gray-800 rounded-lg space-y-3">
           <div className="text-xs text-gray-500 uppercase tracking-wider mb-1">New Git Provider</div>
           <div className="grid grid-cols-2 gap-3">
