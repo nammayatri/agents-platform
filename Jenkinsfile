@@ -1,5 +1,9 @@
 pipeline {
-    agent any
+    agent {
+        kubernetes {
+            label 'dind-agent'
+        }
+    }
 
     environment {
         AWS_REGION       = 'ap-south-1'

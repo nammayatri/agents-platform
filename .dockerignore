@@ -1,5 +1,6 @@
-# Frontend (has its own Dockerfile)
-frontend/
+# Node dependencies (rebuilt inside container)
+frontend/node_modules/
+frontend/dist/
 node_modules/
 
 # Version control

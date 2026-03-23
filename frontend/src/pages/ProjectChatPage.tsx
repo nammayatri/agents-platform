@@ -300,6 +300,7 @@ export default function ProjectChatPage() {
   const messagesEnd = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLTextAreaElement>(null)
   const deletedSessionIdsRef = useRef<Set<string>>(new Set())
+  const activeSessionIdRef = useRef<string | null>(activeSessionId)
   const { activity, activityLog, streamingText, completedStreaming, isStreaming, clearActivity, resetStreaming, incomingMessage, clearIncomingMessage } = useChatSessionWebSocket(activeSessionId)
   const [deleteDialog, setDeleteDialog] = useState<{
     sessionId: string
@@ -418,8 +419,9 @@ export default function ProjectChatPage() {
       setSessions(sessionList)
 
       // Auto-select the most recent session if none is active
-      if (sessionList.length > 0 && !activeSessionId) {
+      if (sessionList.length > 0 && !activeSessionIdRef.current) {
         setActiveSessionId(sessionList[0].id)
+        activeSessionIdRef.current = sessionList[0].id
         loadSessionMessages(sessionList[0].id)
       }
     } catch {
@@ -431,6 +433,8 @@ export default function ProjectChatPage() {
     if (!projectId) return
     try {
       const data = await projectChat.sessions.get(projectId, sessionId)
+      // Guard: discard if user switched sessions while loading
+      if (activeSessionIdRef.current !== sessionId) return
       const msgs = data.messages || []
       setMessages(msgs)
 
@@ -467,6 +471,8 @@ export default function ProjectChatPage() {
   async function loadLegacyMessages() {
     if (!projectId) return
     const msgs = await projectChat.history(projectId)
+    // Guard: only set if still on legacy (no session selected)
+    if (activeSessionIdRef.current !== null) return
     setMessages(msgs as ProjectChatMessage[])
   }
 
@@ -474,6 +480,7 @@ export default function ProjectChatPage() {
     clearActivity()
     resetStreaming()
     setActiveSessionId(sessionId)
+    activeSessionIdRef.current = sessionId
     setMessages([])
     if (sessionId) {
       loadSessionMessages(sessionId)
@@ -489,6 +496,7 @@ export default function ProjectChatPage() {
       const session = (await projectChat.sessions.create(projectId, {})) as ChatSession
       setSessions((prev) => [session, ...prev])
       setActiveSessionId(session.id)
+      activeSessionIdRef.current = session.id
       setMessages([])
     } catch {
       // fallback
@@ -533,12 +541,14 @@ export default function ProjectChatPage() {
       deletedSessionIdsRef.current.add(sessionId)
       setSessions((prev) => {
         const remaining = prev.filter((s) => s.id !== sessionId)
-        if (activeSessionId === sessionId && remaining.length > 0) {
+        if (activeSessionIdRef.current === sessionId && remaining.length > 0) {
           const next = remaining[0]
           setActiveSessionId(next.id)
+          activeSessionIdRef.current = next.id
           loadSessionMessages(next.id)
-        } else if (activeSessionId === sessionId) {
+        } else if (activeSessionIdRef.current === sessionId) {
           setActiveSessionId(null)
+          activeSessionIdRef.current = null
           setMessages([])
         }
         return remaining
@@ -579,29 +589,37 @@ export default function ProjectChatPage() {
     }
     setMessages((prev) => [...prev, tempUserMsg])
 
+    // Capture the session ID at call time so async callbacks can verify
+    // the user hasn't switched sessions while we were waiting.
+    let boundSessionId = activeSessionIdRef.current
+
     try {
       // Create a session on first message if none exists
-      let sessionId = activeSessionId
-      if (!sessionId && !creatingSession) {
+      if (!boundSessionId && !creatingSession) {
         setCreatingSession(true)
         try {
           const session = (await projectChat.sessions.create(projectId, {})) as ChatSession
-          sessionId = session.id
+          boundSessionId = session.id
           setSessions((prev) => [session, ...prev])
-          setActiveSessionId(sessionId)
+          setActiveSessionId(boundSessionId)
+          activeSessionIdRef.current = boundSessionId
         } finally {
           setCreatingSession(false)
         }
       }
-      if (!sessionId) return
+      if (!boundSessionId) return
 
       const result = await projectChat.sendInSession(
         projectId,
-        sessionId,
+        boundSessionId,
         content,
         undefined,
         selectedModel || undefined
       )
+
+      // Guard: if user switched sessions while waiting, discard the UI update
+      // (the messages are already safely stored in the DB under the correct session)
+      if (activeSessionIdRef.current !== boundSessionId) return
 
       // Optimistic plan_mode update when plan is accepted
       const resMeta = typeof result.assistant_message.metadata_json === 'string'
@@ -609,7 +627,7 @@ export default function ProjectChatPage() {
         : result.assistant_message.metadata_json
       if (resMeta?.action === 'plan_accepted') {
         setSessions((prev) =>
-          prev.map((s) => (s.id === sessionId ? { ...s, plan_mode: false } : s))
+          prev.map((s) => (s.id === boundSessionId ? { ...s, plan_mode: false } : s))
         )
       }
 
@@ -650,6 +668,8 @@ export default function ProjectChatPage() {
       // Refresh sessions list to pick up title changes
       loadSessions()
     } catch (err) {
+      // Only show error in the session that initiated the send
+      if (activeSessionIdRef.current !== boundSessionId) return
       setMessages((prev) => prev.filter((m) => m.id !== tempUserMsg.id))
       const errorMsg: ProjectChatMessage = {
         id: `error-${Date.now()}`,
