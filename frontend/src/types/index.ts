@@ -190,6 +190,7 @@ export interface SubTask {
     [key: string]: unknown
   }
   execution_events?: ExecutionEvent[]
+  commit_hash?: string
   created_at: string
   started_at?: string
   completed_at?: string
@@ -234,6 +235,7 @@ export interface TodoItem {
   scheduled_at?: string
   completed_at?: string
   chat_session_id?: string
+  base_commit?: string
   sub_tasks?: SubTask[]
   // Enriched provider info from backend
   provider_name?: string
@@ -483,20 +485,19 @@ export interface NotificationChannel {
 
 export interface PlanTaskSubtask {
   title: string
-  description?: string
   agent_role: string
   depends_on?: number[]
-  parallel?: boolean
-  review_loop?: boolean
   target_repo?: string
-  context?: {
-    relevant_files?: string[]
-    current_state?: string
-    what_to_change?: string
-    patterns_to_follow?: string
-    related_code?: string
-    integration_points?: string
-  }
+  review_loop?: boolean
+  // Structured description fields
+  scope?: string
+  requirements?: string
+  approach?: string
+  goal?: string
+  context?: string
+  // Legacy fields (backward compat with old plans)
+  description?: string
+  parallel?: boolean
 }
 
 export interface PlanTask {
@@ -510,7 +511,10 @@ export interface PlanTask {
 export interface ChatPlanData {
   action?: string
   plan_title?: string
-  tasks: PlanTask[]
+  // New format: singular task
+  task?: PlanTask
+  // Legacy format: tasks array (backward compat)
+  tasks?: PlanTask[]
 }
 
 export interface ChatExecutionInfo {
@@ -545,14 +549,11 @@ export interface ProjectChatMessage {
         depends_on?: number[]
         review_loop?: boolean
         target_repo?: string
-        context?: {
-          relevant_files?: string[]
-          current_state?: string
-          what_to_change?: string
-          patterns_to_follow?: string
-          related_code?: string
-          integration_points?: string
-        }
+        scope?: string
+        requirements?: string
+        approach?: string
+        goal?: string
+        context?: string
       }>
     }
     plan_title?: string
@@ -595,6 +596,7 @@ export interface WSEvent {
   iteration?: number
   error_message?: string
   sub_state?: string
+  phase?: string
   ts?: number
   // Streaming execution event fields
   name?: string
@@ -654,6 +656,87 @@ export interface ReleaseConfig {
   test_release?: ReleaseEndpointConfig
   prod_release?: ReleaseEndpointConfig
 }
+
+// ── Merge Pipeline Types ──────────────────────────────────────────────
+
+export type PipelineRunStatus =
+  | 'pending' | 'testing' | 'test_passed' | 'test_failed'
+  | 'deploying' | 'deploy_success' | 'deploy_failed'
+  | 'skipped' | 'cancelled'
+
+export interface PipelineRun {
+  id: string
+  project_id: string
+  repo_name: string
+  pr_number: number
+  pr_title?: string
+  branch_name?: string
+  commit_hash?: string
+  repo_url?: string
+  status: PipelineRunStatus
+  test_mode?: 'webhook' | 'poll'
+  test_config?: Record<string, unknown>
+  test_result?: { passed: boolean; output?: unknown; received_at?: string }
+  deploy_config?: Record<string, unknown>
+  deploy_result?: Record<string, unknown>
+  webhook_token?: string
+  started_at?: string
+  test_completed_at?: string
+  deploy_completed_at?: string
+  created_at: string
+  updated_at: string
+}
+
+export interface MergePipelineTestConfig {
+  mode: 'poll' | 'webhook'
+  poll_url?: string
+  poll_interval_seconds?: number
+  poll_timeout_minutes?: number
+  poll_success_value?: string
+  poll_headers?: Record<string, string>
+  timeout_minutes?: number
+}
+
+export interface MergePipelineDeployConfig {
+  enabled: boolean
+  deploy_type: 'http' | 'kubernetes'
+  api_url?: string
+  http_method?: string
+  headers?: Record<string, string>
+  body_template?: string
+  success_status_codes?: number[]
+  kube_commands?: string[]
+  kube_context?: string
+}
+
+export interface MergePipelineConfig {
+  enabled: boolean
+  test_config?: MergePipelineTestConfig
+  deploy_config?: MergePipelineDeployConfig
+}
+
+export interface PipelineVariable {
+  key: string
+  example: string
+}
+
+// ── Post-Merge Actions ──────────────────────────────────────────────
+
+export interface PostMergeAction {
+  type: 'webhook' | 'script'
+  url?: string
+  method?: string
+  headers?: Record<string, string>
+  body_template?: string
+  command?: string
+  timeout_seconds?: number
+}
+
+export interface PostMergeRepoConfig {
+  enabled: boolean
+  actions?: PostMergeAction[]
+}
+
 
 export interface ProjectCreatePayload {
   name: string
@@ -788,7 +871,7 @@ export interface GitStatus {
 export interface ProjectMemory {
   id: string
   project_id: string
-  category: 'architecture' | 'pattern' | 'convention' | 'pitfall' | 'dependency'
+  category: 'architecture' | 'pattern' | 'convention' | 'pitfall' | 'dependency' | 'build' | 'workflow'
   content: string
   source_todo_id?: string
   confidence: number
@@ -816,6 +899,7 @@ export interface ExecutionEvent {
   tool_index?: number
   total_tools?: number
   message?: string
+  content?: string       // LLM reasoning text (for llm_thinking events)
   // File/tool detail fields
   file_path?: string
   pattern?: string

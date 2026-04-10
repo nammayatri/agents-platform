@@ -56,7 +56,7 @@ class SubtaskDispatcher:
         *,
         use_iterations: bool = False,
         work_rules: dict | None = None,
-        max_iterations: int = 50,
+        max_iterations: int = 500,
     ) -> Awaitable[None]:
         """Return an *unawaited* coroutine for executing ``sub_task``.
 
@@ -88,7 +88,7 @@ class SubtaskDispatcher:
         *,
         use_iterations: bool = False,
         work_rules: dict | None = None,
-        max_iterations: int = 50,
+        max_iterations: int = 500,
     ) -> None:
         """Await a single subtask dispatch (convenience wrapper)."""
         await self.build_coro(
@@ -108,7 +108,7 @@ class SubtaskDispatcher:
         *,
         use_iterations: bool = False,
         work_rules: dict | None = None,
-        max_iterations: int = 50,
+        max_iterations: int = 500,
     ) -> list[BaseException | None]:
         """Dispatch multiple subtasks concurrently via ``asyncio.gather``.
 

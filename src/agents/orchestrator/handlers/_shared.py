@@ -133,15 +133,14 @@ async def propagate_dependencies(
 
 async def requires_merge_approval(ctx: HandlerContext) -> bool:
     """Check project setting: should we skip auto-merge?"""
+    from agents.utils.settings_helpers import parse_settings, read_setting
     todo = await ctx.load_todo()
     proj = await ctx.db.fetchrow(
         "SELECT settings_json FROM projects WHERE id = $1",
         todo["project_id"],
     )
-    settings_val = (proj or {}).get("settings_json") or {}
-    if isinstance(settings_val, str):
-        settings_val = json.loads(settings_val)
-    return bool(settings_val.get("require_merge_approval", False))
+    settings_val = parse_settings((proj or {}).get("settings_json"))
+    return bool(read_setting(settings_val, "git.require_merge_approval", "require_merge_approval", False))
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -149,12 +148,17 @@ async def requires_merge_approval(ctx: HandlerContext) -> bool:
 # ──────────────────────────────────────────────────────────────────────
 
 async def ensure_coding_guardrails(ctx: HandlerContext, workspace_path: str | None) -> bool:
-    """Check for missing tester/reviewer subtasks on coding tasks.
+    """Create tester/reviewer subtasks per repo for completed coder work.
+
+    Groups completed coders by target_repo. For each repo that doesn't
+    already have a tester+reviewer, creates them. Each tester/reviewer
+    only validates changes for its specific repo.
 
     Returns True if new guardrail subtasks were created.
     """
     coder_subtasks = await ctx.db.fetch(
-        "SELECT id, title, review_loop, review_chain_id FROM sub_tasks "
+        "SELECT id, title, review_loop, review_chain_id, target_repo, workspace_path "
+        "FROM sub_tasks "
         "WHERE todo_id = $1 AND agent_role = 'coder' AND status = 'completed'",
         ctx.todo_id,
     )
@@ -168,83 +172,145 @@ async def ensure_coding_guardrails(ctx: HandlerContext, workspace_path: str | No
     if not unreviewed_coders:
         return False
 
-    existing_roles = await ctx.db.fetch(
-        "SELECT DISTINCT agent_role FROM sub_tasks "
-        "WHERE todo_id = $1 AND (review_chain_id IS NULL)",
+    # Group coders by repo name
+    import json as _json
+    coders_by_repo: dict[str, list[dict]] = {}
+    for st in unreviewed_coders:
+        target = st.get("target_repo")
+        if isinstance(target, str):
+            try:
+                target = _json.loads(target)
+            except (ValueError, TypeError):
+                target = None
+        repo_name = "main"
+        if isinstance(target, dict) and target.get("name"):
+            repo_name = target["name"]
+        elif isinstance(target, str) and target:
+            repo_name = target
+        coders_by_repo.setdefault(repo_name, []).append(dict(st))
+
+    # Check existing tester/reviewer subtasks per repo
+    existing_guardrails = await ctx.db.fetch(
+        "SELECT agent_role, target_repo FROM sub_tasks "
+        "WHERE todo_id = $1 AND agent_role IN ('tester', 'reviewer')",
         ctx.todo_id,
     )
-    existing = {r["agent_role"] for r in existing_roles}
+    # Build set of (repo_name, role) that already exist
+    existing_pairs: set[tuple[str, str]] = set()
+    for row in existing_guardrails:
+        tr = row.get("target_repo")
+        if isinstance(tr, str):
+            try:
+                tr = _json.loads(tr)
+            except (ValueError, TypeError):
+                pass
+        rn = "main"
+        if isinstance(tr, dict) and tr.get("name"):
+            rn = tr["name"]
+        elif isinstance(tr, str) and tr:
+            rn = tr
+        existing_pairs.add((rn, row["agent_role"]))
 
     created: list[tuple[str, str]] = []
-    coder_ids = [str(st["id"]) for st in unreviewed_coders]
-    coder_titles = [st["title"] for st in unreviewed_coders]
-    chain_id = coder_ids[0]
 
-    # 1. Tester guardrail
-    if "tester" not in existing:
-        tester_desc = (
-            "Validate the code changes made by the coder subtask(s):\n"
-            + "\n".join(f"- {t}" for t in coder_titles)
-            + "\n\nRun ALL build, typecheck, lint, and test commands. "
-            "Write additional tests for new/changed functions if needed.\n\n"
-            "You MUST output structured JSON via task_complete:\n"
-            '```json\n'
-            '{"passed": true/false, "summary": "...", "failures": [\n'
-            '  {"file": "path", "type": "build|type_error|test|lint|runtime", "error": "message"}\n'
-            ']}\n'
-            '```'
-        )
-        tester_id = await create_guardrail_subtask(
-            ctx,
-            title="Test implemented changes",
-            description=tester_desc,
-            role="tester",
-            depends_on=coder_ids,
-            review_loop=True,
-            review_chain_id=chain_id,
-        )
-        created.append(("tester", tester_id))
+    for repo_name, coders in coders_by_repo.items():
+        coder_ids = [str(st["id"]) for st in coders]
+        coder_titles = [st["title"] for st in coders]
+        chain_id = coder_ids[0]
 
-    # 2. Reviewer guardrail
-    if "reviewer" not in existing:
-        deps = list(coder_ids)
-        if created:
-            deps.append(created[-1][1])
-        reviewer_desc = (
-            "Review all code changes for quality, security, correctness, and adherence "
-            "to requirements. Check the coder subtask(s):\n"
-            + "\n".join(f"- {t}" for t in coder_titles)
-            + "\n\nYou MUST output a JSON verdict at the end of your response:\n"
-            '{"verdict": "approved"} or {"verdict": "needs_changes", "issues": ["issue1", ...]}'
-        )
-        reviewer_id = await create_guardrail_subtask(
-            ctx,
-            title="Review code changes",
-            description=reviewer_desc,
-            role="reviewer",
-            depends_on=deps,
-            review_loop=True,
-            review_chain_id=chain_id,
-        )
-        created.append(("reviewer", reviewer_id))
+        # Get target_repo and workspace_path from first coder
+        target_repo_json = coders[0].get("target_repo")
+        coder_ws = coders[0].get("workspace_path")
+
+        repo_label = repo_name if repo_name != "main" else "main repo"
+
+        # Tester
+        if (repo_name, "tester") not in existing_pairs:
+            tester_desc = (
+                f"Validate code changes in {repo_label}:\n"
+                + "\n".join(f"- {t}" for t in coder_titles)
+                + "\n\nRun build, typecheck, lint, and test commands for this repo."
+            )
+            title = f"Test changes — {repo_name}" if repo_name != "main" else "Test implemented changes"
+            tester_id = await _create_guardrail_subtask_with_repo(
+                ctx, title=title, description=tester_desc, role="tester",
+                depends_on=coder_ids, chain_id=chain_id,
+                target_repo=target_repo_json, workspace_path=coder_ws,
+            )
+            created.append(("tester", tester_id))
+
+        # Reviewer
+        if (repo_name, "reviewer") not in existing_pairs:
+            deps = list(coder_ids)
+            # Reviewer depends on tester if one was just created for this repo
+            if (repo_name, "tester") not in existing_pairs and created:
+                deps.append(created[-1][1])
+            reviewer_desc = (
+                f"Review code changes in {repo_label} for quality, security, correctness:\n"
+                + "\n".join(f"- {t}" for t in coder_titles)
+            )
+            title = f"Review changes — {repo_name}" if repo_name != "main" else "Review code changes"
+            reviewer_id = await _create_guardrail_subtask_with_repo(
+                ctx, title=title, description=reviewer_desc, role="reviewer",
+                depends_on=deps, chain_id=chain_id,
+                target_repo=target_repo_json, workspace_path=coder_ws,
+            )
+            created.append(("reviewer", reviewer_id))
 
     if created:
-        # Propagate: tasks depending on coders should also wait for guardrails
         all_new_ids = [sid for _, sid in created]
-        for coder_id in coder_ids:
+        all_coder_ids = [str(st["id"]) for st in unreviewed_coders]
+        for coder_id in all_coder_ids:
             await propagate_dependencies(ctx, coder_id, all_new_ids)
 
-        roles = ", ".join(r for r, _ in created)
+        repos = ", ".join(coders_by_repo.keys())
+        roles = ", ".join(sorted(set(r for r, _ in created)))
         logger.info(
-            "[%s] Coding guardrails: auto-created %s subtask(s) for unreviewed coder work",
-            ctx.todo_id, roles,
+            "[%s] Guardrails: created %d subtasks (%s) for repos: %s",
+            ctx.todo_id, len(created), roles, repos,
         )
         await ctx.post_system_message(
-            f"**Guardrail:** Auto-created {roles} subtask(s) to ensure code quality."
+            f"**Guardrail:** Auto-created {roles} for repos: {repos}"
         )
         return True
 
     return False
+
+
+async def _create_guardrail_subtask_with_repo(
+    ctx: HandlerContext,
+    title: str,
+    description: str,
+    role: str,
+    depends_on: list[str],
+    chain_id: str,
+    target_repo=None,
+    workspace_path: str | None = None,
+) -> str:
+    """Create a guardrail subtask with repo targeting and return its ID."""
+    max_order = 0
+    if depends_on:
+        rows = await ctx.db.fetch(
+            "SELECT execution_order FROM sub_tasks WHERE id = ANY($1)",
+            depends_on,
+        )
+        max_order = max((r["execution_order"] or 0) for r in rows) if rows else 0
+
+    row = await ctx.db.fetchrow(
+        """
+        INSERT INTO sub_tasks (
+            todo_id, title, description, agent_role,
+            execution_order, depends_on, review_loop, review_chain_id,
+            target_repo, workspace_path
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, TRUE, $7, $8, $9)
+        RETURNING id
+        """,
+        ctx.todo_id, title, description, role,
+        max_order + 1, depends_on, chain_id,
+        target_repo, workspace_path,
+    )
+    return str(row["id"])
 
 
 async def create_guardrail_subtask(
@@ -536,9 +602,15 @@ async def create_release_subtasks(
     ctx: HandlerContext, merge_subtask: dict, project_settings: dict,
 ) -> None:
     """Create chained release pipeline subtasks after a successful merge."""
-    release_config = project_settings.get("release_config", {})
+    # Resolve per-repo release config (backwards compat: fall back to legacy single key)
+    merge_st_target = merge_subtask.get("target_repo")
+    if isinstance(merge_st_target, str):
+        merge_st_target = json.loads(merge_st_target)
+    _repo_name = (merge_st_target or {}).get("name", "main")
+    release_configs = project_settings.get("release_configs", {})
+    release_config = release_configs.get(_repo_name) or project_settings.get("release_config", {})
     if not release_config:
-        logger.info("[%s] No release_config found, skipping release subtasks", ctx.todo_id)
+        logger.info("[%s] No release_config for repo '%s', skipping release subtasks", ctx.todo_id, _repo_name)
         return
 
     merge_st_id = str(merge_subtask["id"])
@@ -683,10 +755,11 @@ async def create_pr_creator_subtask(
 async def run_post_merge_builds(
     ctx: HandlerContext, todo: dict, build_commands: list[str], workspace_path: str,
 ) -> None:
-    """Pull latest after merge and run build commands."""
-    repo_dir = os.path.join(workspace_path, "repo")
-    if not os.path.isdir(repo_dir):
-        repo_dir = workspace_path
+    """Pull latest after merge and run build commands.
+
+    workspace_path IS the git working directory.
+    """
+    repo_dir = workspace_path
 
     proc = await asyncio.create_subprocess_exec(
         "git", "pull", "origin",

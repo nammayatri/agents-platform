@@ -36,9 +36,10 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
     setMobileOpen(false)
   }, [location.pathname])
 
+  // Fetch projects once on mount — not on every navigation
   useEffect(() => {
     projectsApi.list().then((p) => setProjectList(p as Project[])).catch(() => {})
-  }, [location.pathname])
+  }, []) // eslint-disable-line react-hooks/exhaustive-deps
 
   const linkCls = (active: boolean) =>
     `flex items-center gap-3 px-3 py-2 rounded-lg text-sm transition-colors whitespace-nowrap ${

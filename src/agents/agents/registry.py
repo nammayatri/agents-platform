@@ -193,6 +193,35 @@ _register_tool(BuiltinToolDef(
 ))
 
 _register_tool(BuiltinToolDef(
+    name="web_search",
+    description="Search the web for information. Returns titles, URLs, and snippets.",
+    input_schema={
+        "type": "object",
+        "properties": {
+            "query": {"type": "string", "description": "Search query"},
+            "max_results": {"type": "integer", "description": "Max results to return (default 5, max 10)"},
+        },
+        "required": ["query"],
+    },
+    prompt_hint="Search the web. Args: query, max_results (optional, default 5)",
+    example='web_search(query="Python asyncio best practices")',
+))
+
+_register_tool(BuiltinToolDef(
+    name="web_fetch",
+    description="Fetch a web page and return its content as clean markdown. Use after web_search to read specific pages.",
+    input_schema={
+        "type": "object",
+        "properties": {
+            "url": {"type": "string", "description": "URL to fetch"},
+        },
+        "required": ["url"],
+    },
+    prompt_hint="Fetch a URL as clean markdown. Args: url. Use after web_search to read pages.",
+    example='web_fetch(url="https://docs.python.org/3/library/asyncio.html")',
+))
+
+_register_tool(BuiltinToolDef(
     name="create_subtask",
     description=(
         "Create a new subtask under the current task. Use this when you want to "
@@ -370,7 +399,7 @@ _register(AgentDefinition(
         "- Include necessary imports and error handling\n"
         "- Only add comments for non-obvious logic"
     ),
-    default_tools=["read_file", "write_file", "edit_file", "list_directory", "search_files", "semantic_search", "run_command", "create_subtask", "task_complete"],
+    default_tools=["read_file", "write_file", "edit_file", "list_directory", "search_files", "run_command", "web_search", "web_fetch", "create_subtask", "task_complete"],
     tool_rule_categories=["coding", "quality", "general"],
 ))
 
@@ -379,31 +408,44 @@ _register(AgentDefinition(
     display_name="Tester",
     description="Writes and runs tests, validates implementations",
     system_prompt=(
-        "You are a test engineer. You MUST use the provided tools to read code, write tests, "
-        "and run all build/test/lint commands.\n\n"
+        "You are a test and validation engineer. You verify code changes systematically.\n\n"
         "## Workflow\n"
-        "1. Use `read_file` to understand the implementation being tested\n"
-        "2. Use `search_files` to find existing test patterns\n"
-        "3. Use `write_file` to create or update test files\n"
-        "4. Use `run_command` to execute build, typecheck, lint, and test commands\n"
-        "5. If project build/test commands are provided below, run ALL of them\n\n"
+        "1. Read the task description and changed files to understand what was implemented\n"
+        "2. Create a validation.md checklist covering everything that needs verification\n"
+        "3. Execute each check, updating validation.md with results as you go\n"
+        "4. Call task_complete when all checks are done\n\n"
+        "## validation.md — Your Checklist\n"
+        "On your FIRST iteration, create `validation.md` at the repo root with:\n"
+        "```markdown\n"
+        "# Validation Checklist\n\n"
+        "## Build\n"
+        "- [ ] Project compiles without errors\n"
+        "- [ ] No type errors\n\n"
+        "## Changed Files\n"
+        "- [ ] file1.py — description of what to verify\n"
+        "- [ ] file2.ts — description of what to verify\n\n"
+        "## Tests\n"
+        "- [ ] Existing tests pass\n"
+        "- [ ] New functionality has test coverage\n\n"
+        "## Integration\n"
+        "- [ ] Changes work with the rest of the system\n"
+        "```\n\n"
+        "As you run each check, update the file:\n"
+        "- `- [x] Project compiles without errors` — passed\n"
+        "- `- [x] FAIL: file1.py — error: missing import` — failed with details\n\n"
+        "On subsequent iterations, READ validation.md first to see what's already done. "
+        "Do NOT re-run checks that already passed. Only address failures.\n\n"
         "## Rules\n"
-        "- ALWAYS use `write_file` to create test files — never just output code as text\n"
-        "- Cover happy paths, edge cases, and error conditions\n"
-        "- Follow the project's existing test conventions and framework\n"
-        "- Run tests after writing them to confirm they pass\n"
-        "- If build/test commands are provided in the prompt, you MUST run them all and report results\n\n"
-        "## IMPORTANT: Structured Output\n"
-        "When you call `task_complete`, your summary MUST be valid JSON with this structure:\n"
-        '```json\n'
+        "- ALWAYS create validation.md on first iteration\n"
+        "- ALWAYS read validation.md on subsequent iterations to avoid repeating work\n"
+        "- Run build/test commands provided in the prompt\n"
+        "- If you find failures, fix them if your role allows, or document them clearly\n"
+        "- validation.md stays in the repo and gets included in the PR\n\n"
+        "## Structured Output\n"
+        "When calling `task_complete`, your summary MUST be JSON:\n"
         '{"passed": true/false, "summary": "brief description", "failures": [\n'
-        '  {"file": "src/foo.ts", "type": "build|type_error|test|lint|runtime", '
-        '"error": "the error message"}\n'
-        ']}\n'
-        '```\n'
-        "- `passed`: true if ALL checks pass, false if ANY fail\n"
-        "- `failures`: list every failure with the file, category, and error output\n"
-        "- If passed is true, failures should be an empty list"
+        '  {"file": "src/foo.ts", "type": "build|test|lint", "error": "the error"}\n'
+        "]}\n"
     ),
     default_tools=["read_file", "write_file", "list_directory", "search_files", "run_command", "task_complete", "create_subtask"],
     tool_rule_categories=["testing", "quality", "general"],
@@ -504,7 +546,7 @@ recommend next steps instead.
 - Be precise about file paths and line numbers
 - If input_context has relevant_files, start there
 - If previous agent errors are provided, those are your primary investigation targets
-- Use `semantic_search` to find related code when grep isn't enough
+- Use `search_files` to find related code across the codebase
 - If unsure, recommend further investigation rather than guessing
 """
 
@@ -513,7 +555,7 @@ _register(AgentDefinition(
     display_name="Debugger",
     description="Debugs issues using logs, metrics, database queries, and VM access",
     system_prompt=DEBUGGER_SYSTEM_PROMPT,
-    default_tools=["read_file", "write_file", "edit_file", "list_directory", "search_files", "semantic_search", "run_command", "create_subtask", "task_complete"],
+    default_tools=["read_file", "write_file", "edit_file", "list_directory", "search_files", "run_command", "web_search", "web_fetch", "create_subtask", "task_complete"],
     tool_rule_categories=["debugging", "coding", "general"],
 ))
 
@@ -601,6 +643,6 @@ _register(AgentDefinition(
     display_name="Planner",
     description="Project chat agent — plans work, creates tasks, answers project questions",
     system_prompt=PLANNER_CHAT_PROMPT,
-    default_tools=["read_file", "list_directory", "search_files", "run_command", "semantic_search"],
+    default_tools=["read_file", "list_directory", "search_files", "run_command", "web_search", "web_fetch"],
     tool_rule_categories=["general"],
 ))

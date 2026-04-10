@@ -213,8 +213,8 @@ export const useTodoStore = create<TodoState>((set, get) => ({
 
   sendChat: async (todoId, content) => {
     const msg = await chatApi.send(todoId, content) as ChatMessage
-    const current = get().chatMessages[todoId] || []
-    set({ chatMessages: { ...get().chatMessages, [todoId]: [...current, msg] } })
+    // Use appendChatMessage for dedup — the WebSocket may have already delivered this message
+    get().appendChatMessage(todoId, msg)
   },
 
   appendChatMessage: (todoId, msg) => {
@@ -261,6 +261,8 @@ export const useTodoStore = create<TodoState>((set, get) => ({
   appendActivity: (subTaskId, activity) => {
     const { activityLogs } = get()
     const current = activityLogs[subTaskId] || []
+    // Dedup consecutive identical messages
+    if (current.length > 0 && current[current.length - 1] === activity) return
     const updated = [...current, activity].slice(-MAX_ACTIVITY_ENTRIES)
     set({ activityLogs: { ...activityLogs, [subTaskId]: updated } })
   },
@@ -270,7 +272,18 @@ export const useTodoStore = create<TodoState>((set, get) => ({
     const next = { ...activityLogs }
     for (const [subTaskId, newEntries] of entries) {
       const current = next[subTaskId] || []
-      next[subTaskId] = [...current, ...newEntries].slice(-MAX_ACTIVITY_ENTRIES)
+      // Dedup consecutive identical messages within the batch
+      const deduped: string[] = []
+      let last = current.length > 0 ? current[current.length - 1] : null
+      for (const entry of newEntries) {
+        if (entry !== last) {
+          deduped.push(entry)
+          last = entry
+        }
+      }
+      if (deduped.length > 0) {
+        next[subTaskId] = [...current, ...deduped].slice(-MAX_ACTIVITY_ENTRIES)
+      }
     }
     set({ activityLogs: next })
   },

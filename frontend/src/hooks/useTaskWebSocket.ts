@@ -26,7 +26,10 @@ export function useTaskWebSocket(todoId: string | null) {
     if (!activityBuffer.current[subTaskId]) {
       activityBuffer.current[subTaskId] = []
     }
-    activityBuffer.current[subTaskId].push(activity)
+    // Dedup: skip if identical to the last buffered entry for this subtask
+    const buf = activityBuffer.current[subTaskId]
+    if (buf.length > 0 && buf[buf.length - 1] === activity) return
+    buf.push(activity)
     if (!activityFlushScheduled.current) {
       activityFlushScheduled.current = true
       requestAnimationFrame(flushActivity)
@@ -96,6 +99,8 @@ export function useTaskWebSocket(todoId: string | null) {
           case 'activity':
             if (data.sub_task_id && data.activity) {
               queueActivity(data.sub_task_id, data.activity)
+            } else if (data.phase === 'planning' && data.activity) {
+              queueActivity('planning-phase', data.activity)
             }
             break
 
@@ -154,6 +159,7 @@ export function useTaskWebSocket(todoId: string | null) {
               pattern: data.pattern as string | undefined,
               command: data.command as string | undefined,
               error: data.error as boolean | undefined,
+              content: data.content as string | undefined,
               // Index fields
               query: data.query as string | undefined,
               results_count: data.results_count as number | undefined,

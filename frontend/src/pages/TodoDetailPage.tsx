@@ -518,6 +518,50 @@ export default function TodoDetailPage() {
           </div>
         )}
 
+        {/* Planning Activity — live tool events during planning phase */}
+        {(todo.state === 'planning' || (todo.state === 'plan_ready' && executionEvents.length > 0)) && (
+          <div className="mb-5 bg-gray-900 border border-gray-800 rounded-lg overflow-hidden">
+            <div className="px-4 py-3 border-b border-gray-800 flex items-center gap-2">
+              {todo.state === 'planning' && <Loader2 className="w-3.5 h-3.5 text-blue-400 animate-spin" />}
+              <span className="text-sm font-medium text-gray-300">
+                {todo.state === 'planning' ? 'Planning — exploring codebase...' : 'Planning Activity'}
+              </span>
+              <span className="text-[10px] text-gray-600 ml-auto">{executionEvents.length} events</span>
+            </div>
+            <div className="max-h-[300px] overflow-y-auto">
+              {executionEvents.length === 0 && todo.state === 'planning' && (
+                <div className="px-4 py-6 text-center text-sm text-gray-600">
+                  Waiting for planner to start exploring...
+                </div>
+              )}
+              {executionEvents.map((evt, i) => (
+                <div key={i} className="px-4 py-1.5 border-b border-gray-800/50 last:border-0">
+                  {evt.type === 'tool_start' && (
+                    <div className="flex items-center gap-2 text-xs">
+                      <span className="text-indigo-400 font-mono">{evt.name}</span>
+                      <span className="text-gray-600 truncate">{evt.args_summary || ''}</span>
+                    </div>
+                  )}
+                  {evt.type === 'tool_result' && (
+                    <div className="flex items-center gap-2 text-xs">
+                      <span className={`font-mono ${evt.error ? 'text-red-400' : 'text-emerald-400'}`}>{evt.name}</span>
+                      <span className="text-gray-500 truncate">{evt.result_preview || `${evt.chars || 0} chars`}</span>
+                    </div>
+                  )}
+                  {evt.type === 'llm_thinking' && evt.content && (
+                    <div className="text-xs text-gray-400 leading-relaxed whitespace-pre-wrap">
+                      {evt.content}
+                    </div>
+                  )}
+                  {evt.type !== 'tool_start' && evt.type !== 'tool_result' && evt.type !== 'llm_thinking' && (
+                    <div className="text-xs text-gray-500">{evt.type}</div>
+                  )}
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
         {/* Plan Review Panel */}
         {todo.state === 'plan_ready' && todo.plan_json && (
           <div className="mb-5 bg-gray-900 border border-gray-800 rounded-lg overflow-hidden">

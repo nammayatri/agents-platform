@@ -914,16 +914,18 @@ async def _build_previous_run_context(db, todo_id: str, todo) -> dict:
     task_dir = os.path.join(
         settings.workspace_root, str(todo["project_id"]), "tasks", todo_id,
     )
+    _skip = {"deps", ".context", "indexes", "main"}
     if os.path.isdir(task_dir):
         dep_diffs = {}
         for entry in os.listdir(task_dir):
-            if entry.startswith("dep_") and os.path.isdir(os.path.join(task_dir, entry)):
-                dep_name = entry[4:]  # strip "dep_" prefix
-                dep_diff = await _get_task_workspace_diff_for_dir(
-                    os.path.join(task_dir, entry, "repo")
-                )
+            entry_path = os.path.join(task_dir, entry)
+            if (entry not in _skip
+                and not entry.startswith(".")
+                and os.path.isdir(entry_path)
+                and os.path.isdir(os.path.join(entry_path, ".git"))):
+                dep_diff = await _get_task_workspace_diff_for_dir(entry_path)
                 if dep_diff:
-                    dep_diffs[dep_name] = dep_diff
+                    dep_diffs[entry] = dep_diff
         if dep_diffs:
             ctx["dep_diffs"] = dep_diffs
 
@@ -933,7 +935,7 @@ async def _build_previous_run_context(db, todo_id: str, todo) -> dict:
 async def _get_task_workspace_diff(project_id: str, todo_id: str) -> dict | None:
     """Get git diff from the main task workspace for retry context."""
     repo_dir = os.path.join(
-        settings.workspace_root, project_id, "tasks", todo_id, "repo",
+        settings.workspace_root, project_id, "tasks", todo_id, "main",
     )
     return await _get_task_workspace_diff_for_dir(repo_dir)
 

@@ -39,6 +39,9 @@ dependencies = [
     # HTTP client (for GitHub API, self-hosted providers)
     "httpx>=0.28.0",
 
+    # Web search (DuckDuckGo, zero-cost, no API key)
+    "duckduckgo-search>=7.0.0",
+
     # Utilities
     "python-multipart>=0.0.18",
 

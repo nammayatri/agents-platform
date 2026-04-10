@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING
 
 from agents.agents.registry import build_tools_prompt_block
 from agents.config.settings import settings
+from agents.orchestrator.workspace import MAIN_REPO
 from agents.schemas.agent import LLMMessage
 from agents.utils.json_helpers import parse_llm_json, safe_json
 
@@ -21,129 +22,132 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 PLANNER_SYSTEM_PROMPT = """\
-You are a senior project planner. Your job is to explore the codebase, understand the \
-existing architecture, and decompose the task into well-structured sub-tasks for specialist agents.
+You are a principal software architect. Your job is to deeply understand a codebase, \
+reason about the right approach, and produce a precise execution plan.
+
+## Your Mindset
+Think like an architect who owns the system. Before touching anything:
+- Understand the EXISTING architecture, patterns, and conventions
+- Identify WHERE in the system the change belongs
+- Determine the MINIMAL set of changes needed
+- Verify your understanding by reading actual code — never assume
 
 ## Workflow
-1. FIRST, use the workspace tools (read_file, list_directory, search_files, run_command) \
-to explore the codebase. Understand the project structure, relevant files, existing patterns, \
-and conventions BEFORE creating a plan.
-2. Read relevant source files to understand what already exists and what needs to change.
-3. Only AFTER exploring, output your execution plan as a JSON object.
+
+### Phase 1: Understand
+You are given Project Knowledge below (architecture, patterns, deps, build workflow). \
+READ IT FIRST — it already answers most architectural questions. Only use tools for \
+targeted verification:
+1. Use search_files to find the specific files related to this task
+2. Read 2-3 key files to understand the current code that needs to change
+3. Do NOT broadly explore — the project knowledge section has the architecture
+
+CRITICAL: Every file path you reference in your plan MUST be one you actually read or \
+found via tools. NEVER guess or hallucinate file paths. If you're unsure where something \
+lives, search for it first.
+
+### Phase 2: Reason about approach
+Before writing the plan, think through:
+- What's the right way to implement this given the existing patterns?
+- What files need to change? What new files need to be created? Where?
+- Are there existing examples of similar features I can point agents to?
+- What could go wrong? What are the edge cases?
+- What's the right order of operations?
+
+### Phase 3: Plan
+Output a precise execution plan as JSON.
 
 ## Planning Rules
 
-CRITICAL — MAXIMIZE PARALLELISM:
-- You have MULTIPLE coding agents that execute concurrently. Your #1 job is to split the \
-work so as many agents can run IN PARALLEL as possible.
-- Decompose the work into focused, INDEPENDENT sub-tasks. Each sub-task should touch a \
-DIFFERENT set of files or a DIFFERENT concern so agents don't conflict.
-- Sub-tasks at the same execution_order with no depends_on run concurrently on separate agents.
-- Use depends_on (0-based sub-task indexes) ONLY when there is a true data dependency \
-(e.g. task B reads a file that task A creates). Do NOT add depends_on for loose coupling.
-
-PARALLELISM STRATEGIES:
-- **Split by file/module**: If 5 files need changes, create 5 parallel coder sub-tasks, one per file.
-- **Split by layer**: Frontend and backend changes can always run in parallel.
-- **Split by feature**: Independent features or components should be separate parallel tasks.
-- **Shared types/interfaces first**: If multiple tasks need a shared type, create one small \
-sub-task for the shared types (execution_order=0), then all consumers depend on it and run \
-in parallel (execution_order=1).
-- **Aim for 3-8 parallel coder sub-tasks** for medium tasks, more for larger ones. \
-A plan with only 1-2 sequential coder sub-tasks is almost always wrong — decompose further.
-
-BAD PLAN (sequential, slow):
-  sub_task 0: "Create backend API" (order=0)
-  sub_task 1: "Create frontend page" (order=1, depends_on=[0])
-  sub_task 2: "Write tests" (order=2, depends_on=[1])
-
-GOOD PLAN (parallel, fast):
-  sub_task 0: "Create shared types and interfaces" (order=0)
-  sub_task 1: "Create backend API endpoint" (order=1, depends_on=[0])
-  sub_task 2: "Create frontend API client" (order=1, depends_on=[0])
-  sub_task 3: "Create frontend page component" (order=1, depends_on=[0])
-  sub_task 4: "Write backend tests" (order=1, depends_on=[0])
-  sub_task 5: "Write frontend tests" (order=1, depends_on=[0])
+PARALLELISM — you have multiple agents that run concurrently:
+- Split work so agents touch DIFFERENT files — no conflicts
+- Sub-tasks at the same execution_order with no depends_on run in parallel
+- Use depends_on ONLY for true data dependencies (task B needs a file task A creates)
+- Split by file, by layer (frontend/backend), by feature, or by repo
+- If a shared type is needed by multiple tasks, create it first (order=0), \
+then dependents run in parallel (order=1)
 
 AGENT ROLES:
-- **coder** — Implements code, fixes bugs, adds features. Use for all code changes.
-- **debugger** — Investigates and fixes bugs using logs, metrics, database queries, and VM access. \
-Use for bug reports, error investigations, production incidents, and performance issues.
-- **tester** — Writes and runs tests. Use after coder sub-tasks to validate changes.
-- **reviewer** — Reviews code quality, checks for bugs/security. Use for important changes.
-- **report_writer** — Generates documentation and reports.
+- **coder** — All code changes. Give it specific files, patterns, and exact instructions.
+- **debugger** — Bug investigation using logs, metrics, DB queries. For incidents/errors.
+- **tester** — Writes and runs tests to validate changes.
+- **reviewer** — Code review for quality, security, correctness.
+- **report_writer** — Documentation and reports.
 
-NOTE: Do NOT create pr_creator or merge_agent sub-tasks in your plan. \
-PR creation and merging are handled automatically by the system after coder work completes.
+Do NOT create pr_creator or merge_agent sub-tasks — the system handles PR/merge automatically.
 
-REVIEW LOOP (review_loop field):
-- Set review_loop=true for critical or complex code changes that need the full \
-coder→reviewer→PR→merge cycle. The system will automatically chain a reviewer, PR creator, \
-and merge agent after the coder completes.
-- Use review_loop=true for: core business logic, security-sensitive code, API changes, \
-database migrations, infrastructure changes.
-- Use review_loop=false for: simple fixes, config changes, documentation, test-only changes, \
-straightforward additions.
+REVIEW LOOP: Set review_loop=true for critical changes (core logic, security, API contracts, \
+DB migrations). The system chains coder→reviewer→PR→merge automatically.
 
-SUB-TASK DESCRIPTIONS:
-- Be specific and detailed. Include which files to modify, what patterns to follow, \
-and what the expected outcome is.
-- Reference actual file paths and code patterns you discovered during exploration.
-- Include relevant context from your codebase exploration so the agent doesn't need to \
-re-discover everything.
+## Sub-Task Quality Standards
 
-SUB-TASK CONTEXT (the "context" field — REQUIRED for coder/debugger sub-tasks):
-Populate the "context" object on each sub-task with your exploration findings:
-- relevant_files: list of file paths the agent should look at or modify
-- current_state: what the code currently does (so the agent knows the starting point)
-- what_to_change: specific changes needed (not just "fix the bug" — describe the fix)
-- patterns_to_follow: coding patterns, naming conventions, or examples from the codebase
-- related_code: brief snippets or function signatures discovered during exploration
-- integration_points: how this sub-task connects to other sub-tasks or repos
+Each sub-task description must be a complete brief that an agent can execute without \
+re-exploring the codebase. Include:
 
-## Cross-Repo Exploration
+1. **VERIFIED file paths** — only paths you confirmed exist (or explicit "create new file at X")
+2. **Current state** — what the code does now (paste key snippets you read)
+3. **Exact changes** — not "update the API" but "add field X to the response type at line Y \
+in file Z, following the pattern used by field W"
+4. **Patterns to follow** — point to a specific existing example: "follow the pattern in \
+src/routes/users.py which does the same thing for user profiles"
+5. **Integration context** — how this change connects to other sub-tasks or systems
 
-Dependency repos are available at ../deps/{name}/ (read-only via workspace tools).
-- Use list_directory(path="../deps/") to see which dependency repos are available.
-- Use read_file(path="../deps/{name}/src/...") to read dependency source code.
-- Use search_files(pattern="...", path="../deps/{name}/") to search within a dependency.
-- When a task involves cross-repo concerns (shared types, API consumed from a dep, \
-integration patterns), ALWAYS explore both the main repo AND the relevant deps first.
-- For sub-tasks that need to modify a dependency repo, set target_repo to the \
-dependency name string (e.g. "auth-service"). The orchestrator resolves all repo metadata.
+BAD sub-task: "Add the new field to the API response"
+GOOD sub-task: "Add isLLMChatEnabled boolean to ProfileRes type in Backend/spec/profile.yaml \
+(line 45, alongside existing fields like hasCompletedSafetySetup). Then update \
+Backend/src/Profile/Handler.hs makeProfileRes function to compute the value from RiderConfig. \
+Follow the exact pattern used by hasCompletedSafetySetup — see line 89 of Handler.hs."
 
-## Query Enrichment
+## Cross-Repo Work
 
-Before creating your plan, proactively enrich the user's request:
-- Identify ambiguities or missing context in the task description.
-- Explore the codebase to find the actual file paths, current implementation, and patterns.
-- Discover the current behavior so you can describe what needs to change.
-- Make each sub-task description self-contained with all discovered context \
-(file paths, function names, current patterns) so agents can start working immediately.
+Dependency repos are at ../deps/{name}/ (read-only). Explore them with:
+- list_directory(path="../deps/") — see available repos
+- read_file(path="../deps/{name}/src/...") — read dependency code
+- search_files(pattern="...", path="../deps/{name}/") — exact string search within a dep
+
+For sub-tasks that MODIFY a dependency, set target_repo to the dependency name. \
+The orchestrator creates a writeable workspace automatically.
+
+When the task spans repos, explore BOTH repos and document the integration points \
+(API contracts, shared types, data flow) in each sub-task's context.
 
 ## Output Format
 
-After exploring the codebase, output ONLY a JSON object (no markdown fences, no extra text):
-{"summary":"...", "sub_tasks":[{"title":"...", "description":"...", "agent_role":"...", \
-"execution_order":0, "depends_on":[], "review_loop":false, "target_repo":"main", \
-"context":{"relevant_files":[], "current_state":"...", "what_to_change":"...", \
-"patterns_to_follow":"...", "related_code":"...", "integration_points":"..."}}], \
-"estimated_tokens":5000}
+After exploration, call submit_result with your plan. The plan MUST have this structure:
 
-Sub-task fields:
-- title: short descriptive title
-- description: detailed instructions for the agent
-- agent_role: one of the roles above
-- execution_order: 0 for parallel, sequential number for ordered execution
-- depends_on: list of 0-based indexes of sub-tasks this depends on
-- review_loop: true for critical code changes needing coder→reviewer→merge cycle
-- target_repo: REQUIRED — every sub-task MUST have this field set. Use "main" for work in \
-the main project repo. For dependency repo work, use the EXACT dependency name string from \
-the dependency repos list below (e.g. "auth-service"). This routes the agent to the correct \
-workspace — a wrong value means the agent codes in the wrong repo and the task fails.
-- context: exploration findings for the agent (REQUIRED for coder/debugger). Include \
-relevant_files, current_state, what_to_change, patterns_to_follow, related_code, \
-integration_points. This is the agent's primary reference — make it thorough.
+```json
+{
+  "summary": "Brief description of the overall plan",
+  "sub_tasks": [
+    {
+      "title": "Short descriptive title",
+      "description": "Detailed instructions with verified file paths and exact changes",
+      "agent_role": "coder",
+      "execution_order": 0,
+      "depends_on": [],
+      "review_loop": false,
+      "target_repo": "main",
+      "context": {
+        "relevant_files": ["path/to/file.py"],
+        "current_state": "What the code currently does",
+        "what_to_change": "Specific changes needed",
+        "patterns_to_follow": "Example from codebase to follow",
+        "related_code": "Key function signatures",
+        "integration_points": "How this connects to other parts"
+      }
+    }
+  ],
+  "estimated_tokens": 5000
+}
+```
+
+Rules:
+- sub_tasks array MUST have at least 1 entry — a plan with 0 sub-tasks is invalid
+- agent_role: coder | debugger | tester | reviewer | report_writer
+- target_repo: "main" or the exact dependency name
+- context is REQUIRED for coder and debugger roles
+- execution_order 0 = first wave (parallel), 1+ = sequential after dependencies
+- depends_on: 0-based indexes of sub-tasks that must complete first
 """
 
 
@@ -185,142 +189,113 @@ class PlanningPhase:
 
         planner_prompt = PLANNER_SYSTEM_PROMPT + f"\n\nAvailable agent roles: {available_roles}\n"
 
+        # Load project settings early — used for guidelines injection and plan approval check
+        from agents.utils.settings_helpers import parse_settings, read_setting
+        _proj_settings_row = await coord.db.fetchrow(
+            "SELECT settings_json FROM projects WHERE id = $1", todo["project_id"],
+        )
+        _proj_settings = parse_settings((_proj_settings_row or {}).get("settings_json"))
+
+        # Inject planning guidelines if configured
+        _guidelines = read_setting(_proj_settings, "planning.guidelines", "planning_guidelines", "")
+        if _guidelines:
+            planner_prompt += f"\n\n## Project Planning Guidelines\n{_guidelines}\n"
+
         # Resolve workspace for codebase exploration
-        workspace_path = None
+        # setup_task_workspace returns task_root (tasks/{todo_id}/)
+        # The main repo workspace is at task_root/repos/main/
+        workspace_path = None  # git working dir for main repo
+        task_root = None
         try:
             project = await coord.db.fetchrow(
                 "SELECT repo_url, workspace_path FROM projects WHERE id = $1",
                 todo["project_id"],
             )
             if project and project.get("repo_url"):
-                workspace_path = await coord.workspace_mgr.setup_task_workspace(coord.todo_id)
+                task_root = await coord.workspace_mgr.setup_task_workspace(coord.todo_id)
+                workspace_path = os.path.join(task_root, MAIN_REPO)
                 logger.info("[%s] Planner workspace ready at %s", coord.todo_id, workspace_path)
         except Exception:
             logger.exception("[%s] Could not set up planner workspace — planning will proceed without workspace tools",
                              coord.todo_id)
 
-        # ── Pre-build code indexes (structural + embedding) ──
-        repo_map_text: str | None = None
-        if workspace_path:
-            repo_dir = os.path.join(workspace_path, "repo")
-            if os.path.isdir(repo_dir):
-                project_index_dir = os.path.normpath(
-                    os.path.join(workspace_path, "..", "..", ".agent_index")
-                )
-                task_index_dir = os.path.join(workspace_path, ".agent_index")
-                try:
-                    from agents.indexing import (
-                        build_indexes_and_repo_map,
-                        copy_project_index_to_task,
-                    )
+        # ── Inject project knowledge so the planner doesn't re-explore everything ──
+        # This is the most important section — it gives the planner the analysis
+        # results so it can plan with knowledge instead of spending 100K tokens
+        # rediscovering what the project already analyzed.
 
-                    _had_base = await asyncio.to_thread(
-                        copy_project_index_to_task, project_index_dir, task_index_dir,
-                    )
+        understanding = context.get("project_understanding", {})
+        if understanding and isinstance(understanding, dict):
+            summary = understanding.get("summary", "")
+            arch = understanding.get("architecture", "")
+            tech = understanding.get("tech_stack", [])
+            build_workflow = understanding.get("build_workflow", "")
+            key_patterns = understanding.get("key_patterns", [])
+            api_surface = understanding.get("api_surface", "")
 
-                    await coord._post_system_message("Indexing codebase for planning...")
-                    _idx_t0 = time.monotonic()
-                    repo_map_text = await asyncio.to_thread(
-                        build_indexes_and_repo_map,
-                        repo_dir,
-                        cache_dir=task_index_dir,
-                        repo_map_budget=settings.repo_map_token_budget,
-                    )
-                    _idx_ms = int((time.monotonic() - _idx_t0) * 1000)
-                    logger.info(
-                        "[%s] Pre-indexing complete: repo_map=%s took=%dms",
-                        coord.todo_id,
-                        f"{len(repo_map_text)} chars" if repo_map_text else "None",
-                        _idx_ms,
-                    )
-                    try:
-                        await coord.redis.publish(
-                            f"task:{coord.todo_id}:events",
-                            json.dumps({
-                                "type": "index_build",
-                                "latency_ms": _idx_ms,
-                                "has_repo_map": repo_map_text is not None,
-                                "repo_map_chars": len(repo_map_text) if repo_map_text else 0,
-                                "from_base": _had_base,
-                            }),
-                        )
-                    except Exception:
-                        pass
-                except Exception:
-                    logger.warning(
-                        "[%s] Pre-indexing failed, planner will proceed without repo map",
-                        coord.todo_id, exc_info=True,
-                    )
+            planner_prompt += "\n\n## Project Knowledge (from analysis — use this, don't re-explore)"
+            if summary:
+                planner_prompt += f"\n{summary}"
+            if tech:
+                planner_prompt += f"\nTech stack: {', '.join(tech[:10])}"
+            if arch:
+                planner_prompt += f"\n\nArchitecture:\n{arch[:1000]}"
+            if build_workflow:
+                planner_prompt += f"\n\nBuild workflow:\n{build_workflow[:500]}"
+            if key_patterns:
+                planner_prompt += "\n\nKey patterns:\n" + "\n".join(f"- {p}" for p in key_patterns[:8])
+            if api_surface:
+                planner_prompt += f"\n\nAPI surface:\n{api_surface[:500]}"
 
-        # Add workspace context and tool instructions to system prompt
+        dep_understandings = context.get("dep_understandings", {})
+        if dep_understandings and isinstance(dep_understandings, dict):
+            planner_prompt += "\n\n## Dependency Repos"
+            for dep_name, dep_u in dep_understandings.items():
+                if isinstance(dep_u, dict):
+                    purpose = dep_u.get("purpose", "")
+                    api = dep_u.get("api_surface", "")
+                    dep_arch = dep_u.get("architecture", "")
+                    planner_prompt += f"\n\n### {dep_name}"
+                    if purpose:
+                        planner_prompt += f"\n{purpose}"
+                    if dep_arch:
+                        planner_prompt += f"\nArchitecture: {dep_arch[:300]}"
+                    if api:
+                        planner_prompt += f"\nAPI: {api[:400]}"
+
+        linking_doc = context.get("linking_document", {})
+        if linking_doc and isinstance(linking_doc, dict):
+            overview = linking_doc.get("overview", "")
+            if overview:
+                planner_prompt += f"\n\n## Cross-Repo Integration\n{overview[:800]}"
+            integrations = linking_doc.get("integrations", [])
+            if integrations:
+                for intg in integrations[:6]:
+                    src = intg.get("source_repo", "")
+                    tgt = intg.get("target_repo", "")
+                    pattern = intg.get("pattern", "")
+                    if src and tgt:
+                        planner_prompt += f"\n- {src} → {tgt}: {pattern[:150]}"
+
+        # ── Workspace tools and file tree ──
         if workspace_path:
             file_tree = coord.workspace_mgr.get_file_tree(workspace_path, max_depth=3)
-            workspace_block = f"\n\nProject file structure:\n{file_tree}\n"
-            if repo_map_text:
-                workspace_block += f"\n## Repository Symbol Map\n{repo_map_text}\n"
-            workspace_block += (
-                "\nYou MUST explore the codebase using the tools before outputting your plan. "
-                "Read relevant files, search for patterns, and understand the existing code."
-            )
-            planner_prompt += workspace_block
+            planner_prompt += f"\n\n## File Structure\n{file_tree}\n"
 
-            # Inject dependency info so planner knows about available deps
+            planner_prompt += (
+                "\nUse tools to verify specific files ONLY when the project knowledge above "
+                "doesn't have what you need. Don't re-explore what's already documented above."
+            )
+
             dep_dirs = context.get("dependency_dirs", {})
             deps_list = context.get("dependencies", [])
-            logger.info(
-                "[%s] Planner dep injection: dep_dirs=%s, deps_list_count=%d",
-                coord.todo_id, list(dep_dirs.keys()) if dep_dirs else "NONE", len(deps_list),
-            )
             if dep_dirs:
-                planner_prompt += "\n\nDependency repositories (read-only at ../deps/{dir_name}/, writable via target_repo):"
-                planner_prompt += "\nTo modify a dep repo, set target_repo to the dep name string. The orchestrator resolves all metadata."
-                planner_prompt += "\nTool outputs include [Repository: <name>] labels — use these to determine which repo each file belongs to."
+                planner_prompt += "\n\nDependency repos (read-only at ../deps/{name}/, writable via target_repo):"
                 for dep in deps_list:
                     name = dep.get("name", "")
                     dir_name = dep_dirs.get(name, "")
-                    repo_url = dep.get("repo_url", "")
                     if dir_name:
                         planner_prompt += f"\n  - \"{name}\" (browse at ../deps/{dir_name}/)"
-                        if not repo_url:
-                            logger.warning(
-                                "[%s] Dependency '%s' has no repo_url — target_repo will fail at execution",
-                                coord.todo_id, name,
-                            )
-
-            # Inject cross-repo integration links from project understanding
-            understanding = context.get("project_understanding", {})
-            cross_links = understanding.get("cross_repo_links", []) if isinstance(understanding, dict) else []
-            if cross_links:
-                planner_prompt += "\n\nKnown cross-repo integration points:"
-                for link in cross_links:
-                    dep = link.get("dep_name", "?")
-                    pattern = link.get("integration_pattern", "")
-                    main_files = ", ".join(link.get("main_repo_files", [])[:5])
-                    interfaces = ", ".join(link.get("shared_interfaces", [])[:5])
-                    planner_prompt += f"\n  - {dep}: {pattern}"
-                    if main_files:
-                        planner_prompt += f" (main repo: {main_files})"
-                    if interfaces:
-                        planner_prompt += f" (interfaces: {interfaces})"
-
-            # Inject per-dependency understandings
-            dep_understandings = context.get("dep_understandings", {})
-            if dep_understandings and isinstance(dep_understandings, dict):
-                planner_prompt += "\n\nDependency repo understandings:"
-                for dep_name, dep_u in dep_understandings.items():
-                    if isinstance(dep_u, dict):
-                        purpose = dep_u.get("purpose", "")
-                        api = dep_u.get("api_surface", "")
-                        planner_prompt += f"\n  - {dep_name}: {purpose}"
-                        if api:
-                            planner_prompt += f"\n    API: {api[:300]}"
-
-            # Inject linking document overview
-            linking_doc = context.get("linking_document", {})
-            if linking_doc and isinstance(linking_doc, dict):
-                overview = linking_doc.get("overview", "")
-                if overview:
-                    planner_prompt += f"\n\nCross-repo architecture:\n{overview[:800]}"
 
             planner_prompt += build_tools_prompt_block("planner")
 
@@ -337,9 +312,7 @@ class PlanningPhase:
             dep_names_str = ", ".join(f"'{n}'" for n in dep_dirs.keys())
             user_parts.append(
                 f"\nAvailable dependency repos: {dep_names_str}. "
-                "If this task requires changes to any dependency repo, set target_repo to the "
-                "dependency name on those sub-tasks (not 'main'). Explore the dep repos at "
-                "../deps/{name}/ to understand their structure."
+                "Sub-tasks modifying a dep MUST set target_repo to the dep name."
             )
 
         previous_run = intake_data.get("previous_run") if intake_data else None
@@ -409,13 +382,6 @@ class PlanningPhase:
         planner_tools = None
         if workspace_path:
             planner_tools = coord._get_builtin_tools(workspace_path, "planner")
-            _plan_idx = os.path.join(workspace_path, ".agent_index")
-            _plan_dep_dirs = coord._get_dep_index_dirs(workspace_path)
-            for _bt in planner_tools:
-                if _bt["name"] == "semantic_search":
-                    _bt["_index_dir"] = _plan_idx
-                    if _plan_dep_dirs:
-                        _bt["_dep_index_dirs"] = _plan_dep_dirs
 
             # Also include MCP tools if configured
             mcp_tools = await coord.tools_registry.resolve_tools(
@@ -476,6 +442,7 @@ class PlanningPhase:
             "Submit your execution plan. Call this AFTER exploring the codebase.")
 
         plan = None
+        _captured_plan_data: dict | None = None
         max_retries = 3
         for attempt in range(max_retries):
             if planner_tools:
@@ -484,19 +451,39 @@ class PlanningPhase:
                 tools_with_submit = list(planner_tools) + [plan_submit_tool]
 
                 async def _plan_tool_exec(name: str, args: dict) -> str:
+                    nonlocal _captured_plan_data
                     if name == "submit_result":
+                        _captured_plan_data = args
                         return json.dumps({"status": "received"})
                     return await coord.mcp_executor.execute_tool(
                         name, args, planner_tools,
                     )
+
+                async def _plan_tool_event(event: dict) -> None:
+                    """Publish planning tool events for frontend visibility."""
+                    try:
+                        event["phase"] = "planning"
+                        event["ts"] = time.time()
+                        payload = json.dumps(event)
+                        await coord.redis.publish(
+                            f"task:{coord.todo_id}:events", payload,
+                        )
+                        if getattr(coord, "_chat_session_id", None):
+                            await coord.redis.publish(
+                                f"chat:session:{coord._chat_session_id}:activity",
+                                payload,
+                            )
+                    except Exception:
+                        pass
 
                 _plan_token_cb = coord._build_token_streamer()
                 content, response = await run_tool_loop(
                     provider, messages,
                     tools=tools_with_submit,
                     tool_executor=_plan_tool_exec,
-                    max_rounds=70,
+                    max_rounds=500,
                     on_activity=lambda msg: coord._report_planning_activity(msg),
+                    on_tool_event=_plan_tool_event,
                     on_cancel_check=coord._is_cancelled,
                     on_token=_plan_token_cb,
                     temperature=0.1,
@@ -522,13 +509,22 @@ class PlanningPhase:
                 content = response.content
             await coord._track_tokens(response)
 
-            plan = extract_submit_result(
-                response.tool_calls, content, messages=messages,
-            )
+            # Use captured plan from tool executor (most reliable)
+            plan = _captured_plan_data
+            # If captured data has _raw_arguments (unparsed JSON string from provider),
+            # parse it — this happens with models that don't produce valid JSON tool args
+            if plan and "_raw_arguments" in plan and "sub_tasks" not in plan:
+                raw = plan.get("_raw_arguments", "")
+                if raw:
+                    parsed = parse_llm_json(raw)
+                    if parsed and parsed.get("sub_tasks"):
+                        plan = parsed
+                        logger.info("[%s] Parsed plan from captured _raw_arguments", coord.todo_id)
+            if plan is None:
+                plan = extract_submit_result(response.tool_calls, content)
             if plan is None:
                 plan = parse_llm_json(content)
-            # Last resort: if the model called submit_result with raw string
-            # args (common with kimi-latest), try to parse those
+            # Last resort: raw string args from tool_calls
             if plan is None and response.tool_calls:
                 for tc in response.tool_calls:
                     raw = tc.get("arguments", {}).get("_raw_arguments", "")
@@ -537,6 +533,7 @@ class PlanningPhase:
                         if plan:
                             logger.info("[%s] Recovered plan from _raw_arguments fallback", coord.todo_id)
                             break
+            _captured_plan_data = None  # Reset for next retry
             if plan is not None:
                 logger.info(
                     "[%s] Plan parsed on attempt %d: keys=%s, sub_tasks=%d",
@@ -561,8 +558,10 @@ class PlanningPhase:
                             coord.todo_id, dep_names,
                         )
                 else:
-                    logger.warning("[%s] Plan has ZERO sub_tasks! Raw content: %.500s",
-                                   coord.todo_id, content)
+                    logger.warning("[%s] Plan has ZERO sub_tasks on attempt %d, will retry",
+                                   coord.todo_id, attempt + 1)
+                    plan = None  # Force retry
+                    continue
                 break
 
             content_len = len(content or "")
@@ -627,7 +626,10 @@ class PlanningPhase:
         )
         max_review_iterations = 2
         for review_iter in range(max_review_iterations + 1):
-            review = await self.review_plan(plan, task_context, provider, context=context)
+            review = await self.review_plan(
+                plan, task_context, provider,
+                context=context, workspace_path=workspace_path,
+            )
 
             review_metadata = {
                 "action": "plan_review_verdict",
@@ -661,11 +663,27 @@ class PlanningPhase:
                 f"**Plan review (iteration {review_iter + 1}):** Revising plan...\n\n{feedback}",
                 metadata=review_metadata,
             )
+            previous_plan = plan
             plan = await self.re_plan_with_feedback(
                 plan, feedback, provider, todo, context,
                 workspace_path=workspace_path,
                 planner_tools=planner_tools,
+                planner_system_prompt=planner_prompt,
             )
+
+            # Detect when re-plan failed and returned the same plan unchanged
+            prev_titles = {st.get("title") for st in previous_plan.get("sub_tasks", [])}
+            new_titles = {st.get("title") for st in plan.get("sub_tasks", [])}
+            if prev_titles == new_titles and len(prev_titles) == len(plan.get("sub_tasks", [])):
+                logger.warning(
+                    "[%s] Re-plan returned identical plan (re-plan extraction likely failed), stopping review loop",
+                    coord.todo_id,
+                )
+                await coord._post_system_message(
+                    f"**Plan review:** Re-plan could not produce a revised plan. Proceeding with current plan.",
+                    metadata={**review_metadata, "replan_failed": True},
+                )
+                break
 
             await coord.db.execute(
                 "UPDATE todo_items SET plan_json = $2, updated_at = NOW() WHERE id = $1",
@@ -684,15 +702,10 @@ class PlanningPhase:
             for i, st in enumerate(plan.get("sub_tasks", []))
         )
 
-        # Check if human approval is required
-        project_row = await coord.db.fetchrow(
-            "SELECT settings_json FROM projects WHERE id = $1",
-            todo["project_id"],
+        # Check if human approval is required (using settings loaded at start of run())
+        require_plan_approval = read_setting(
+            _proj_settings, "planning.require_approval", "require_plan_approval", False,
         )
-        project_settings = project_row["settings_json"] or {} if project_row else {}
-        if isinstance(project_settings, str):
-            project_settings = json.loads(project_settings)
-        require_plan_approval = project_settings.get("require_plan_approval", False)
         has_chat_session = bool(getattr(coord, "_chat_session_id", None))
 
         if require_plan_approval or has_chat_session:
@@ -748,8 +761,55 @@ class PlanningPhase:
     # Plan review
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _verify_plan_paths(plan: dict, workspace_path: str | None) -> str:
+        """Check which file paths in the plan actually exist on disk.
+
+        Returns a summary string for the reviewer, e.g.:
+          VERIFIED (exists): Backend/spec/profile.yaml, Backend/src/Handler.hs
+          NOT FOUND: consumer/src/chat/ChatScreen.tsx
+          NEW FILE (to be created): Backend/spec/chat.yaml
+        """
+        if not workspace_path:
+            return ""
+
+        all_paths: dict[str, str] = {}  # path → subtask title
+        for st in plan.get("sub_tasks", []):
+            ctx = st.get("context", {})
+            if not isinstance(ctx, dict):
+                continue
+            title = st.get("title", "?")
+            for f in ctx.get("relevant_files", []):
+                if isinstance(f, str) and f.strip():
+                    all_paths[f.strip()] = title
+
+        if not all_paths:
+            return ""
+
+        verified = []
+        not_found = []
+        for path, title in sorted(all_paths.items()):
+            full = os.path.normpath(os.path.join(workspace_path, path))
+            if os.path.exists(full):
+                verified.append(path)
+            else:
+                not_found.append(path)
+
+        lines = []
+        if verified:
+            lines.append(f"VERIFIED (exist on disk): {', '.join(verified[:20])}")
+        if not_found:
+            lines.append(f"NOT FOUND on disk: {', '.join(not_found[:20])}")
+            lines.append(
+                "Note: 'not found' paths may be files the agent will CREATE — "
+                "only flag as hallucinated if the plan says to MODIFY an existing file "
+                "but the path doesn't exist."
+            )
+        return "\n".join(lines)
+
     async def review_plan(
-        self, plan: dict, task_context: str, provider: AIProvider, *, context: dict | None = None,
+        self, plan: dict, task_context: str, provider: AIProvider,
+        *, context: dict | None = None, workspace_path: str | None = None,
     ) -> dict:
         """LLM-based plan quality review. Returns {"approved": bool, "feedback": str}."""
         coord = self._coord
@@ -763,12 +823,18 @@ class PlanningPhase:
             "1. Every coder/debugger sub-task has specific context — references actual file paths, not vague descriptions\n"
             "2. Sub-task descriptions are actionable and clear about what needs to change\n"
             "3. Dependencies are logical (no circular deps, no unnecessary sequential chains)\n"
-            "4. The plan covers the full scope of the original task\n"
+            "4. The plan covers the full scope of the original task — nothing missing\n"
             "5. Agent roles are appropriate for the work described\n"
             "6. Parallelism is maximized — flag plans that are unnecessarily sequential\n"
-            "7. Sub-tasks have populated context objects with relevant_files where applicable\n"
-            "8. target_repo is correctly set — sub-tasks modifying a dependency repo MUST set "
-            "target_repo to the dependency name, NOT 'main'. Sub-tasks for the main repo use 'main'.\n\n"
+            "7. File paths are verified — check the 'Path Verification' section in the review input. "
+            "If paths meant to modify EXISTING files show as NOT FOUND, that's a real problem. "
+            "Paths for NEW files to be created are fine even if not found.\n"
+            "8. Sub-task descriptions are precise enough for an agent to execute WITHOUT re-exploring "
+            "the codebase — they should include exact file paths, current code state, and specific changes\n"
+            "9. target_repo is correctly set — sub-tasks modifying a dependency repo MUST set "
+            "target_repo to the dependency name, NOT 'main'. Sub-tasks for the main repo use 'main'.\n"
+            "10. The approach is architecturally sound — changes are in the right place, follow "
+            "existing patterns, and don't introduce unnecessary complexity\n\n"
         )
         if dep_names_for_review:
             review_system += (
@@ -796,16 +862,23 @@ class PlanningPhase:
         if len(plan_text) > 8000:
             plan_text = plan_text[:8000] + "\n...(truncated)"
 
+        # Pre-verify file paths mentioned in the plan so the reviewer
+        # has facts instead of guessing whether paths are hallucinated.
+        path_verification = self._verify_plan_paths(plan, workspace_path)
+
+        review_user = f"{task_context}\n\n"
+        if path_verification:
+            review_user += f"## Path Verification (automated)\n{path_verification}\n\n"
+        review_user += (
+            f"## Execution Plan to Review\n```json\n{plan_text}\n```\n\n"
+            "Review this plan against the criteria. The path verification above "
+            "shows which files actually exist — use it to judge path accuracy. "
+            "Submit your verdict."
+        )
+
         messages = [
             LLMMessage(role="system", content=review_system),
-            LLMMessage(
-                role="user",
-                content=(
-                    f"{task_context}\n\n"
-                    f"## Execution Plan to Review\n```json\n{plan_text}\n```\n\n"
-                    "Review this plan against the criteria and submit your verdict."
-                ),
-            ),
+            LLMMessage(role="user", content=review_user),
         ]
 
         try:
@@ -865,8 +938,14 @@ class PlanningPhase:
         *,
         workspace_path: str | None = None,
         planner_tools: list | None = None,
+        planner_system_prompt: str | None = None,
     ) -> dict:
-        """Re-run the planner with review feedback injected. Returns updated plan."""
+        """Re-run the planner with review feedback injected. Returns updated plan.
+
+        planner_system_prompt: the full enriched prompt from the original planning
+        run, including workspace context, dep info, and guidelines. If not provided,
+        falls back to the bare PLANNER_SYSTEM_PROMPT (loses all codebase context).
+        """
         coord = self._coord
         from agents.orchestrator.structured_output import build_submit_tool, extract_submit_result
 
@@ -927,15 +1006,19 @@ class PlanningPhase:
                 "Set target_repo to the dependency name for sub-tasks modifying a dep repo.\n"
             )
         replan_user_content += (
-            f"\n## Previous Plan\n```json\n{prev_plan_text}\n```\n\n"
-            f"## Review Feedback\n{feedback}\n\n"
-            "Revise the plan to address the review feedback. "
-            "You already explored the codebase — focus on fixing the identified issues. "
+            f"\n## CRITICAL: Review Feedback (MUST address)\n{feedback}\n\n"
+            f"## Previous Plan (rejected — see feedback above)\n```json\n{prev_plan_text}\n```\n\n"
+            "You MUST revise the plan to address ALL points in the review feedback above. "
+            "The previous plan was rejected specifically because of those issues. "
+            "Do NOT return the same plan — the reviewer will reject it again. "
+            "Use the workspace tools to explore the codebase if you need to understand "
+            "what files exist in dependency repos before creating sub-tasks for them. "
             "Submit the complete revised plan via submit_result."
         )
 
+        system_prompt = planner_system_prompt or PLANNER_SYSTEM_PROMPT
         messages = [
-            LLMMessage(role="system", content=PLANNER_SYSTEM_PROMPT),
+            LLMMessage(role="system", content=system_prompt),
             LLMMessage(role="user", content=replan_user_content),
         ]
 
@@ -943,12 +1026,16 @@ class PlanningPhase:
         if planner_tools:
             tools_for_replan = list(planner_tools) + [plan_submit_tool]
 
+        _captured_plan: dict | None = None
+
         try:
             if planner_tools:
                 from agents.providers.base import run_tool_loop
 
                 async def _replan_tool_exec(name: str, args: dict) -> str:
+                    nonlocal _captured_plan
                     if name == "submit_result":
+                        _captured_plan = args  # Capture the plan data directly
                         return json.dumps({"status": "received"})
                     return await coord.mcp_executor.execute_tool(
                         name, args, planner_tools,
@@ -959,7 +1046,7 @@ class PlanningPhase:
                     provider, messages,
                     tools=tools_for_replan,
                     tool_executor=_replan_tool_exec,
-                    max_rounds=30,
+                    max_rounds=500,
                     on_activity=lambda msg: coord._report_planning_activity(msg),
                     on_cancel_check=coord._is_cancelled,
                     on_token=_replan_token_cb,
@@ -969,7 +1056,6 @@ class PlanningPhase:
                 if hasattr(_replan_token_cb, "flush"):
                     await _replan_token_cb.flush()
             else:
-                # No workspace tools — try structured tool first, then plain text
                 response = await provider.send_message(
                     messages, temperature=0.1, max_tokens=16384,
                     tools=[plan_submit_tool],
@@ -979,48 +1065,46 @@ class PlanningPhase:
 
             await coord._track_tokens(response)
 
-            revised = extract_submit_result(response.tool_calls, content, messages=messages)
+            # Use captured plan from tool executor (most reliable)
+            revised = _captured_plan
+            if revised and "_raw_arguments" in revised and "sub_tasks" not in revised:
+                raw = revised.get("_raw_arguments", "")
+                if raw:
+                    parsed = parse_llm_json(raw)
+                    if parsed and parsed.get("sub_tasks"):
+                        revised = parsed
+            if revised is None:
+                revised = extract_submit_result(response.tool_calls, content)
             if revised is None:
                 revised = parse_llm_json(content)
-            # Fallback: try _raw_arguments
-            if revised is None and response.tool_calls:
-                for tc in response.tool_calls:
-                    raw = tc.get("arguments", {}).get("_raw_arguments", "")
-                    if raw:
-                        revised = parse_llm_json(raw)
-                        if revised:
-                            break
 
             if revised and revised.get("sub_tasks"):
-                logger.info(
-                    "[%s] Re-plan produced %d sub-tasks",
-                    coord.todo_id, len(revised["sub_tasks"]),
-                )
+                logger.info("[%s] Re-plan produced %d sub-tasks", coord.todo_id, len(revised["sub_tasks"]))
                 return revised
 
-            # If tool-based extraction failed, retry without tools
-            if not planner_tools:
-                logger.warning("[%s] Re-plan tool extraction failed, retrying as plain JSON", coord.todo_id)
-                messages.append(LLMMessage(role="assistant", content=content or ""))
-                messages.append(LLMMessage(
-                    role="user",
-                    content=(
-                        "Your response could not be parsed. Respond with ONLY a raw JSON object "
-                        "containing your revised plan. No markdown fences, no other text."
-                    ),
-                ))
-                retry_resp = await provider.send_message(
-                    messages, temperature=0.1, max_tokens=16384,
-                )
-                await coord._track_tokens(retry_resp)
-                revised = parse_llm_json(retry_resp.content)
-                if revised and revised.get("sub_tasks"):
-                    logger.info("[%s] Re-plan (retry) produced %d sub-tasks",
-                                coord.todo_id, len(revised["sub_tasks"]))
-                    return revised
+            # Extraction failed — retry as plain JSON
+            logger.warning(
+                "[%s] Re-plan extraction failed (captured=%s, content_len=%d), retrying as plain JSON",
+                coord.todo_id, _captured_plan is not None, len(content) if content else 0,
+            )
+            messages.append(LLMMessage(role="assistant", content=content or ""))
+            messages.append(LLMMessage(role="user", content=(
+                "Your response could not be parsed. Respond with ONLY a JSON object: "
+                '{"summary": "...", "sub_tasks": [...]}. No markdown, no other text.'
+            )))
+            retry_resp = await provider.send_message(messages, temperature=0.1, max_tokens=16384)
+            await coord._track_tokens(retry_resp)
+            revised = parse_llm_json(retry_resp.content)
+            if revised and revised.get("sub_tasks"):
+                logger.info("[%s] Re-plan (retry) produced %d sub-tasks", coord.todo_id, len(revised["sub_tasks"]))
+                return revised
         except Exception:
             logger.warning("[%s] Re-plan failed, keeping previous plan", coord.todo_id, exc_info=True)
 
+        logger.warning(
+            "[%s] Re-plan did not produce a valid revised plan, returning previous plan unchanged",
+            coord.todo_id,
+        )
         return previous_plan
 
     # ------------------------------------------------------------------
@@ -1037,6 +1121,11 @@ class PlanningPhase:
         if not plan.get("sub_tasks"):
             logger.error("[%s] auto_approve_plan: NO sub_tasks in plan! Plan: %.1000s",
                          coord.todo_id, json.dumps(plan, default=str))
+            await coord._post_system_message(
+                "**Planning failed:** Plan has no sub-tasks. Cannot execute."
+            )
+            await coord._transition_todo("failed", error_message="Plan produced 0 sub-tasks")
+            return
 
         # Load context_docs for deterministic target_repo resolution
         project = await coord.db.fetchrow(
@@ -1131,9 +1220,7 @@ class PlanningPhase:
         )
 
         # Immediately start execution
-        logger.info("[%s] Resolving provider for execution...", coord.todo_id)
-        todo = await coord._load_todo()
-        provider = await coord.provider_registry.resolve_for_todo(coord.todo_id)
-        logger.info("[%s] Provider resolved: %s/%s. Starting execution",
-                    coord.todo_id, provider.provider_type, provider.default_model)
-        await coord._execution.run(todo, provider)
+        # Don't chain into execution directly — return and let the scheduler
+        # pick up the in_progress state on the next dispatch. This avoids
+        # dual execution paths (old ExecutionPhase vs scheduler._execute_jobs).
+        logger.info("[%s] Plan approved, subtasks created. Returning to scheduler for execution.", coord.todo_id)

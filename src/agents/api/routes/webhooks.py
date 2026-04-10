@@ -6,6 +6,7 @@ webhook payloads using HMAC-SHA256 (GitHub) or secret token headers (GitLab).
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import json
@@ -94,6 +95,9 @@ async def github_webhook(project_id: str, request: Request):
             pr_number=pr.get("number"),
             merged=pr.get("merged", False),
             merge_commit_sha=pr.get("merge_commit_sha"),
+            pr_title=pr.get("title", ""),
+            branch_name=pr.get("head", {}).get("ref", ""),
+            repo_url=pr.get("base", {}).get("repo", {}).get("html_url", ""),
         )
     elif event_type == "ping":
         return {"status": "pong"}
@@ -135,12 +139,16 @@ async def gitlab_webhook(project_id: str, request: Request):
 
     if event_type == "Merge Request Hook":
         attrs = payload.get("object_attributes", {})
+        source = attrs.get("source", {})
         await _handle_pr_event(
             db, redis, event_bus, project_id,
             action=attrs.get("action", ""),
             pr_number=attrs.get("iid"),
             merged=(attrs.get("state") == "merged"),
             merge_commit_sha=attrs.get("merge_commit_sha"),
+            pr_title=attrs.get("title", ""),
+            branch_name=attrs.get("source_branch", ""),
+            repo_url=source.get("web_url", ""),
         )
 
     return {"status": "ok"}
@@ -160,10 +168,14 @@ async def _handle_pr_event(
     pr_number: int | None,
     merged: bool,
     merge_commit_sha: str | None = None,
+    pr_title: str = "",
+    branch_name: str = "",
+    repo_url: str = "",
 ) -> None:
     """Process a PR merge/close event.
 
     Finds the matching deliverable and wakes any merge_observer subtask.
+    Also triggers the standalone merge pipeline if enabled.
     """
     if not pr_number:
         return
@@ -185,45 +197,72 @@ async def _handle_pr_event(
         """,
         project_id, pr_number,
     )
-    if not deliv:
+
+    if deliv:
+        todo_id = str(deliv["todo_id"])
+
+        if merged:
+            await db.execute(
+                "UPDATE deliverables SET pr_state = 'merged', merged_at = NOW(), "
+                "status = 'approved' WHERE id = $1",
+                deliv["id"],
+            )
+            logger.info("[webhook] PR #%d marked as merged for todo %s", pr_number, todo_id[:8])
+
+        # Wake the merge_observer via Redis signal
+        await redis.set(
+            f"merge_observer:{todo_id}:wake",
+            json.dumps({
+                "pr_number": pr_number,
+                "merged": merged,
+                "sha": merge_commit_sha or "",
+            }),
+            ex=86400,  # 24h TTL
+        )
+
+        # Publish event to wake the orchestrator if observer isn't actively running
+        from agents.orchestrator.events import TaskEvent
+
+        await event_bus.publish(TaskEvent(
+            event_type="pr_merged" if merged else "pr_closed",
+            todo_id=todo_id,
+            state="in_progress",
+            metadata={"pr_number": pr_number, "merge_commit_sha": merge_commit_sha or ""},
+        ))
+
+        logger.info(
+            "[webhook] PR #%d %s for todo %s — observer woken",
+            pr_number, "merged" if merged else "closed", todo_id[:8],
+        )
+    else:
         logger.info(
             "[webhook] No deliverable found for PR #%d in project %s",
             pr_number, project_id[:8],
         )
-        return
 
-    todo_id = str(deliv["todo_id"])
-
+    # Trigger post-merge hooks (independent of task system)
     if merged:
-        await db.execute(
-            "UPDATE deliverables SET pr_state = 'merged', merged_at = NOW(), "
-            "status = 'approved' WHERE id = $1",
-            deliv["id"],
+        from agents.orchestrator.merge_pipeline import (
+            run_post_merge_actions,
+            trigger_merge_pipeline,
         )
-        logger.info("[webhook] PR #%d marked as merged for todo %s", pr_number, todo_id[:8])
 
-    # Wake the merge_observer via Redis signal
-    await redis.set(
-        f"merge_observer:{todo_id}:wake",
-        json.dumps({
-            "pr_number": pr_number,
-            "merged": merged,
-            "sha": merge_commit_sha or "",
-        }),
-        ex=86400,  # 24h TTL
-    )
+        merge_kwargs = dict(
+            pr_number=pr_number, pr_title=pr_title, branch_name=branch_name,
+            commit_hash=merge_commit_sha or "", repo_url=repo_url,
+        )
 
-    # Publish event to wake the orchestrator if observer isn't actively running
-    from agents.orchestrator.events import TaskEvent
+        # Post-merge actions (webhook calls, scripts) — fire-and-forget
+        asyncio.create_task(
+            run_post_merge_actions(db, redis, project_id, **merge_kwargs)
+        )
 
-    await event_bus.publish(TaskEvent(
-        event_type="pr_merged" if merged else "pr_closed",
-        todo_id=todo_id,
-        state="in_progress",
-        metadata={"pr_number": pr_number, "merge_commit_sha": merge_commit_sha or ""},
-    ))
-
-    logger.info(
-        "[webhook] PR #%d %s for todo %s — observer woken",
-        pr_number, "merged" if merged else "closed", todo_id[:8],
-    )
+        # Full merge pipeline (test verification → deploy)
+        run_id = await trigger_merge_pipeline(
+            db, redis, project_id, **merge_kwargs,
+        )
+        if run_id:
+            logger.info(
+                "[webhook] Merge pipeline triggered: run=%s PR=#%d project=%s",
+                run_id[:8], pr_number, project_id[:8],
+            )

@@ -34,7 +34,7 @@ VALID_TRANSITIONS: dict[str, set[str]] = {
 VALID_SUBTASK_TRANSITIONS: dict[str, set[str]] = {
     "pending": {"assigned", "cancelled", "failed"},
     "assigned": {"running", "cancelled"},
-    "running": {"completed", "failed", "cancelled", "pending"},  # pending = pause for retry (CI wait, merge approval)
+    "running": {"completed", "failed", "cancelled", "pending", "assigned"},  # assigned = re-dispatch after stale recovery
     "failed": {"pending"},  # retry
 }
 
@@ -148,6 +148,8 @@ async def transition_subtask(
         return None
 
     current = row["status"]
+    if current == target_status:
+        return dict(row)  # no-op: already in the target state
     if not validate_subtask_transition(current, target_status):
         raise ValueError(f"Invalid sub-task transition: {current} -> {target_status}")
 

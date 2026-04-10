@@ -70,7 +70,9 @@ class _CoordinatorAdapter:
     async def _build_context(self, todo: dict) -> dict:
         """Build project context for the planner."""
         from agents.orchestrator.context_builder import ContextBuilder
-        builder = ContextBuilder(self.db)
+        builder = ContextBuilder(
+            self.db, self.todo_id, self.workspace_mgr, self.provider_registry,
+        )
         return await builder.build_context(todo)
 
     def _get_builtin_tools(self, workspace_path: str, role: str):
@@ -78,19 +80,8 @@ class _CoordinatorAdapter:
         return get_builtin_tool_schemas(workspace_path, role)
 
     def _get_dep_index_dirs(self, workspace_path: str) -> dict[str, str]:
-        import os
-        deps_root = os.path.join(workspace_path, ".agent_index_deps")
-        if not os.path.isdir(deps_root):
-            return {}
-        result = {}
-        try:
-            for entry in os.listdir(deps_root):
-                idx = os.path.join(deps_root, entry)
-                if os.path.isdir(idx):
-                    result[entry] = idx
-        except OSError:
-            pass
-        return result
+        from agents.utils.file_utils import get_dep_index_dirs
+        return get_dep_index_dirs(workspace_path)
 
 
 class PlannerAgent(BaseAgent):

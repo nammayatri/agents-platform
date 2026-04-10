@@ -11,6 +11,8 @@ import type {
   ProjectMember, DebugContext, ProjectMemory,
   FileTreeNode, FileContent, GitStatus,
   ProviderRepos, ReleaseConfig,
+  MergePipelineConfig, PipelineRun, PipelineVariable,
+  PostMergeRepoConfig,
 } from '../types'
 
 const API_BASE = '/api'
@@ -75,6 +77,12 @@ export const projects = {
   delete: (id: string) => request<void>(`/projects/${id}`, { method: 'DELETE' }),
   analyze: (id: string) => request<{ status: string }>(`/projects/${id}/analyze`, { method: 'POST' }),
   cancelAnalysis: (id: string) => request<{ status: string }>(`/projects/${id}/cancel-analysis`, { method: 'POST' }),
+  getSettings: (id: string) =>
+    request<Record<string, unknown>>(`/projects/${id}/settings`),
+  updateSettingsSection: (id: string, section: string, data: Record<string, unknown>) =>
+    request<Record<string, unknown>>(`/projects/${id}/settings/${section}`, {
+      method: 'PUT', body: JSON.stringify(data),
+    }),
   rules: {
     get: (projectId: string) =>
       request<Record<string, string[]>>(`/projects/${projectId}/rules`),
@@ -106,12 +114,42 @@ export const projects = {
   },
   releaseSettings: {
     get: (projectId: string) =>
-      request<{ release_pipeline_enabled: boolean; release_config: ReleaseConfig }>(
+      request<{ release_pipeline_enabled: boolean; release_configs: Record<string, ReleaseConfig>; repos: Array<{ name: string; repo_url: string }> }>(
         `/projects/${projectId}/release-settings`,
       ),
-    update: (projectId: string, data: { release_pipeline_enabled?: boolean; release_config?: ReleaseConfig }) =>
-      request<{ release_pipeline_enabled: boolean; release_config: ReleaseConfig }>(
+    update: (projectId: string, data: { release_pipeline_enabled?: boolean; release_configs?: Record<string, ReleaseConfig> }) =>
+      request<{ release_pipeline_enabled: boolean; release_configs: Record<string, ReleaseConfig> }>(
         `/projects/${projectId}/release-settings`,
+        { method: 'PUT', body: JSON.stringify(data) },
+      ),
+  },
+  mergePipeline: {
+    getSettings: (projectId: string) =>
+      request<{ merge_pipelines: Record<string, MergePipelineConfig>; repos: Array<{ name: string; repo_url: string }> }>(
+        `/projects/${projectId}/merge-pipeline-settings`,
+      ),
+    updateSettings: (projectId: string, data: { merge_pipelines: Record<string, MergePipelineConfig> }) =>
+      request<{ merge_pipelines: Record<string, MergePipelineConfig> }>(
+        `/projects/${projectId}/merge-pipeline-settings`,
+        { method: 'PUT', body: JSON.stringify(data) },
+      ),
+    listRuns: (projectId: string) =>
+      request<PipelineRun[]>(`/projects/${projectId}/pipeline-runs`),
+    getRun: (projectId: string, runId: string) =>
+      request<PipelineRun>(`/projects/${projectId}/pipeline-runs/${runId}`),
+    cancelRun: (projectId: string, runId: string) =>
+      request<{ status: string }>(`/projects/${projectId}/pipeline-runs/${runId}/cancel`, { method: 'POST' }),
+    getVariables: (projectId: string) =>
+      request<{ variables: PipelineVariable[] }>(`/projects/${projectId}/pipeline-variables`),
+  },
+  postMergeActions: {
+    get: (projectId: string) =>
+      request<{ post_merge_actions: Record<string, PostMergeRepoConfig>; repos: Array<{ name: string; repo_url: string }> }>(
+        `/projects/${projectId}/post-merge-actions`,
+      ),
+    update: (projectId: string, data: { post_merge_actions: Record<string, PostMergeRepoConfig> }) =>
+      request<{ post_merge_actions: Record<string, PostMergeRepoConfig> }>(
+        `/projects/${projectId}/post-merge-actions`,
         { method: 'PUT', body: JSON.stringify(data) },
       ),
   },
@@ -233,6 +271,22 @@ export const todos = {
       if (repo) params.set('repo', repo)
       const qs = params.toString()
       return request<{ diff: string; stats: string }>(`/todos/${todoId}/workspace/git/diff${qs ? `?${qs}` : ''}`)
+    },
+    taskDiff: (todoId: string, repo?: string) => {
+      const params = new URLSearchParams()
+      if (repo) params.set('repo', repo)
+      const qs = params.toString()
+      return request<{ diff: string; stats: string; files: Array<{ status: string; path: string }>; has_changes: boolean; base_commit?: string }>(
+        `/todos/${todoId}/workspace/git/task-diff${qs ? `?${qs}` : ''}`,
+      )
+    },
+    subtaskDiff: (todoId: string, subtaskId: string, repo?: string) => {
+      const params = new URLSearchParams()
+      if (repo) params.set('repo', repo)
+      const qs = params.toString()
+      return request<{ diff: string; stats: string; files: Array<{ status: string; path: string }>; has_changes: boolean; commit_hash?: string }>(
+        `/todos/${todoId}/workspace/git/subtask-diff/${subtaskId}${qs ? `?${qs}` : ''}`,
+      )
     },
     gitAdd: (todoId: string, paths: string[], repo?: string) =>
       request<GitStatus>(`/todos/${todoId}/workspace/git/add`, {
@@ -489,6 +543,7 @@ export const admin = {
     ),
   stats: () => request<Record<string, number>>('/admin/stats'),
   auditLog: (limit = 100) => request<Record<string, unknown>[]>(`/admin/audit-log?limit=${limit}`),
+  testEmail: () => request<{ status: string; detail?: string }>('/admin/settings/email/test', { method: 'POST' }),
   getSetting: (key: string) => request<Record<string, unknown>>(`/admin/settings/${key}`),
   putSetting: (key: string, value: Record<string, string>) =>
     request<Record<string, unknown>>(`/admin/settings/${key}`, { method: 'PUT', body: JSON.stringify({ value_json: value }) }),

@@ -1,12 +1,22 @@
 import asyncio
 import json
+import logging
 import secrets
+from typing import Any
 
 from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel
 
 from agents.api.deps import DB, CurrentUser, Redis, check_project_access, check_project_owner
+from agents.utils.settings_helpers import (
+    VALID_SECTIONS,
+    get_build_command_strings,
+    migrate_settings,
+    parse_settings,
+    read_setting,
+)
 
+logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
@@ -37,6 +47,7 @@ class UpdateProjectInput(BaseModel):
     context_docs: list[ProjectDependency] | None = None
     git_provider_id: str | None = None
     icon_url: str | None = None
+    # Legacy fields — kept for backwards compat; prefer PUT /settings/execution
     architect_editor_enabled: bool | None = None
     architect_model: str | None = None
     editor_model: str | None = None
@@ -92,6 +103,10 @@ async def create_project(body: CreateProjectInput, user: CurrentUser, db: DB, re
     )
     result = _sanitize_project(dict(row))
 
+    # Copy pipeline configs from an existing project with the same repo
+    if body.repo_url:
+        await _copy_pipeline_configs_from_existing(db, str(row["id"]), body.repo_url)
+
     # Kick off async project analysis if repo_url is provided
     if body.repo_url:
         asyncio.create_task(_analyze_project(str(row["id"]), db, redis))
@@ -121,10 +136,11 @@ async def update_project(project_id: str, body: UpdateProjectInput, user: Curren
     if not updates:
         return _sanitize_project(dict(row))
 
-    # Ensure context_docs is a list of dicts (not Pydantic models)
+    # Ensure context_docs entries are plain dicts (not Pydantic models)
     if "context_docs" in updates:
         updates["context_docs"] = [
-            d if isinstance(d, dict) else d for d in updates["context_docs"]
+            d.model_dump(exclude_none=True) if hasattr(d, "model_dump") else d
+            for d in updates["context_docs"]
         ]
 
     set_parts = []
@@ -184,11 +200,14 @@ async def cancel_analysis(project_id: str, user: CurrentUser, db: DB):
     row = await db.fetchrow("SELECT settings_json FROM projects WHERE id = $1", project_id)
     if not row:
         raise HTTPException(status_code=404)
-    settings = row["settings_json"] or {}
-    if isinstance(settings, str):
-        settings = json.loads(settings)
-    if settings.get("analysis_status") == "analyzing":
-        settings["analysis_status"] = None
+    settings = parse_settings(row["settings_json"])
+    status_val = read_setting(settings, "understanding.status", "analysis_status")
+    if status_val == "analyzing":
+        # Update in whichever format the settings are currently in
+        if isinstance(settings.get("understanding"), dict):
+            settings["understanding"]["status"] = None
+        else:
+            settings["analysis_status"] = None
         await db.execute(
             "UPDATE projects SET settings_json = $2, updated_at = NOW() WHERE id = $1",
             project_id,
@@ -341,10 +360,8 @@ async def get_work_rules(project_id: str, user: CurrentUser, db: DB):
     """Get project-level work rules."""
     await check_project_access(db, project_id, user)
     row = await db.fetchrow("SELECT settings_json FROM projects WHERE id = $1", project_id)
-    settings = row["settings_json"] or {}
-    if isinstance(settings, str):
-        settings = json.loads(settings)
-    return settings.get("work_rules", {})
+    settings = parse_settings(row["settings_json"])
+    return read_setting(settings, "execution.work_rules", "work_rules", {})
 
 
 @router.put("/{project_id}/rules")
@@ -352,14 +369,13 @@ async def update_work_rules(project_id: str, body: WorkRulesInput, user: Current
     """Update project-level work rules. Owner-only. Merges by category."""
     await check_project_owner(db, project_id, user)
     row = await db.fetchrow("SELECT settings_json FROM projects WHERE id = $1", project_id)
-    settings = row["settings_json"] or {}
-    if isinstance(settings, str):
-        settings = json.loads(settings)
+    settings = parse_settings(row["settings_json"])
+    settings = migrate_settings(settings)
 
-    rules = settings.get("work_rules", {})
+    rules = settings.get("execution", {}).get("work_rules", {})
     for category, values in body.model_dump(exclude_none=True).items():
         rules[category] = values
-    settings["work_rules"] = rules
+    settings.setdefault("execution", {})["work_rules"] = rules
 
     await db.execute(
         "UPDATE projects SET settings_json = $2, updated_at = NOW() WHERE id = $1",
@@ -374,10 +390,8 @@ async def get_debug_context(project_id: str, user: CurrentUser, db: DB):
     """Get project-level debug context (log sources, MCP hints, instructions)."""
     await check_project_access(db, project_id, user)
     row = await db.fetchrow("SELECT settings_json FROM projects WHERE id = $1", project_id)
-    settings = row["settings_json"] or {}
-    if isinstance(settings, str):
-        settings = json.loads(settings)
-    return settings.get("debug_context", {})
+    settings = parse_settings(row["settings_json"])
+    return read_setting(settings, "debugging", "debug_context", {})
 
 
 @router.put("/{project_id}/debug-context")
@@ -387,18 +401,17 @@ async def update_debug_context(
     """Update project-level debug context. Owner-only."""
     await check_project_owner(db, project_id, user)
     row = await db.fetchrow("SELECT settings_json FROM projects WHERE id = $1", project_id)
-    settings = row["settings_json"] or {}
-    if isinstance(settings, str):
-        settings = json.loads(settings)
+    settings = parse_settings(row["settings_json"])
+    settings = migrate_settings(settings)
 
-    settings["debug_context"] = body.model_dump(exclude_none=True)
+    settings["debugging"] = body.model_dump(exclude_none=True)
 
     await db.execute(
         "UPDATE projects SET settings_json = $2, updated_at = NOW() WHERE id = $1",
         project_id,
         settings,
     )
-    return settings["debug_context"]
+    return settings["debugging"]
 
 
 class BuildSettingsInput(BaseModel):
@@ -442,8 +455,9 @@ class ReleaseConfig(BaseModel):
 
 
 class ReleaseSettingsInput(BaseModel):
+    """Per-repo release config. Key is repo name ('main' or dep name)."""
     release_pipeline_enabled: bool | None = None
-    release_config: ReleaseConfig | None = None
+    release_configs: dict[str, ReleaseConfig] | None = None
 
 
 @router.get("/{project_id}/build-settings")
@@ -451,14 +465,12 @@ async def get_build_settings(project_id: str, user: CurrentUser, db: DB):
     """Get project build & merge settings."""
     await check_project_access(db, project_id, user)
     row = await db.fetchrow("SELECT settings_json FROM projects WHERE id = $1", project_id)
-    settings = row["settings_json"] or {}
-    if isinstance(settings, str):
-        settings = json.loads(settings)
+    settings = parse_settings(row["settings_json"])
     return {
-        "build_commands": settings.get("build_commands", []),
-        "merge_method": settings.get("merge_method", "squash"),
-        "require_merge_approval": settings.get("require_merge_approval", False),
-        "require_plan_approval": settings.get("require_plan_approval", False),
+        "build_commands": read_setting(settings, "git.build_commands", "build_commands", []),
+        "merge_method": read_setting(settings, "git.merge_method", "merge_method", "squash"),
+        "require_merge_approval": read_setting(settings, "git.require_merge_approval", "require_merge_approval", False),
+        "require_plan_approval": read_setting(settings, "planning.require_approval", "require_plan_approval", False),
     }
 
 
@@ -471,18 +483,20 @@ async def update_build_settings(
     row = await db.fetchrow("SELECT settings_json FROM projects WHERE id = $1", project_id)
     if not row:
         raise HTTPException(status_code=404)
-    settings = row["settings_json"] or {}
-    if isinstance(settings, str):
-        settings = json.loads(settings)
+    settings = parse_settings(row["settings_json"])
+    settings = migrate_settings(settings)
+
+    git = settings.setdefault("git", {})
+    planning = settings.setdefault("planning", {})
 
     if body.build_commands is not None:
-        settings["build_commands"] = body.build_commands
+        git["build_commands"] = body.build_commands
     if body.merge_method is not None:
-        settings["merge_method"] = body.merge_method
+        git["merge_method"] = body.merge_method
     if body.require_merge_approval is not None:
-        settings["require_merge_approval"] = body.require_merge_approval
+        git["require_merge_approval"] = body.require_merge_approval
     if body.require_plan_approval is not None:
-        settings["require_plan_approval"] = body.require_plan_approval
+        planning["require_approval"] = body.require_plan_approval
 
     await db.execute(
         "UPDATE projects SET settings_json = $2, updated_at = NOW() WHERE id = $1",
@@ -490,24 +504,35 @@ async def update_build_settings(
         settings,
     )
     return {
-        "build_commands": settings.get("build_commands", []),
-        "merge_method": settings.get("merge_method", "squash"),
-        "require_merge_approval": settings.get("require_merge_approval", False),
-        "require_plan_approval": settings.get("require_plan_approval", False),
+        "build_commands": git.get("build_commands", []),
+        "merge_method": git.get("merge_method", "squash"),
+        "require_merge_approval": git.get("require_merge_approval", False),
+        "require_plan_approval": planning.get("require_approval", False),
     }
 
 
 @router.get("/{project_id}/release-settings")
 async def get_release_settings(project_id: str, user: CurrentUser, db: DB):
-    """Get project release pipeline settings."""
+    """Get project release pipeline settings (per-repo)."""
     await check_project_access(db, project_id, user)
-    row = await db.fetchrow("SELECT settings_json FROM projects WHERE id = $1", project_id)
-    settings = row["settings_json"] or {}
-    if isinstance(settings, str):
-        settings = json.loads(settings)
+    row = await db.fetchrow(
+        "SELECT settings_json, repo_url, context_docs FROM projects WHERE id = $1", project_id,
+    )
+    if not row:
+        raise HTTPException(status_code=404)
+    settings = parse_settings(row["settings_json"])
+
+    # Backwards compat: migrate old single release_config to per-repo dict
+    release_configs = settings.get("release_configs", {})
+    if not release_configs and settings.get("release_config"):
+        release_configs = {"main": settings["release_config"]}
+
+    repos = _build_repo_list(row)
+
     return {
-        "release_pipeline_enabled": settings.get("release_pipeline_enabled", False),
-        "release_config": settings.get("release_config", {}),
+        "release_pipeline_enabled": read_setting(settings, "release.enabled", "release_pipeline_enabled", False),
+        "release_configs": release_configs,
+        "repos": repos,
     }
 
 
@@ -515,19 +540,23 @@ async def get_release_settings(project_id: str, user: CurrentUser, db: DB):
 async def update_release_settings(
     project_id: str, body: ReleaseSettingsInput, user: CurrentUser, db: DB,
 ):
-    """Update project release pipeline settings. Owner-only."""
+    """Update project release pipeline settings (per-repo). Owner-only."""
     await check_project_owner(db, project_id, user)
     row = await db.fetchrow("SELECT settings_json FROM projects WHERE id = $1", project_id)
     if not row:
         raise HTTPException(status_code=404)
-    settings = row["settings_json"] or {}
-    if isinstance(settings, str):
-        settings = json.loads(settings)
+    settings = parse_settings(row["settings_json"])
+    settings = migrate_settings(settings)
 
     if body.release_pipeline_enabled is not None:
-        settings["release_pipeline_enabled"] = body.release_pipeline_enabled
-    if body.release_config is not None:
-        settings["release_config"] = body.release_config.model_dump(exclude_none=True)
+        settings.setdefault("release", {})["enabled"] = body.release_pipeline_enabled
+    if body.release_configs is not None:
+        settings["release_configs"] = {
+            k: v.model_dump(exclude_none=True) for k, v in body.release_configs.items()
+        }
+        # Keep legacy key in sync for backwards compat with task-based handlers
+        if "main" in body.release_configs:
+            settings["release_config"] = settings["release_configs"]["main"]
 
     await db.execute(
         "UPDATE projects SET settings_json = $2, updated_at = NOW() WHERE id = $1",
@@ -535,9 +564,153 @@ async def update_release_settings(
         settings,
     )
     return {
-        "release_pipeline_enabled": settings.get("release_pipeline_enabled", False),
-        "release_config": settings.get("release_config", {}),
+        "release_pipeline_enabled": read_setting(settings, "release.enabled", "release_pipeline_enabled", False),
+        "release_configs": settings.get("release_configs", {}),
     }
+
+
+# ── Unified Settings API ──────────────────────────────────────────
+
+
+class SettingsSectionBody(BaseModel):
+    """Arbitrary JSON body for a single settings section."""
+    class Config:
+        extra = "allow"
+
+
+@router.get("/{project_id}/settings")
+async def get_settings(project_id: str, user: CurrentUser, db: DB):
+    """Get all project settings in the new structured format."""
+    await check_project_access(db, project_id, user)
+    row = await db.fetchrow(
+        "SELECT settings_json, architect_editor_enabled, architect_model, editor_model "
+        "FROM projects WHERE id = $1",
+        project_id,
+    )
+    if not row:
+        raise HTTPException(status_code=404)
+    settings = parse_settings(row["settings_json"])
+    migrated = migrate_settings(settings, project_row=dict(row))
+    return migrated
+
+
+@router.put("/{project_id}/settings/{section}")
+async def update_settings_section(
+    project_id: str, section: str, body: dict[str, Any],
+    user: CurrentUser, db: DB,
+):
+    """Update a single settings section. Owner-only.
+
+    section must be one of: planning, execution, git, debugging, release.
+    The body is merged into the named section.
+    """
+    if section not in VALID_SECTIONS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid section '{section}'. Must be one of: {', '.join(sorted(VALID_SECTIONS))}",
+        )
+    await check_project_owner(db, project_id, user)
+    row = await db.fetchrow(
+        "SELECT settings_json, architect_editor_enabled, architect_model, editor_model "
+        "FROM projects WHERE id = $1",
+        project_id,
+    )
+    if not row:
+        raise HTTPException(status_code=404)
+
+    settings = parse_settings(row["settings_json"])
+    settings = migrate_settings(settings, project_row=dict(row))
+
+    # Deep-merge the body into the target section
+    existing_section = settings.get(section, {})
+    if isinstance(existing_section, dict) and isinstance(body, dict):
+        existing_section.update(body)
+        settings[section] = existing_section
+    else:
+        settings[section] = body
+
+    await db.execute(
+        "UPDATE projects SET settings_json = $2, updated_at = NOW() WHERE id = $1",
+        project_id,
+        settings,
+    )
+    return settings[section]
+
+
+def _build_repo_list(project_row) -> list[dict]:
+    """Build a list of repos from project row (main + deps)."""
+    repos = [{"name": "main", "repo_url": project_row.get("repo_url") or ""}]
+    context_docs = project_row.get("context_docs") or []
+    if isinstance(context_docs, str):
+        context_docs = json.loads(context_docs)
+    for doc in context_docs:
+        if isinstance(doc, dict) and doc.get("name") and doc.get("repo_url"):
+            repos.append({"name": doc["name"], "repo_url": doc["repo_url"]})
+    return repos
+
+
+async def _copy_pipeline_configs_from_existing(db, new_project_id: str, repo_url: str) -> None:
+    """Copy release_configs and merge_pipelines from an existing project with the same repo.
+
+    When a user creates a new project pointing at a repo that already has
+    pipeline configs in another project, auto-copy those configs so they
+    don't have to reconfigure everything.  The user can still override per-project.
+    """
+    if not repo_url:
+        return
+
+    # Normalize URL for matching
+    norm = repo_url.rstrip("/").removesuffix(".git").lower()
+
+    # Find an existing project with matching repo that has pipeline configs
+    donor = await db.fetchrow(
+        """
+        SELECT settings_json FROM projects
+        WHERE id != $1
+          AND LOWER(RTRIM(REPLACE(repo_url, '.git', ''), '/')) = $2
+          AND settings_json IS NOT NULL
+        ORDER BY updated_at DESC LIMIT 1
+        """,
+        new_project_id, norm,
+    )
+    if not donor:
+        return
+
+    donor_settings = parse_settings(donor["settings_json"])
+
+    # Collect configs to copy (only if they exist in the donor)
+    to_copy = {}
+    for key in ("release_configs", "release_config", "release_pipeline_enabled",
+                "merge_pipelines"):
+        if key in donor_settings:
+            to_copy[key] = donor_settings[key]
+    # Also copy from new-format sections
+    if "release" in donor_settings and isinstance(donor_settings["release"], dict):
+        if "enabled" in donor_settings["release"]:
+            to_copy.setdefault("release_pipeline_enabled", donor_settings["release"]["enabled"])
+    if "git" in donor_settings and isinstance(donor_settings["git"], dict):
+        if "post_merge_actions" in donor_settings["git"]:
+            to_copy.setdefault("post_merge_actions", donor_settings["git"]["post_merge_actions"])
+
+    if not to_copy:
+        return
+
+    # Merge into the new project's settings
+    row = await db.fetchrow(
+        "SELECT settings_json FROM projects WHERE id = $1", new_project_id,
+    )
+    settings = parse_settings((row or {}).get("settings_json"))
+
+    settings.update(to_copy)
+
+    await db.execute(
+        "UPDATE projects SET settings_json = $2, updated_at = NOW() WHERE id = $1",
+        new_project_id, settings,
+    )
+    logger.info(
+        "[project] Copied pipeline configs from existing project to new project %s (keys: %s)",
+        new_project_id[:8], list(to_copy.keys()),
+    )
 
 
 # ── Project Memories ──────────────────────────────────────────
@@ -699,5 +872,4 @@ async def _analyze_project(project_id: str, db, redis=None) -> None:
         analyzer = ProjectAnalyzer(db, redis=redis)
         await analyzer.analyze(project_id)
     except Exception:
-        import logging
-        logging.getLogger(__name__).exception("Background project analysis failed for %s", project_id)
+        logger.exception("Background project analysis failed for %s", project_id)

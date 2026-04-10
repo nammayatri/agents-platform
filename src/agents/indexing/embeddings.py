@@ -55,6 +55,38 @@ class CodeChunk:
     content: str
 
 
+# Module-level singleton for the embedding model.
+# Loading takes ~6s — must only happen once, not per search call.
+_shared_model = None
+_shared_model_lock = None  # Lazy init threading lock
+
+
+def _get_shared_model():
+    """Get the shared sentence-transformer model (loads once, reuses forever)."""
+    global _shared_model, _shared_model_lock
+    if _shared_model is not None:
+        return _shared_model
+
+    import threading
+    if _shared_model_lock is None:
+        _shared_model_lock = threading.Lock()
+
+    with _shared_model_lock:
+        if _shared_model is not None:
+            return _shared_model
+        try:
+            from sentence_transformers import SentenceTransformer
+            _shared_model = SentenceTransformer("all-MiniLM-L6-v2")
+            logger.info("embeddings: loaded all-MiniLM-L6-v2 model (singleton)")
+        except ImportError:
+            logger.warning("sentence-transformers not installed")
+            raise
+        except Exception as e:
+            logger.error("Failed to load embedding model: %s", e)
+            raise
+    return _shared_model
+
+
 class EmbeddingIndex:
     """FAISS-backed semantic search index for a code repository.
 
@@ -63,7 +95,6 @@ class EmbeddingIndex:
     """
 
     def __init__(self):
-        self._model = None
         self._index = None
         self._chunks: list[CodeChunk] = []
         self._mtimes: dict[str, float] = {}
@@ -71,20 +102,8 @@ class EmbeddingIndex:
         self._initialized = False
 
     def _ensure_model(self):
-        """Lazy-load the sentence-transformer model."""
-        if self._model is not None:
-            return
-
-        try:
-            from sentence_transformers import SentenceTransformer
-            self._model = SentenceTransformer("all-MiniLM-L6-v2")
-            logger.info("embeddings: loaded all-MiniLM-L6-v2 model")
-        except ImportError:
-            logger.warning("sentence-transformers not installed, semantic search unavailable")
-            raise
-        except Exception as e:
-            logger.error("Failed to load embedding model: %s", e)
-            raise
+        """Get the shared embedding model."""
+        return _get_shared_model()
 
     def build_index(self, repo_path: str, *, cache_dir: str | None = None) -> None:
         """Build or incrementally update the embedding index for a repository.
@@ -149,7 +168,7 @@ class EmbeddingIndex:
 
         # Generate embeddings for all chunks
         texts = [c.content for c in self._chunks]
-        embeddings = self._model.encode(texts, show_progress_bar=False, batch_size=64)
+        embeddings = self._ensure_model().encode(texts, show_progress_bar=False, batch_size=64)
         embeddings = np.array(embeddings, dtype=np.float32)
 
         # Normalize for cosine similarity
@@ -203,7 +222,7 @@ class EmbeddingIndex:
         self._ensure_model()
 
         # Encode query
-        query_embedding = self._model.encode([query], show_progress_bar=False)
+        query_embedding = self._ensure_model().encode([query], show_progress_bar=False)
         query_embedding = np.array(query_embedding, dtype=np.float32)
         norm = np.linalg.norm(query_embedding)
         if norm > 0:

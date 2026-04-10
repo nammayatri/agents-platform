@@ -40,7 +40,13 @@ async def execute_build_watcher(
         project_settings = project.get("settings_json") or {}
         if isinstance(project_settings, str):
             project_settings = json.loads(project_settings)
-        release_config = project_settings.get("release_config", {})
+        # Resolve per-repo release config
+        _target = sub_task.get("target_repo")
+        if isinstance(_target, str):
+            _target = json.loads(_target)
+        _repo_name = (_target or {}).get("name", "main")
+        release_configs = project_settings.get("release_configs", {})
+        release_config = release_configs.get(_repo_name) or project_settings.get("release_config", {})
         build_config = release_config.get("build", {})
 
         pr_deliv = await ctx.db.fetchrow(

@@ -39,6 +39,9 @@ def _configure_logging() -> None:
 _configure_logging()
 
 
+_logger = logging.getLogger(__name__)
+
+
 async def _seed_admin(pool) -> None:
     """Promote user to admin if ADMIN_SEED_EMAIL is configured."""
     email = settings.admin_seed_email
@@ -47,11 +50,9 @@ async def _seed_admin(pool) -> None:
     row = await pool.fetchrow("SELECT id, role FROM users WHERE email = $1", email)
     if row and row["role"] != "admin":
         await pool.execute("UPDATE users SET role = 'admin' WHERE id = $1", row["id"])
-        import logging
-        logging.getLogger(__name__).info("Promoted %s to admin (seed)", email)
+        _logger.info("Promoted %s to admin (seed)", email)
     elif not row:
-        import logging
-        logging.getLogger(__name__).info(
+        _logger.info(
             "ADMIN_SEED_EMAIL=%s not found yet — will promote on next restart after registration",
             email,
         )
@@ -85,13 +86,17 @@ async def lifespan(app: FastAPI):
         event_bus=event_bus,
     )
     if settings.workspace_root.startswith("/tmp"):
-        logging.getLogger(__name__).warning(
+        _logger.warning(
             "WORKSPACE_ROOT is %s — ephemeral in K8s. Mount a PVC and set WORKSPACE_ROOT.",
             settings.workspace_root,
         )
 
     orchestrator_task = asyncio.create_task(orchestrator.run_forever())
     app.state.orchestrator = orchestrator
+
+    # Recover in-flight pipeline runs from before restart
+    from agents.orchestrator.merge_pipeline import recover_in_flight_runs
+    await recover_in_flight_runs(pool, redis_client)
 
     yield
 
@@ -130,6 +135,7 @@ def create_app() -> FastAPI:
         deliverables,
         health,
         notifications,
+        pipeline,
         project_chat,
         projects,
         providers,
@@ -156,6 +162,7 @@ def create_app() -> FastAPI:
     app.include_router(notifications.router, prefix="/api", tags=["notifications"])
     app.include_router(admin.router, prefix="/api/admin", tags=["admin"])
     app.include_router(webhooks.router, prefix="/api", tags=["webhooks"])
+    app.include_router(pipeline.router, prefix="/api", tags=["pipeline"])
     app.include_router(websocket.router, tags=["websocket"])
 
     return app

@@ -132,10 +132,9 @@ async def execute_merge_observer(
                     )
 
                     # Trigger release pipeline if enabled
-                    project_settings = project.get("settings_json") or {}
-                    if isinstance(project_settings, str):
-                        project_settings = json.loads(project_settings)
-                    if project_settings.get("release_pipeline_enabled"):
+                    from agents.utils.settings_helpers import parse_settings, read_setting
+                    project_settings = parse_settings(project.get("settings_json"))
+                    if read_setting(project_settings, "release.enabled", "release_pipeline_enabled", False):
                         try:
                             await create_release_subtasks(ctx, sub_task, project_settings)
                         except Exception as rel_e:

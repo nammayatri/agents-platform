@@ -19,6 +19,7 @@ export interface ExecutionEvent {
   tool_index?: number
   total_tools?: number
   message?: string
+  content?: string
   file_path?: string
   pattern?: string
   command?: string
@@ -252,13 +253,20 @@ function EventRow({
 
   if (event.type === 'llm_thinking') {
     return (
-      <div className="flex items-center gap-2 px-3 py-1 text-indigo-400/60 border-b border-gray-900/50">
-        {timeStr && <span className="text-gray-700 text-[10px] font-mono shrink-0">{timeStr}</span>}
-        <Brain className="w-3 h-3 flex-shrink-0" />
-        <span>LLM response</span>
-        <span className="text-gray-600">
-          (round {event.round}, {event.tokens_in?.toLocaleString()}→{event.tokens_out?.toLocaleString()} tokens)
-        </span>
+      <div className="px-3 py-1 border-b border-gray-900/50">
+        <div className="flex items-center gap-2 text-indigo-400/60">
+          {timeStr && <span className="text-gray-700 text-[10px] font-mono shrink-0">{timeStr}</span>}
+          <Brain className="w-3 h-3 flex-shrink-0" />
+          <span>Round {event.round}</span>
+          <span className="text-gray-600 text-[10px]">
+            {event.tokens_in?.toLocaleString()}→{event.tokens_out?.toLocaleString()} tok
+          </span>
+        </div>
+        {event.content && (
+          <div className="mt-0.5 ml-5 text-[11px] text-gray-500 leading-relaxed whitespace-pre-wrap">
+            {event.content}
+          </div>
+        )}
       </div>
     )
   }

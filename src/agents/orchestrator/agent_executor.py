@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING, Any
 from agents.agents.registry import get_builtin_tool_schemas, get_default_tools
 from agents.schemas.agent import LLMMessage, LLMResponse
 from agents.providers.base import AIProvider
+from agents.utils.error_classification import classify_error, validate_debugger_output
 
 if TYPE_CHECKING:
     from agents.orchestrator.coordinator import AgentCoordinator
@@ -25,23 +26,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def _classify_error(exc: Exception) -> str:
-    """Classify an exception into a category for the ``error_type`` field."""
-    name = type(exc).__name__.lower()
-    msg = str(exc).lower()
-    if any(k in name for k in ("timeout", "timedout")):
-        return "timeout"
-    if any(k in name for k in ("ratelimit", "rate_limit", "429")):
-        return "rate_limit"
-    if "401" in msg or "unauthorized" in msg or "authentication" in msg:
-        return "auth_error"
-    if "context" in msg and ("long" in msg or "length" in msg or "tokens" in msg):
-        return "context_length"
-    if any(k in name for k in ("connection", "network", "dns")):
-        return "network"
-    if "json" in name or "parse" in name or "decode" in name:
-        return "parse_error"
-    return "transient"
 
 
 class AgentExecutor:
@@ -94,8 +78,7 @@ class AgentExecutor:
 
     @staticmethod
     def _validate_debugger_output(submit_data: dict | None) -> dict:
-        from agents.orchestrator.coordinator import AgentCoordinator
-        return AgentCoordinator._validate_debugger_output(submit_data)
+        return validate_debugger_output(submit_data)
 
     async def _append_progress_log(self, *args: Any, **kwargs: Any) -> None:
         await self._coord._append_progress_log(*args, **kwargs)
@@ -119,8 +102,6 @@ class AgentExecutor:
     def _get_builtin_tools(workspace_path: str, role: str = "coder") -> list[dict]:
         return get_builtin_tool_schemas(workspace_path, role)
 
-    def _get_dep_index_dirs(self, workspace_path: str) -> dict[str, str]:
-        return self._coord._get_dep_index_dirs(workspace_path)
 
     # ------------------------------------------------------------------
     # Single-shot execution
@@ -201,14 +182,6 @@ class AgentExecutor:
         # Ensure agents always have workspace tools (built-in fallback)
         if workspace_path:
             builtin_tools = self._get_builtin_tools(workspace_path, sub_task["agent_role"])
-            # Inject task-local index directory for semantic_search
-            _exec_idx = os.path.join(workspace_path, ".agent_index")
-            _exec_dep_dirs = self._get_dep_index_dirs(workspace_path)
-            for _bt in builtin_tools:
-                if _bt["name"] == "semantic_search":
-                    _bt["_index_dir"] = _exec_idx
-                    if _exec_dep_dirs:
-                        _bt["_dep_index_dirs"] = _exec_dep_dirs
             if mcp_tools:
                 existing_names = {t["name"] for t in mcp_tools}
                 mcp_tools.extend(t for t in builtin_tools if t["name"] not in existing_names)
@@ -296,7 +269,7 @@ class AgentExecutor:
                 provider, messages,
                 tools=tools_arg,
                 tool_executor=_tool_exec,
-                max_rounds=70,
+                max_rounds=500,
                 on_tool_round=_on_tool_round,
                 on_activity=lambda msg: self._report_activity(st_id, msg),
                 on_tool_event=_on_tool_event,
@@ -382,7 +355,10 @@ class AgentExecutor:
             )
 
             # Create deliverable if the agent produced one
-            await self._maybe_create_deliverable(sub_task, response, run, workspace_path=workspace_path)
+            try:
+                await self._maybe_create_deliverable(sub_task, response, run, workspace_path=workspace_path)
+            except Exception:
+                logger.warning("[%s] Failed to create deliverable for %s (non-fatal)", self.todo_id, st_id, exc_info=True)
 
             # Update token tracking on the TODO
             await self.db.execute(
@@ -404,7 +380,7 @@ class AgentExecutor:
             import traceback as _tb
 
             duration_ms = int((time.monotonic() - start_time) * 1000)
-            error_type = _classify_error(e)
+            error_type = classify_error(e)
             error_detail = f"{type(e).__name__}: {e}"
             error_traceback = "".join(_tb.format_exception(type(e), e, e.__traceback__))
 
@@ -433,7 +409,7 @@ class AgentExecutor:
         *,
         workspace_path: str | None = None,
         work_rules: dict | None = None,
-        max_iterations: int = 50,
+        max_iterations: int = 500,
     ) -> None:
         """RALPH-style iterative execution: fresh context per iteration,
         quality checks, stuck detection, hard cutoff."""
@@ -501,13 +477,6 @@ class AgentExecutor:
         _cached_all_tools: list[dict] | None = None
         if workspace_path:
             builtin_tools = self._get_builtin_tools(workspace_path, role)
-            _task_idx = os.path.join(workspace_path, ".agent_index")
-            _task_dep_dirs = self._get_dep_index_dirs(workspace_path)
-            for bt in builtin_tools:
-                if bt["name"] == "semantic_search":
-                    bt["_index_dir"] = _task_idx
-                    if _task_dep_dirs:
-                        bt["_dep_index_dirs"] = _task_dep_dirs
             if _cached_mcp_tools:
                 existing_names = {t["name"] for t in _cached_mcp_tools}
                 _cached_all_tools = list(_cached_mcp_tools) + [
@@ -641,27 +610,6 @@ class AgentExecutor:
                         # Accumulate for DB persistence (cap at 2000 events)
                         if len(_accumulated_events) < 2000:
                             _accumulated_events.append(event)
-                        # Publish extra index_search event when semantic_search completes
-                        if event.get("type") == "tool_result" and event.get("name") == "semantic_search":
-                            try:
-                                from agents.indexing.search_tool import pop_last_search_meta
-                                _idx_dir = os.path.join(workspace_path, ".agent_index")
-                                search_meta = pop_last_search_meta(_idx_dir)
-                                if search_meta:
-                                    idx_event = {
-                                        "type": "index_search",
-                                        "sub_task_id": st_id,
-                                        "ts": time.time(),
-                                        **search_meta,
-                                    }
-                                    await self.redis.publish(
-                                        f"task:{self.todo_id}:events",
-                                        json.dumps(idx_event),
-                                    )
-                                    if len(_accumulated_events) < 2000:
-                                        _accumulated_events.append(idx_event)
-                            except Exception:
-                                pass
                     except Exception:
                         pass  # Don't let event publishing break execution
 
@@ -675,7 +623,7 @@ class AgentExecutor:
 
                 # Architect/Editor dual-model execution
                 if architect_editor_enabled and architect_model and editor_model:
-                    READ_ONLY_TOOLS = {"read_file", "list_directory", "search_files", "semantic_search"}
+                    READ_ONLY_TOOLS = {"read_file", "list_directory", "search_files"}
                     WRITE_TOOLS = {"write_file", "edit_file", "run_command", "task_complete", "create_subtask"}
 
                     # Phase A: Architect — powerful model with read-only tools
@@ -690,7 +638,7 @@ class AgentExecutor:
                         provider, list(messages),
                         tools=architect_tools or None,
                         tool_executor=_architect_tool_exec,
-                        max_rounds=70,
+                        max_rounds=500,
                         on_activity=lambda msg, _i=iteration: self._report_activity(st_id, f"[iter {_i}] [Architect] {msg}"),
                         on_tool_event=_on_tool_event,
                         on_inject_check=_check_inject_iter,
@@ -723,7 +671,7 @@ class AgentExecutor:
                         provider, editor_messages,
                         tools=editor_tools or None,
                         tool_executor=_iter_tool_exec,
-                        max_rounds=70,
+                        max_rounds=500,
                         on_activity=lambda msg, _i=iteration: self._report_activity(st_id, f"[iter {_i}] [Editor] {msg}"),
                         on_tool_event=_on_tool_event,
                         on_inject_check=_check_inject_iter,
@@ -746,7 +694,7 @@ class AgentExecutor:
                         provider, messages,
                         tools=tools_arg,
                         tool_executor=_iter_tool_exec,
-                        max_rounds=70,
+                        max_rounds=500,
                         on_activity=lambda msg, _i=iteration: self._report_activity(st_id, f"[iter {_i}] {msg}"),
                         on_tool_event=_on_tool_event,
                         on_inject_check=_check_inject_iter,
@@ -829,7 +777,7 @@ class AgentExecutor:
                 learnings = qc_result.get("learnings", [])
                 if tool_loop_truncated:
                     learnings.append(
-                        "Tool loop was truncated (hit max_rounds=70). "
+                        "Tool loop was truncated (hit max_rounds). "
                         "Agent may not have finished all intended tool calls."
                     )
                 entry = {
@@ -913,7 +861,10 @@ class AgentExecutor:
                         progress_message="Done",
                         output_result=validated_output,
                     )
-                    await self._maybe_create_deliverable(sub_task, response, run, workspace_path=workspace_path)
+                    try:
+                        await self._maybe_create_deliverable(sub_task, response, run, workspace_path=workspace_path)
+                    except Exception:
+                        logger.warning("[%s] Failed to create deliverable for %s (non-fatal)", self.todo_id, st_id, exc_info=True)
                     await self._append_progress_log(
                         sub_task, iteration, "completed", iteration_log,
                     )
@@ -985,7 +936,10 @@ class AgentExecutor:
                         progress_message=agent_done_summary or "Done",
                         output_result=validated_output,
                     )
-                    await self._maybe_create_deliverable(sub_task, response, run, workspace_path=workspace_path)
+                    try:
+                        await self._maybe_create_deliverable(sub_task, response, run, workspace_path=workspace_path)
+                    except Exception:
+                        logger.warning("[%s] Failed to create deliverable for %s (non-fatal)", self.todo_id, st_id, exc_info=True)
                     await self._append_progress_log(
                         sub_task, iteration, "completed_agent_signal", iteration_log,
                     )
@@ -998,7 +952,7 @@ class AgentExecutor:
                 import traceback as _tb
 
                 duration_ms = int((time.monotonic() - start_time) * 1000)
-                error_type = _classify_error(e)
+                error_type = classify_error(e)
                 error_detail = f"{type(e).__name__}: {e}"
                 error_traceback = "".join(_tb.format_exception(type(e), e, e.__traceback__))
 

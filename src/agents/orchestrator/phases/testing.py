@@ -69,13 +69,16 @@ class TestingPhase:
         )
 
         # 1. Resolve workspace
+        # setup_task_workspace returns task_root; main repo is at repos/main/
+        from agents.orchestrator.workspace import MAIN_REPO
         workspace_path = None
         try:
             project = await coord.db.fetchrow(
                 "SELECT repo_url FROM projects WHERE id = $1", todo["project_id"]
             )
             if project and project.get("repo_url"):
-                workspace_path = await coord.workspace_mgr.setup_task_workspace(coord.todo_id)
+                task_root = await coord.workspace_mgr.setup_task_workspace(coord.todo_id)
+                workspace_path = os.path.join(task_root, MAIN_REPO)
         except Exception:
             logger.exception("[%s] Could not set up workspace for testing — skipping to review", coord.todo_id)
 
@@ -85,15 +88,16 @@ class TestingPhase:
             await coord._review.run(todo, provider)
             return
 
-        repo_dir = os.path.join(workspace_path, "repo")
-        if not os.path.isdir(repo_dir):
-            repo_dir = workspace_path
+        repo_dir = workspace_path
 
         # 2. Resolve build/test commands from project settings and work rules
-        work_rules = await coord._execution.resolve_work_rules(todo)
+        from agents.utils.work_rules import resolve_work_rules
+        project = await coord.db.fetchrow("SELECT settings_json FROM projects WHERE id = $1", todo["project_id"])
+        work_rules = resolve_work_rules(todo, dict(project) if project else None)
         project_settings = await self._get_project_settings(todo)
 
-        build_commands = project_settings.get("build_commands", [])
+        from agents.utils.settings_helpers import get_build_command_strings
+        build_commands = get_build_command_strings(project_settings)
         quality_commands = work_rules.get("quality", [])
         testing_rules = work_rules.get("testing", [])
 
@@ -135,8 +139,8 @@ class TestingPhase:
                 await coord._transition_todo(
                     "in_progress", sub_state="fixing_test_failures",
                 )
-                todo = await coord._load_todo()
-                await coord._execution.run(todo, provider)
+                # Return to scheduler — it will pick up in_progress and run _execute_jobs
+                return
             else:
                 error_output = test_results.get("error_output", "Unknown failures")
                 await coord._post_system_message(
@@ -249,9 +253,7 @@ class TestingPhase:
     ) -> dict:
         """Use an LLM agent to discover and run build/test commands."""
         coord = self._coord
-        repo_dir = os.path.join(workspace_path, "repo")
-        if not os.path.isdir(repo_dir):
-            repo_dir = workspace_path
+        repo_dir = workspace_path
 
         # Install detected dependencies first
         dep_cmds = self._detect_dependency_install_commands(repo_dir)
@@ -320,7 +322,7 @@ class TestingPhase:
                     provider, messages,
                     tools=tools_with_submit,
                     tool_executor=_test_tool_exec,
-                    max_rounds=70,
+                    max_rounds=500,
                     on_cancel_check=coord._is_cancelled,
                     on_token=_test_token_cb,
                     temperature=0.1,
@@ -459,14 +461,12 @@ class TestingPhase:
 
     async def _get_project_settings(self, todo: dict) -> dict:
         """Fetch and parse project settings_json."""
+        from agents.utils.settings_helpers import parse_settings
         coord = self._coord
         project = await coord.db.fetchrow(
             "SELECT settings_json FROM projects WHERE id = $1", todo["project_id"]
         )
-        proj_settings = (project.get("settings_json") or {}) if project else {}
-        if isinstance(proj_settings, str):
-            proj_settings = json.loads(proj_settings)
-        return proj_settings
+        return parse_settings((project or {}).get("settings_json"))
 
     async def _publish_testing_progress(self, command: str, passed: bool) -> None:
         """Publish a testing progress event to the WebSocket channel."""

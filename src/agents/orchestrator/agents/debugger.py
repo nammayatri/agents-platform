@@ -22,11 +22,9 @@ class DebuggerAgent(LLMAgent):
         # Include debug context if available
         project = await ctx.load_project(str(todo["project_id"]))
         if project:
-            import json
-            settings = project.get("settings_json") or {}
-            if isinstance(settings, str):
-                settings = json.loads(settings)
-            debug_ctx = settings.get("debug_context")
+            from agents.utils.settings_helpers import parse_settings, read_setting
+            settings = parse_settings(project.get("settings_json"))
+            debug_ctx = read_setting(settings, "debugging", "debug_context")
             if debug_ctx:
                 system_parts.append(f"## Debug Context\n{debug_ctx}")
 

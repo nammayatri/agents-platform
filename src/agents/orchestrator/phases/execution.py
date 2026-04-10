@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING
 
 from agents.orchestrator.dispatcher import SubtaskDispatcher
 from agents.orchestrator.state_machine import check_all_subtasks_done
+from agents.utils.work_rules import resolve_work_rules as _resolve_work_rules
 
 if TYPE_CHECKING:
     from agents.orchestrator.coordinator import AgentCoordinator
@@ -69,6 +70,8 @@ class ExecutionPhase:
             )
 
         # Set up task workspace if project has a repo
+        # setup_task_workspace returns task_root; main repo is at repos/main/
+        from agents.orchestrator.workspace import MAIN_REPO
         workspace_path = None
         project = await coord.db.fetchrow(
             "SELECT repo_url FROM projects WHERE id = $1", todo["project_id"]
@@ -76,7 +79,8 @@ class ExecutionPhase:
         if project and project.get("repo_url"):
             logger.info("[%s] Setting up workspace for repo %s", coord.todo_id, project["repo_url"])
             try:
-                workspace_path = await coord.workspace_mgr.setup_task_workspace(coord.todo_id)
+                task_root = await coord.workspace_mgr.setup_task_workspace(coord.todo_id)
+                workspace_path = os.path.join(task_root, MAIN_REPO)
                 logger.info("[%s] Task workspace ready at %s", coord.todo_id, workspace_path)
             except Exception:
                 logger.exception("[%s] Workspace setup FAILED for %s — task cannot proceed without workspace",
@@ -183,7 +187,7 @@ class ExecutionPhase:
         # Resolve work rules for RALPH loop
         work_rules = await self.resolve_work_rules(todo)
         has_quality_rules = bool(work_rules.get("quality"))
-        max_iterations = todo.get("max_iterations") or 50
+        max_iterations = todo.get("max_iterations") or 500
 
         # Lazy-init the dispatcher (needs bound methods available after __init__)
         if coord._dispatcher is None:
@@ -203,33 +207,12 @@ class ExecutionPhase:
         logger.info("[%s] Dispatching %d sub-tasks (quality_rules=%s, max_iter=%d, workspace=%s)",
                     coord.todo_id, len(runnable), has_quality_rules, max_iterations, workspace_path)
         tasks = []
+        dispatched: list[dict] = []  # Only subtasks that actually got dispatched
         workspace_map: dict[str, str] = {}  # subtask_id → resolved workspace
         for st in runnable:
-            # Resolve per-subtask workspace (dep repos get their own)
-            st_workspace = workspace_path
-            target_repo = st.get("target_repo")
-            if target_repo:
-                dep_label = target_repo.get("name") if isinstance(target_repo, dict) else target_repo
-                logger.info("[%s] Sub-task %s targets dep repo '%s'", coord.todo_id, st["id"], dep_label)
-                try:
-                    st_workspace = await coord._setup_dependency_workspace(st)
-                    logger.info("[%s] Dep workspace for %s: %s", coord.todo_id, st["id"], st_workspace)
-                except Exception as e:
-                    logger.error(
-                        "[%s] Failed to set up dep workspace for %s (repo=%s): %s",
-                        coord.todo_id, st["id"], dep_label, e, exc_info=True,
-                    )
-                    # Fail the subtask instead of silently running against the wrong repo
-                    await coord.db.execute(
-                        "UPDATE sub_tasks SET status = 'failed', error_message = $2 WHERE id = $1",
-                        st["id"],
-                        f"Could not set up dependency workspace for '{dep_label}': {e}",
-                    )
-                    await coord._post_system_message(
-                        f"**Sub-task failed:** Could not clone dependency repo '{dep_label}'. "
-                        f"Check git credentials and repo URL. Error: {e}"
-                    )
-                    continue
+            st_workspace = await self._resolve_subtask_workspace(st, workspace_path)
+            if st_workspace is None:
+                continue  # Already failed the subtask
             workspace_map[str(st["id"])] = st_workspace
 
             logger.info("[%s] Sub-task %s: dispatching (role=%s)", coord.todo_id, st["id"], st["agent_role"])
@@ -239,12 +222,13 @@ class ExecutionPhase:
                 work_rules=work_rules,
                 max_iterations=max_iterations,
             ))
+            dispatched.append(st)
 
         logger.info("[%s] Waiting on %d sub-task coroutines...", coord.todo_id, len(tasks))
         results = await asyncio.gather(*tasks, return_exceptions=True)
         logger.info("[%s] All sub-tasks returned. Processing results...", coord.todo_id)
 
-        for st, result in zip(runnable, results):
+        for st, result in zip(dispatched, results):
             if isinstance(result, Exception):
                 logger.error("Sub-task %s failed: %s", st["id"], result, exc_info=result)
                 error_msg = f"{type(result).__name__}: {result}"
@@ -316,13 +300,11 @@ class ExecutionPhase:
             logger.info("[%s] Re-scan round %d: found %d newly runnable subtasks",
                         coord.todo_id, rescan_round, len(next_runnable))
             next_tasks = []
+            next_dispatched: list[dict] = []
             for st2 in next_runnable:
-                st2_ws = workspace_path
-                if st2.get("target_repo"):
-                    try:
-                        st2_ws = await coord._setup_dependency_workspace(st2)
-                    except Exception:
-                        pass
+                st2_ws = await self._resolve_subtask_workspace(st2, workspace_path)
+                if st2_ws is None:
+                    continue
                 workspace_map[str(st2["id"])] = st2_ws
 
                 next_tasks.append(coord._dispatcher.build_coro(
@@ -331,9 +313,10 @@ class ExecutionPhase:
                     work_rules=work_rules,
                     max_iterations=max_iterations,
                 ))
+                next_dispatched.append(st2)
 
             rescan_results = await asyncio.gather(*next_tasks, return_exceptions=True)
-            for st2, result2 in zip(next_runnable, rescan_results):
+            for st2, result2 in zip(next_dispatched, rescan_results):
                 if isinstance(result2, Exception):
                     logger.error("Sub-task %s failed: %s", st2["id"], result2, exc_info=result2)
                     await coord._transition_subtask(str(st2["id"]), "failed", error_message=str(result2))
@@ -371,23 +354,9 @@ class ExecutionPhase:
                     if deps:
                         if any(g_dep_map.get(str(d)) != "completed" for d in deps):
                             continue
-                    gst_ws = workspace_path
-                    gst_target = gst.get("target_repo")
-                    if gst_target:
-                        gst_dep_label = gst_target.get("name") if isinstance(gst_target, dict) else gst_target
-                        try:
-                            gst_ws = await coord._setup_dependency_workspace(gst)
-                        except Exception as e:
-                            logger.error(
-                                "[%s] Failed to set up dep workspace for guardrail %s: %s",
-                                coord.todo_id, gst["id"], e, exc_info=True,
-                            )
-                            await coord.db.execute(
-                                "UPDATE sub_tasks SET status = 'failed', error_message = $2 WHERE id = $1",
-                                gst["id"],
-                                f"Could not set up dependency workspace for '{gst_dep_label}': {e}",
-                            )
-                            continue
+                    gst_ws = await self._resolve_subtask_workspace(dict(gst), workspace_path)
+                    if gst_ws is None:
+                        continue
                     await coord._dispatcher.dispatch(
                         dict(gst), provider, gst_ws,
                         use_iterations=has_quality_rules,
@@ -508,25 +477,66 @@ class ExecutionPhase:
             else:
                 await coord._lifecycle.execute_merge_subtask(merge_st, provider, workspace_path)
 
+    async def _resolve_subtask_workspace(self, st: dict, default_workspace: str | None) -> str | None:
+        """Resolve and persist workspace path for a subtask.
+
+        Resolution order:
+        1. Already persisted on the subtask (survives crash/restart)
+        2. Fresh setup via _setup_dependency_workspace (for dep repos)
+        3. Default task workspace (for main repo)
+
+        Returns None if setup fails (subtask is marked failed).
+        """
+        coord = self._coord
+
+        # 1. Check if already persisted
+        stored_path = st.get("workspace_path")
+        if stored_path and os.path.isdir(stored_path):
+            return stored_path
+
+        target_repo = st.get("target_repo")
+        if not target_repo:
+            # Main repo — persist default workspace
+            if default_workspace:
+                await coord.db.execute(
+                    "UPDATE sub_tasks SET workspace_path = $2 WHERE id = $1",
+                    st["id"], default_workspace,
+                )
+            return default_workspace
+
+        dep_label = target_repo.get("name") if isinstance(target_repo, dict) else target_repo
+        logger.info("[%s] Sub-task %s targets dep repo '%s'", coord.todo_id, st["id"], dep_label)
+
+        try:
+            st_workspace = await coord._setup_dependency_workspace(st)
+            logger.info("[%s] Dep workspace for %s: %s", coord.todo_id, st["id"], st_workspace)
+            await coord.db.execute(
+                "UPDATE sub_tasks SET workspace_path = $2 WHERE id = $1",
+                st["id"], st_workspace,
+            )
+            return st_workspace
+        except Exception as e:
+            logger.error(
+                "[%s] Failed to set up dep workspace for %s (repo=%s): %s",
+                coord.todo_id, st["id"], dep_label, e, exc_info=True,
+            )
+            await coord.db.execute(
+                "UPDATE sub_tasks SET status = 'failed', error_message = $2 WHERE id = $1",
+                st["id"],
+                f"Could not set up dependency workspace for '{dep_label}': {e}",
+            )
+            await coord._post_system_message(
+                f"**Sub-task failed:** Could not clone dependency repo '{dep_label}'. "
+                f"Check git credentials and repo URL. Error: {e}"
+            )
+            return None
+
     async def resolve_work_rules(self, todo: dict) -> dict:
         """Merge project-level work rules with task-level overrides."""
-        coord = self._coord
-        project = await coord.db.fetchrow(
-            "SELECT settings_json FROM projects WHERE id = $1", todo["project_id"]
+        project = await self._coord.db.fetchrow(
+            "SELECT settings_json FROM projects WHERE id = $1", todo["project_id"],
         )
-        project_settings = project["settings_json"] or {} if project else {}
-        if isinstance(project_settings, str):
-            project_settings = json.loads(project_settings)
-        rules = dict(project_settings.get("work_rules", {}))
-
-        # Task-level overrides
-        overrides = todo.get("rules_override_json") or {}
-        if isinstance(overrides, str):
-            overrides = json.loads(overrides)
-        for category, values in overrides.items():
-            rules[category] = values
-
-        return rules
+        return _resolve_work_rules(todo, dict(project) if project else None)
 
     async def enter_testing_or_review(self, todo: dict, provider: AIProvider) -> None:
         """Route to testing phase if code work was done, otherwise skip to review."""

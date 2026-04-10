@@ -61,15 +61,11 @@ async def get_deliverable_diff(deliverable_id: str, user: CurrentUser, db: DB):
 
     task_workspace = os.path.join(project["workspace_path"], "tasks", str(row["todo_id"]))
 
-    # Check if this deliverable targets a dependency repo
-    repo_dir = os.path.join(task_workspace, "repo")
+    # Resolve which repo this deliverable targets
+    repo_name = "main"
     if row.get("target_repo_name"):
-        dep_name = row["target_repo_name"].replace("/", "_").replace(" ", "_")
-        dep_repo = os.path.join(task_workspace, f"dep_{dep_name}", "repo")
-        if os.path.isdir(dep_repo):
-            repo_dir = dep_repo
+        repo_name = row["target_repo_name"].replace("/", "_").replace(" ", "_")
     elif row.get("sub_task_id"):
-        # Fallback: look up target_repo from the sub_task
         st = await db.fetchrow(
             "SELECT target_repo FROM sub_tasks WHERE id = $1", row["sub_task_id"]
         )
@@ -78,10 +74,8 @@ async def get_deliverable_diff(deliverable_id: str, user: CurrentUser, db: DB):
             if isinstance(tr, str):
                 tr = json.loads(tr)
             if isinstance(tr, dict) and tr.get("name"):
-                dep_name = tr["name"].replace("/", "_").replace(" ", "_")
-                dep_repo = os.path.join(task_workspace, f"dep_{dep_name}", "repo")
-                if os.path.isdir(dep_repo):
-                    repo_dir = dep_repo
+                repo_name = tr["name"].replace("/", "_").replace(" ", "_")
+    repo_dir = os.path.join(task_workspace, repo_name)
 
     if not os.path.isdir(repo_dir):
         raise HTTPException(status_code=404, detail="Workspace not found")

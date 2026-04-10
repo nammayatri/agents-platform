@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING, Any
 
 from agents.agents.registry import get_builtin_tool_schemas, get_default_tools
 from agents.orchestrator.agent_result import AgentResult
+from agents.utils.error_classification import classify_error, validate_debugger_output
 from agents.orchestrator.output_validator import (
     build_correction_prompt,
     validate_agent_output,
@@ -40,30 +41,6 @@ if TYPE_CHECKING:
     from agents.orchestrator.run_context import RunContext
 
 logger = logging.getLogger(__name__)
-
-
-# =====================================================================
-# Error classification
-# =====================================================================
-
-
-def _classify_error(exc: Exception) -> str:
-    """Classify an exception into a category for the ``error_type`` field."""
-    name = type(exc).__name__.lower()
-    msg = str(exc).lower()
-    if any(k in name for k in ("timeout", "timedout")):
-        return "timeout"
-    if any(k in name for k in ("ratelimit", "rate_limit", "429")):
-        return "rate_limit"
-    if "401" in msg or "unauthorized" in msg or "authentication" in msg:
-        return "auth_error"
-    if "context" in msg and ("long" in msg or "length" in msg or "tokens" in msg):
-        return "context_length"
-    if any(k in name for k in ("connection", "network", "dns")):
-        return "network"
-    if "json" in name or "parse" in name or "decode" in name:
-        return "parse_error"
-    return "transient"
 
 
 # =====================================================================
@@ -102,13 +79,6 @@ async def _resolve_tools(
     # Merge builtin workspace tools
     if workspace_path:
         builtin = get_builtin_tool_schemas(workspace_path, role)
-        idx_dir = os.path.join(workspace_path, ".agent_index")
-        dep_dirs = _get_dep_index_dirs(workspace_path)
-        for bt in builtin:
-            if bt["name"] == "semantic_search":
-                bt["_index_dir"] = idx_dir
-                if dep_dirs:
-                    bt["_dep_index_dirs"] = dep_dirs
         if mcp_tools:
             existing = {t["name"] for t in mcp_tools}
             mcp_tools.extend(t for t in builtin if t["name"] not in existing)
@@ -118,52 +88,11 @@ async def _resolve_tools(
     return mcp_tools, skills_ctx or ""
 
 
-def _get_dep_index_dirs(workspace_path: str) -> dict[str, str]:
-    """Build a mapping of dep_name -> index_dir for dependency repos."""
-    deps_index_root = os.path.join(workspace_path, ".agent_index_deps")
-    if not os.path.isdir(deps_index_root):
-        return {}
-    result: dict[str, str] = {}
-    try:
-        for entry in os.listdir(deps_index_root):
-            idx_dir = os.path.join(deps_index_root, entry)
-            if os.path.isdir(idx_dir):
-                result[entry] = idx_dir
-    except OSError:
-        pass
-    return result
 
 
 # =====================================================================
 # Quality checks
 # =====================================================================
-
-
-def _validate_debugger_output(submit_data: dict | None) -> dict:
-    """Validate that a debugger produced substantive findings."""
-    if not submit_data:
-        return {"passed": True, "reason": "no structured output", "learnings": []}
-
-    root_cause = (submit_data.get("root_cause") or "").strip()
-    evidence = submit_data.get("evidence") or []
-
-    if len(root_cause) < 20:
-        return {
-            "passed": False,
-            "reason": "Root cause too vague — investigate further with specific file paths and evidence.",
-            "error_output": "Root cause must describe the specific code/config issue.",
-            "learnings": ["Provide a detailed root cause referencing file paths and line numbers"],
-        }
-
-    if not evidence:
-        return {
-            "passed": False,
-            "reason": "No evidence collected. Use tools to gather log lines, code paths, or query results.",
-            "error_output": "Evidence list is empty.",
-            "learnings": ["Collect at least one piece of evidence before concluding"],
-        }
-
-    return {"passed": True, "reason": "debugger output valid", "learnings": []}
 
 
 async def _run_quality_checks(
@@ -179,7 +108,7 @@ async def _run_quality_checks(
     Returns ``{"passed": bool, "reason": str, "error_output": str | None, "learnings": list}``.
     """
     if role == "debugger":
-        return _validate_debugger_output(submit_data)
+        return validate_debugger_output(submit_data)
     if role not in ("coder", "tester"):
         return {"passed": True, "reason": "not applicable", "learnings": []}
 
@@ -187,9 +116,8 @@ async def _run_quality_checks(
     if not quality_rules:
         return {"passed": True, "reason": "no quality rules", "learnings": []}
 
-    repo_dir = os.path.join(workspace_path, "repo")
-    if not os.path.isdir(repo_dir):
-        repo_dir = workspace_path
+    # workspace_path IS the git working directory
+    repo_dir = workspace_path
 
     all_passed = True
     combined_output: list[str] = []
@@ -276,16 +204,15 @@ async def _maybe_create_deliverable(
 
 
 async def _get_workspace_diff(workspace_path: str) -> dict | None:
-    """Get git diff from workspace after coder commits."""
-    import asyncio
+    """Get git diff from workspace after coder commits.
 
-    repo_dir = os.path.join(workspace_path, "repo")
-    if not os.path.isdir(repo_dir):
-        repo_dir = workspace_path
+    workspace_path IS the git working directory.
+    """
+    import asyncio
 
     async def _run(args: list[str]) -> tuple[int, str]:
         proc = await asyncio.create_subprocess_exec(
-            "git", *args, cwd=repo_dir,
+            "git", *args, cwd=workspace_path,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
@@ -642,7 +569,7 @@ async def _execute_single_shot(
             provider, messages,
             tools=tools_arg,
             tool_executor=_tool_exec,
-            max_rounds=70,
+            max_rounds=500,
             on_tool_round=_on_tool_round,
             on_activity=lambda msg: ctx.report_activity(st_id, msg),
             on_tool_event=_on_tool_event,
@@ -736,7 +663,7 @@ async def _execute_single_shot(
         import traceback as _tb
 
         duration_ms = int((time.monotonic() - start_time) * 1000)
-        error_type = _classify_error(e)
+        error_type = classify_error(e)
         error_detail = f"{type(e).__name__}: {e}"
         error_traceback = "".join(_tb.format_exception(type(e), e, e.__traceback__))
 
@@ -768,7 +695,7 @@ async def _execute_iterative(
     *,
     workspace_path: str | None = None,
     work_rules: dict | None = None,
-    max_iterations: int = 50,
+    max_iterations: int = 500,
 ) -> tuple[dict, LLMResponse | None, dict | None]:
     """RALPH-style iterative execution: fresh context per iteration,
     quality checks, stuck detection, hard cutoff.
@@ -948,7 +875,7 @@ async def _execute_iterative(
                     provider, list(messages),
                     tools=architect_tools or None,
                     tool_executor=_architect_tool_exec,
-                    max_rounds=70,
+                    max_rounds=500,
                     on_activity=lambda msg, _i=iteration: ctx.report_activity(
                         st_id, f"[iter {_i}] [Architect] {msg}",
                     ),
@@ -983,7 +910,7 @@ async def _execute_iterative(
                     provider, editor_messages,
                     tools=editor_tools or None,
                     tool_executor=_iter_tool_exec,
-                    max_rounds=70,
+                    max_rounds=500,
                     on_activity=lambda msg, _i=iteration: ctx.report_activity(
                         st_id, f"[iter {_i}] [Editor] {msg}",
                     ),
@@ -1008,7 +935,7 @@ async def _execute_iterative(
                     provider, messages,
                     tools=tools_arg,
                     tool_executor=_iter_tool_exec,
-                    max_rounds=70,
+                    max_rounds=500,
                     on_activity=lambda msg, _i=iteration: ctx.report_activity(
                         st_id, f"[iter {_i}] {msg}",
                     ),
@@ -1077,7 +1004,7 @@ async def _execute_iterative(
                     submit_data=_submit_result_data,
                 )
             elif role == "debugger" and agent_signaled_done and _submit_result_data:
-                qc_result = _validate_debugger_output(_submit_result_data)
+                qc_result = validate_debugger_output(_submit_result_data)
             else:
                 qc_result = {"passed": True, "reason": "no quality rules", "learnings": []}
 
@@ -1096,7 +1023,7 @@ async def _execute_iterative(
             learnings = qc_result.get("learnings", [])
             if tool_loop_truncated:
                 learnings.append(
-                    "Tool loop was truncated (hit max_rounds=70). "
+                    "Tool loop was truncated (hit max_rounds). "
                     "Agent may not have finished all intended tool calls."
                 )
             entry: dict[str, Any] = {
@@ -1258,7 +1185,7 @@ async def _execute_iterative(
             import traceback as _tb
 
             duration_ms = int((time.monotonic() - start_time) * 1000)
-            error_type = _classify_error(e)
+            error_type = classify_error(e)
             error_detail = f"{type(e).__name__}: {e}"
             error_traceback = "".join(_tb.format_exception(type(e), e, e.__traceback__))
 
@@ -1332,7 +1259,7 @@ async def run_llm_job(
     *,
     workspace_path: str | None = None,
     work_rules: dict | None = None,
-    max_iterations: int = 50,
+    max_iterations: int = 500,
 ) -> AgentResult:
     """Execute an LLM-powered agent job with full lifecycle management.
 
@@ -1492,7 +1419,7 @@ async def run_procedural_job(
         import traceback as _tb
 
         duration_ms = int((time.monotonic() - start_time) * 1000)
-        error_type = _classify_error(e)
+        error_type = classify_error(e)
         error_detail = f"{type(e).__name__}: {e}"
 
         logger.error(

@@ -1,8 +1,8 @@
 """Workspace IDE endpoints: file browsing, editing, and git operations.
 
 Extracted from todos.py to keep route modules focused.
-Resolves the task workspace at {project_workspace}/tasks/{todo_id}/repo/
-or {project_workspace}/tasks/{todo_id}/dep_{repo}/repo/ for dependency repos.
+Resolves the task workspace at {project_workspace}/tasks/{todo_id}/{repo_name}/
+where repo_name is 'main' or the dependency name.
 """
 
 import json
@@ -34,8 +34,7 @@ async def _resolve_task_repo(
     """Resolve the task workspace repo directory.
 
     Args:
-        repo: Optional dependency repo name. When provided and not "main",
-              resolves to dep_{repo}/repo/ instead of repo/.
+        repo: Repo name ("main" or dependency name).
 
     Returns (repo_dir, todo_id).
     """
@@ -51,11 +50,10 @@ async def _resolve_task_repo(
         raise HTTPException(status_code=404, detail="No workspace configured")
 
     task_dir = os.path.join(str(project["workspace_path"]), "tasks", todo_id)
-    if repo and repo != "main":
-        dep_name = repo.replace("/", "_").replace(" ", "_")
-        repo_dir = os.path.join(task_dir, f"dep_{dep_name}", "repo")
-    else:
-        repo_dir = os.path.join(task_dir, "repo")
+    repo_name = repo or "main"
+    if repo_name != "main":
+        repo_name = repo_name.replace("/", "_").replace(" ", "_")
+    repo_dir = os.path.join(task_dir, repo_name)
 
     if not os.path.isdir(repo_dir):
         raise HTTPException(status_code=404, detail="Task workspace not found")
@@ -85,15 +83,21 @@ async def workspace_repos(todo_id: str, user: CurrentUser, db: DB):
         raise HTTPException(status_code=404, detail="No workspace configured")
 
     task_dir = os.path.join(str(project["workspace_path"]), "tasks", todo_id)
-    repos = [{"name": "main", "label": "Main Repository"}]
+    repos = []
+    _skip = {"deps", ".context", "indexes"}
 
     if os.path.isdir(task_dir):
         for entry in sorted(os.listdir(task_dir)):
-            if entry.startswith("dep_") and os.path.isdir(
-                os.path.join(task_dir, entry, "repo")
-            ):
-                dep_name = entry[4:]  # strip "dep_" prefix
-                repos.append({"name": dep_name, "label": dep_name})
+            entry_path = os.path.join(task_dir, entry)
+            if (entry not in _skip
+                and not entry.startswith(".")
+                and os.path.isdir(entry_path)
+                and os.path.isdir(os.path.join(entry_path, ".git"))):
+                label = "Main Repository" if entry == "main" else entry
+                repos.append({"name": entry, "label": label})
+
+    if not repos:
+        repos.append({"name": "main", "label": "Main Repository"})
 
     return repos
 
@@ -290,6 +294,83 @@ async def workspace_git_diff(
     return {
         "diff": diff if rc == 0 else "",
         "stats": stats.strip() if rc == 0 else "",
+    }
+
+
+@router.get("/todos/{todo_id}/workspace/git/task-diff")
+async def workspace_task_diff(
+    todo_id: str, user: CurrentUser, db: DB,
+    repo: str = Query(None, description="Repo name: 'main' or dependency name"),
+):
+    """Get the overall diff for the entire task (base_commit..HEAD).
+
+    Returns the cumulative diff of all coder subtask work since the task
+    branch was created. Only available after at least one coder has committed.
+    """
+    repo_dir, _ = await _resolve_task_repo(todo_id, user, db, repo=repo)
+
+    todo = await db.fetchrow(
+        "SELECT base_commit FROM todo_items WHERE id = $1", todo_id,
+    )
+    base = todo["base_commit"] if todo else None
+    if not base:
+        return {"diff": "", "stats": "", "files": [], "has_changes": False}
+
+    rc, diff = await run_git_command("diff", f"{base}..HEAD", cwd=repo_dir)
+    _, stats = await run_git_command("diff", "--stat", f"{base}..HEAD", cwd=repo_dir)
+    _, name_status = await run_git_command("diff", "--name-status", f"{base}..HEAD", cwd=repo_dir)
+
+    files = []
+    for line in (name_status or "").strip().splitlines():
+        parts = line.split("\t", 1)
+        if len(parts) == 2:
+            files.append({"status": parts[0], "path": parts[1]})
+
+    return {
+        "diff": diff or "",
+        "stats": stats or "",
+        "files": files,
+        "has_changes": bool(diff and diff.strip()),
+        "base_commit": base,
+    }
+
+
+@router.get("/todos/{todo_id}/workspace/git/subtask-diff/{subtask_id}")
+async def workspace_subtask_diff(
+    todo_id: str, subtask_id: str, user: CurrentUser, db: DB,
+    repo: str = Query(None, description="Repo name"),
+):
+    """Get the diff for a specific subtask's incremental commit.
+
+    Uses the commit_hash stored on the subtask after incremental commit.
+    Shows what that specific subtask changed (commit~1..commit).
+    """
+    repo_dir, _ = await _resolve_task_repo(todo_id, user, db, repo=repo)
+
+    st = await db.fetchrow(
+        "SELECT commit_hash FROM sub_tasks WHERE id = $1 AND todo_id = $2",
+        subtask_id, todo_id,
+    )
+    if not st or not st.get("commit_hash"):
+        return {"diff": "", "stats": "", "files": [], "has_changes": False}
+
+    commit = st["commit_hash"]
+    rc, diff = await run_git_command("diff", f"{commit}~1..{commit}", cwd=repo_dir)
+    _, stats = await run_git_command("diff", "--stat", f"{commit}~1..{commit}", cwd=repo_dir)
+    _, name_status = await run_git_command("diff", "--name-status", f"{commit}~1..{commit}", cwd=repo_dir)
+
+    files = []
+    for line in (name_status or "").strip().splitlines():
+        parts = line.split("\t", 1)
+        if len(parts) == 2:
+            files.append({"status": parts[0], "path": parts[1]})
+
+    return {
+        "diff": diff or "",
+        "stats": stats or "",
+        "files": files,
+        "has_changes": bool(diff and diff.strip()),
+        "commit_hash": commit,
     }
 
 

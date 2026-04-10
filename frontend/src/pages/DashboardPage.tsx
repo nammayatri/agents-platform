@@ -15,10 +15,10 @@ export default function DashboardPage() {
 
   useEffect(() => {
     if (user?.role === 'admin') {
-      adminApi.stats().then(setStats)
-      adminApi.todos().then((t) => setRecentTodos((t as TodoItem[]).slice(0, 20)))
+      adminApi.stats().then(setStats).catch(() => {})
+      adminApi.todos().then((t) => setRecentTodos((t as TodoItem[]).slice(0, 20))).catch(() => {})
     }
-  }, [user])
+  }, [user?.role])
 
   const statCards = [
     { label: 'Total Tasks', value: stats.total_todos, accent: 'border-l-gray-500', iconBg: 'bg-gray-500/10', iconColor: 'text-gray-400', Icon: ListTodo },

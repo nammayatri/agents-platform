@@ -5,8 +5,18 @@ interface AnalysisEvent {
   detail: string
 }
 
-const STEP_ORDER = ['cloning', 'scanning', 'sampling', 'dependencies', 'analyzing', 'complete']
-
+/**
+ * WebSocket hook for real-time project analysis progress.
+ *
+ * Connects to /ws/projects/{projectId}/analysis which implements
+ * the **snapshot + stream** pattern:
+ * - On connect, the server sends the current step from DB (survives refresh)
+ * - Then streams incremental updates via Redis pub/sub
+ *
+ * This hook is intentionally step-order-agnostic — it just tracks
+ * the current step and detail string. The rendering component owns
+ * the STEP_ORDER and computes completed/pending from currentStep.
+ */
 export function useAnalysisWebSocket(
   projectId: string | null,
   active: boolean,
@@ -17,7 +27,7 @@ export function useAnalysisWebSocket(
   const [reconnectCount, setReconnectCount] = useState(0)
   const [currentStep, setCurrentStep] = useState<string | null>(null)
   const [detail, setDetail] = useState<string | null>(null)
-  const [completedSteps, setCompletedSteps] = useState<string[]>([])
+  const [done, setDone] = useState(false)
 
   const onCompleteRef = useRef(onComplete)
   const onFailedRef = useRef(onFailed)
@@ -27,7 +37,7 @@ export function useAnalysisWebSocket(
   const reset = useCallback(() => {
     setCurrentStep(null)
     setDetail(null)
-    setCompletedSteps([])
+    setDone(false)
   }, [])
 
   useEffect(() => {
@@ -47,9 +57,9 @@ export function useAnalysisWebSocket(
         if (!data.step) return // ignore pings
 
         if (data.step === 'complete') {
-          setCompletedSteps(STEP_ORDER.filter(s => s !== 'complete'))
           setCurrentStep(null)
           setDetail(data.detail)
+          setDone(true)
           onCompleteRef.current?.()
           return
         }
@@ -61,11 +71,6 @@ export function useAnalysisWebSocket(
           return
         }
 
-        // Mark all prior steps as completed
-        const stepIdx = STEP_ORDER.indexOf(data.step)
-        if (stepIdx >= 0) {
-          setCompletedSteps(STEP_ORDER.slice(0, stepIdx))
-        }
         setCurrentStep(data.step)
         setDetail(data.detail)
       } catch {
@@ -85,5 +90,5 @@ export function useAnalysisWebSocket(
     }
   }, [projectId, active, reconnectCount])
 
-  return { currentStep, detail, completedSteps, reset }
+  return { currentStep, detail, done, reset }
 }

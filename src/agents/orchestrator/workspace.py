@@ -3,13 +3,27 @@
 Directory structure:
     {WORKSPACE_ROOT}/
         {project_id}/
-            repo/              <- main project repo clone
+            repo/                   <- project-level reference clone (main repo)
             deps/
-                {dep_name}/    <- cloned dependency repos
-            analysis.json      <- cached codebase understanding
+                {dep_name}/         <- project-level dep reference clones
             tasks/
-                {todo_id}/
-                    repo/      <- fresh clone for this task (own branch)
+                {todo_id}/          <- task_root
+                    main/           <- writeable main repo clone (task branch)
+                    {dep_name}/     <- writeable dep repo clone (task branch)
+                    deps/           <- symlink → project_dir/deps/ (read-only)
+                    .context/       <- context docs copy
+
+workspace_path on sub_tasks = the git working directory itself.
+    e.g. tasks/{todo_id}/main/ or tasks/{todo_id}/{dep_name}/
+
+task_root = tasks/{todo_id}/
+    Derived from workspace_path: os.path.dirname(workspace_path)
+
+Agent's file access model (from inside main/):
+    .              → repo code
+    ../deps/{name}/ → read-only dep repos
+    ../.context/    → project context docs
+    ../{dep_name}/  → sibling writeable repo
 """
 
 import asyncio
@@ -34,6 +48,18 @@ from agents.utils.git_utils import (
 
 logger = logging.getLogger(__name__)
 
+# Reserved repo name for the main project repository
+MAIN_REPO = "main"
+
+
+def task_root_from_workspace(workspace_path: str) -> str:
+    """Derive task_root from a workspace_path (git working dir).
+
+    workspace_path = task_root/{name}/
+    task_root = workspace_path/../
+    """
+    return os.path.normpath(os.path.join(workspace_path, ".."))
+
 
 class WorkspaceManager:
     def __init__(self, db: asyncpg.Pool, workspace_root: str):
@@ -42,7 +68,7 @@ class WorkspaceManager:
         os.makedirs(workspace_root, exist_ok=True)
 
     # ------------------------------------------------------------------
-    # Project workspace
+    # Project workspace (reference clones — unchanged)
     # ------------------------------------------------------------------
 
     async def setup_project_workspace(self, project_id: str) -> str:
@@ -128,14 +154,14 @@ class WorkspaceManager:
         return project_dir
 
     # ------------------------------------------------------------------
-    # Task workspace
+    # Task workspace setup
     # ------------------------------------------------------------------
 
     async def setup_task_workspace(self, todo_id: str) -> str:
-        """Create a task-level workspace with its own clone and branch.
+        """Create the task_root and clone the main repo into task_root/main/.
 
-        Clones from the project workspace (local clone for speed), creates a
-        new branch named task/{short_id}, and returns the task workspace path.
+        Returns task_root (tasks/{todo_id}/).
+        The main repo workspace_path is task_root/main/.
         """
         logger.info("[workspace] setup_task_workspace START for todo=%s", todo_id)
         todo = await self.db.fetchrow(
@@ -158,8 +184,6 @@ class WorkspaceManager:
         project_repo_dir = os.path.join(project_workspace, "repo")
 
         # Verify the project repo is a valid, functional git clone.
-        # Just checking for .git dir is insufficient — the repo can be corrupt
-        # (missing objects, interrupted clone, /tmp cleanup, etc.).
         repo_valid = False
         if os.path.isdir(project_repo_dir):
             rc, _ = await run_git_command(
@@ -182,35 +206,38 @@ class WorkspaceManager:
                 raise ValueError(f"Project repo not cloned at {project_repo_dir} after re-setup")
 
         short_id = str(todo_id)[:8]
-        task_dir = os.path.join(project_workspace, "tasks", str(todo_id))
-        task_repo_dir = os.path.join(task_dir, "repo")
+        task_root = os.path.join(project_workspace, "tasks", str(todo_id))
+        main_workspace = os.path.join(task_root, MAIN_REPO)
 
-        if os.path.isdir(task_repo_dir):
+        if os.path.isdir(main_workspace):
             logger.info("[workspace] Task workspace exists, verifying for todo=%s", todo_id)
-            # Re-authenticate remote in case token expired
-            await ensure_authenticated_remote(task_repo_dir, self.db)
-            await run_git_command("fetch", "origin", cwd=task_repo_dir)
-            # Ensure the task branch exists and is checked out
+            await ensure_authenticated_remote(main_workspace, self.db)
+            # Don't fetch — task workspace doesn't need remote updates.
+            # Fetching on large repos hangs for minutes.
             branch_name = f"task/{short_id}"
             rc, current = await run_git_command(
-                "rev-parse", "--abbrev-ref", "HEAD", cwd=task_repo_dir,
+                "rev-parse", "--abbrev-ref", "HEAD", cwd=main_workspace,
             )
             current = current.strip() if rc == 0 else ""
             if current != branch_name:
                 logger.info("[workspace] Checking out task branch %s (was on %s)", branch_name, current)
-                rc, _ = await run_git_command("checkout", branch_name, cwd=task_repo_dir)
+                rc, _ = await run_git_command("checkout", branch_name, cwd=main_workspace)
                 if rc != 0:
-                    await run_git_command("checkout", "-b", branch_name, cwd=task_repo_dir)
-            # Unshallow if needed (shallow clones can block push)
-            rc_s, is_shallow = await run_git_command(
-                "rev-parse", "--is-shallow-repository", cwd=task_repo_dir,
-            )
-            if rc_s == 0 and is_shallow.strip() == "true":
-                logger.info("[workspace] Unshallowing task repo for todo=%s", todo_id)
-                await run_git_command("fetch", "--unshallow", "origin", cwd=task_repo_dir)
-            return task_dir
+                    await run_git_command("checkout", "-b", branch_name, cwd=main_workspace)
+            return task_root
 
-        os.makedirs(task_dir, exist_ok=True)
+        # ── Pull project repo to latest before cloning task workspace ──
+        branch = todo.get("default_branch") or "main"
+        await ensure_authenticated_remote(project_repo_dir, self.db)
+        rc_pull, _ = await run_git_command(
+            "pull", "--ff-only", "origin", branch, cwd=project_repo_dir,
+        )
+        if rc_pull == 0:
+            logger.info("[workspace] Project repo fast-forwarded to origin/%s for todo=%s", branch, todo_id)
+        else:
+            logger.warning("[workspace] Project repo pull --ff-only failed for project=%s (non-fatal, using as-is)", project_id)
+
+        os.makedirs(task_root, exist_ok=True)
 
         clone_url = todo.get("repo_url") or ""
         git_provider_id = str(todo["git_provider_id"]) if todo.get("git_provider_id") else None
@@ -220,7 +247,7 @@ class WorkspaceManager:
         )
 
         rc, out = await run_git_command(
-            "clone", project_repo_dir, task_repo_dir,
+            "clone", project_repo_dir, main_workspace,
             cwd=self.workspace_root,
         )
         if rc != 0:
@@ -229,36 +256,142 @@ class WorkspaceManager:
         authenticated_url = build_clone_url(clone_url, token, provider_type)
         await run_git_command(
             "remote", "set-url", "origin", authenticated_url,
-            cwd=task_repo_dir,
+            cwd=main_workspace,
         )
 
-        # Unshallow the clone so push works cleanly
-        rc_check, is_shallow = await run_git_command(
-            "rev-parse", "--is-shallow-repository", cwd=task_repo_dir,
-        )
-        if rc_check == 0 and is_shallow.strip() == "true":
-            logger.info("[workspace] Unshallowing fresh task clone for todo=%s", todo_id)
-            await run_git_command("fetch", "--unshallow", "origin", cwd=task_repo_dir)
+        # Record base commit for diff computation
+        rc_base, base_hash = await run_git_command("rev-parse", "HEAD", cwd=main_workspace)
+        if rc_base == 0:
+            base_commit = base_hash.strip()
+            await self.db.execute(
+                "UPDATE todo_items SET base_commit = $2 WHERE id = $1",
+                todo_id, base_commit,
+            )
+            logger.info("[workspace] Stored base_commit=%s for todo=%s", base_commit[:12], todo_id)
 
         branch_name = f"task/{short_id}"
         logger.info("[workspace] Created task branch=%s for todo=%s", branch_name, todo_id)
-        await run_git_command("checkout", "-b", branch_name, cwd=task_repo_dir)
+        await run_git_command("checkout", "-b", branch_name, cwd=main_workspace)
 
-        project_deps = os.path.join(project_workspace, "deps")
-        task_deps = os.path.join(task_dir, "deps")
-        if os.path.isdir(project_deps) and not os.path.exists(task_deps):
-            os.symlink(project_deps, task_deps)
-
-        # Copy project context docs (.context/) into task workspace
+        # Copy project context docs into task_root/.context/
         project_context = os.path.join(project_workspace, ".context")
-        task_context = os.path.join(task_dir, ".context")
+        task_context = os.path.join(task_root, ".context")
         if os.path.isdir(project_context) and not os.path.exists(task_context):
             try:
                 shutil.copytree(project_context, task_context)
             except Exception:
                 logger.debug("Could not copy .context/ into task workspace")
 
-        return task_dir
+        # Symlink project deps into task_root/deps/ so ../deps/{name}/ works
+        # from task_root/main/ (matches the path convention in tool descriptions).
+        project_deps = os.path.join(project_workspace, "deps")
+        task_deps_link = os.path.join(task_root, "deps")
+        if os.path.isdir(project_deps) and not os.path.exists(task_deps_link):
+            try:
+                os.symlink(project_deps, task_deps_link)
+            except Exception:
+                logger.debug("Could not symlink deps into task root")
+
+        return task_root
+
+    # ------------------------------------------------------------------
+    # Per-repo workspace setup (unified for main and deps)
+    # ------------------------------------------------------------------
+
+    async def setup_repo_workspace(
+        self,
+        todo_id: str,
+        repo_name: str,
+        repo_url: str,
+        *,
+        default_branch: str = "main",
+        git_provider_id: str | None = None,
+    ) -> str:
+        """Set up a writeable workspace for any repo (main or dependency).
+
+        Clones the repo into task_root/{repo_name}/ and creates a
+        task branch. Returns the workspace_path (the git working directory).
+
+        This is the unified method — main repo and dep repos use the same
+        code path. For the main repo, setup_task_workspace calls this
+        internally.
+        """
+        todo = await self.db.fetchrow(
+            "SELECT t.*, p.workspace_path AS project_workspace, p.git_provider_id AS project_gp_id "
+            "FROM todo_items t JOIN projects p ON t.project_id = p.id "
+            "WHERE t.id = $1",
+            todo_id,
+        )
+        if not todo:
+            raise ValueError(f"Todo {todo_id} not found")
+
+        project_workspace = todo.get("project_workspace")
+        if not project_workspace or not os.path.isdir(project_workspace):
+            project_workspace = await self.setup_project_workspace(str(todo["project_id"]))
+
+        short_id = str(todo_id)[:8]
+        task_root = os.path.join(project_workspace, "tasks", str(todo_id))
+        workspace_path = os.path.join(task_root, repo_name)
+
+        if os.path.isdir(workspace_path):
+            logger.info("[workspace] Reusing existing repo workspace: %s", workspace_path)
+            # Don't fetch — the repo was cloned for this task and doesn't need
+            # updates. Fetching on large repos can hang for minutes downloading
+            # full ref lists. Just ensure auth is valid and return.
+            await ensure_authenticated_remote(workspace_path, self.db)
+            return workspace_path
+
+        logger.info("[workspace] Cloning repo '%s' → %s", repo_name, workspace_path)
+        os.makedirs(os.path.dirname(workspace_path), exist_ok=True)
+
+        # Resolve git credentials
+        effective_gp_id = git_provider_id
+        if not effective_gp_id:
+            effective_gp_id = str(todo["project_gp_id"]) if todo.get("project_gp_id") else None
+
+        token, provider_type, _ = await resolve_git_credentials(
+            self.db, effective_gp_id, repo_url,
+        )
+
+        # Try local clone from project deps first (faster than remote)
+        project_dep_dir = os.path.join(project_workspace, "deps", repo_name)
+        if os.path.isdir(os.path.join(project_dep_dir, ".git")):
+            # Pull latest on the project dep first
+            await self._clone_or_pull(
+                repo_url=repo_url,
+                target_dir=project_dep_dir,
+                branch="HEAD",
+                token=token,
+                provider_type=provider_type,
+            )
+            rc, out = await run_git_command(
+                "clone", project_dep_dir, workspace_path,
+                cwd=self.workspace_root,
+            )
+        else:
+            # No local reference — clone from remote
+            authenticated_url = build_clone_url(repo_url, token, provider_type)
+            rc, out = await run_git_command(
+                "clone", "--depth", "1", authenticated_url, workspace_path,
+                cwd=self.workspace_root,
+            )
+
+        if rc != 0:
+            raise RuntimeError(f"git clone failed for '{repo_name}': {out}")
+
+        # Set authenticated remote
+        authenticated_url = build_clone_url(repo_url, token, provider_type)
+        await run_git_command(
+            "remote", "set-url", "origin", authenticated_url,
+            cwd=workspace_path,
+        )
+
+        # Create task branch
+        branch_name = f"task/{short_id}-{repo_name}" if repo_name != MAIN_REPO else f"task/{short_id}"
+        await run_git_command("checkout", "-b", branch_name, cwd=workspace_path)
+        logger.info("[workspace] Created branch %s for repo '%s'", branch_name, repo_name)
+
+        return workspace_path
 
     async def cleanup_task_workspace(self, todo_id: str) -> None:
         """Remove a task workspace after completion."""
@@ -269,21 +402,14 @@ class WorkspaceManager:
             return
 
         project_dir = os.path.join(self.workspace_root, str(todo["project_id"]))
-        task_dir = os.path.join(project_dir, "tasks", str(todo_id))
+        task_root = os.path.join(project_dir, "tasks", str(todo_id))
 
-        if os.path.isdir(task_dir):
-            shutil.rmtree(task_dir, ignore_errors=True)
-            logger.info("Cleaned up task workspace %s", task_dir)
+        if os.path.isdir(task_root):
+            shutil.rmtree(task_root, ignore_errors=True)
+            logger.info("Cleaned up task workspace %s", task_root)
 
     async def evict_old_workspaces(self, max_total_bytes: int = 10 * 1024**3) -> int:
-        """LRU-evict completed task workspaces when total size exceeds limit.
-
-        Scans all ``{project}/tasks/{todo}/`` directories, measures total disk
-        usage, and removes the oldest (by mtime) directories belonging to
-        completed/cancelled/failed tasks until total drops below *max_total_bytes*.
-
-        Returns the number of workspaces evicted.
-        """
+        """LRU-evict completed task workspaces when total size exceeds limit."""
         task_dirs: list[tuple[float, str, str]] = []  # (mtime, path, todo_id)
 
         for project_name in os.listdir(self.workspace_root):
@@ -304,7 +430,6 @@ class WorkspaceManager:
         if not task_dirs:
             return 0
 
-        # Calculate total size (approximate via du-style walk)
         total_bytes = 0
         dir_sizes: dict[str, int] = {}
         for _, path, _ in task_dirs:
@@ -324,10 +449,8 @@ class WorkspaceManager:
         if total_bytes <= max_total_bytes:
             return 0
 
-        # Sort by mtime ascending (oldest first) for LRU eviction
         task_dirs.sort(key=lambda t: t[0])
 
-        # Only evict completed/cancelled/failed tasks
         terminal_ids: set[str] = set()
         try:
             rows = await self.db.fetch(
@@ -343,7 +466,7 @@ class WorkspaceManager:
             if total_bytes <= max_total_bytes:
                 break
             if todo_id not in terminal_ids:
-                continue  # don't evict active tasks
+                continue
             freed = dir_sizes.get(path, 0)
             try:
                 shutil.rmtree(path, ignore_errors=True)
@@ -356,16 +479,13 @@ class WorkspaceManager:
         return evicted
 
     # ------------------------------------------------------------------
-    # Command execution (quality checks, etc.)
+    # Command execution
     # ------------------------------------------------------------------
 
     async def run_command(
         self, cmd: str, cwd: str, *, timeout: int = 60,
     ) -> tuple[int, str]:
-        """Run a shell command in the given directory.
-
-        Returns (exit_code, combined_output).
-        """
+        """Run a shell command in the given directory."""
         try:
             proc = await asyncio.create_subprocess_shell(
                 cmd,
@@ -393,6 +513,8 @@ class WorkspaceManager:
     ) -> dict:
         """Stage all changes, commit, and push to remote.
 
+        workspace_path is the git working directory directly (no /repo/ subdir).
+
         Returns a dict with:
             success (bool): True if the branch was successfully pushed.
             error (str | None): Error description on failure.
@@ -405,43 +527,39 @@ class WorkspaceManager:
             "pre_commit_failed": False,
             "pre_commit_output": None,
         }
-        repo_dir = os.path.join(workspace_path, "repo")
-        if not os.path.isdir(repo_dir):
-            repo_dir = workspace_path
 
-        if not os.path.isdir(os.path.join(repo_dir, ".git")):
-            logger.error("commit_and_push: no .git directory in %s", repo_dir)
+        if not os.path.isdir(os.path.join(workspace_path, ".git")):
+            logger.error("commit_and_push: no .git directory in %s", workspace_path)
             result["error"] = "no .git directory"
             return result
 
-        await ensure_authenticated_remote(repo_dir, self.db)
+        await ensure_authenticated_remote(workspace_path, self.db)
 
-        rc, current_branch = await run_git_command("rev-parse", "--abbrev-ref", "HEAD", cwd=repo_dir)
+        rc, current_branch = await run_git_command("rev-parse", "--abbrev-ref", "HEAD", cwd=workspace_path)
         if rc == 0:
             current_branch = current_branch.strip()
             if current_branch != branch:
                 logger.info("Switching from %s to %s", current_branch, branch)
-                rc, out = await run_git_command("checkout", branch, cwd=repo_dir)
+                rc, out = await run_git_command("checkout", branch, cwd=workspace_path)
                 if rc != 0:
-                    rc, out = await run_git_command("checkout", "-b", branch, cwd=repo_dir)
+                    rc, out = await run_git_command("checkout", "-b", branch, cwd=workspace_path)
                     if rc != 0:
                         logger.error("git checkout -b %s failed: %s", branch, out)
                         result["error"] = f"checkout failed: {out}"
                         return result
 
-        rc, out = await run_git_command("add", "-A", cwd=repo_dir)
+        rc, out = await run_git_command("add", "-A", cwd=workspace_path)
         if rc != 0:
             logger.error("git add failed: %s", out)
             result["error"] = f"git add failed: {out}"
             return result
 
-        rc, out = await run_git_command("diff", "--cached", "--quiet", cwd=repo_dir)
+        rc, out = await run_git_command("diff", "--cached", "--quiet", cwd=workspace_path)
         if rc == 0:
             logger.info("No new changes to commit — checking if branch has unpushed commits")
         else:
-            rc, out = await run_git_command("commit", "-m", message, cwd=repo_dir)
+            rc, out = await run_git_command("commit", "-m", message, cwd=workspace_path)
             if rc != 0:
-                # Detect pre-commit hook failure
                 hook_indicators = [
                     "pre-commit", "hook", "husky", "lint-staged",
                     "eslint", "prettier", "tsc", "mypy", "ruff",
@@ -460,19 +578,20 @@ class WorkspaceManager:
                 return result
             logger.info("Committed changes on branch %s", branch)
 
-        # Unshallow if needed — shallow clones can cause push failures
-        rc_s, is_shallow = await run_git_command(
-            "rev-parse", "--is-shallow-repository", cwd=repo_dir,
-        )
-        if rc_s == 0 and is_shallow.strip() == "true":
-            logger.info("Unshallowing before push on branch %s", branch)
-            await run_git_command("fetch", "--unshallow", "origin", cwd=repo_dir)
-
-        rc, out = await run_git_command("push", "-u", "origin", branch, cwd=repo_dir)
+        rc, out = await run_git_command("push", "-u", "origin", branch, cwd=workspace_path)
         if rc != 0:
-            logger.error("git push failed: %s", out)
-            result["error"] = f"git push failed: {out}"
-            return result
+            rc_s, is_shallow = await run_git_command(
+                "rev-parse", "--is-shallow-repository", cwd=workspace_path,
+            )
+            if rc_s == 0 and is_shallow.strip() == "true":
+                logger.info("Push failed on shallow clone, unshallowing and retrying branch %s", branch)
+                await run_git_command("fetch", "--unshallow", "origin", cwd=workspace_path)
+                rc, out = await run_git_command("push", "-u", "origin", branch, cwd=workspace_path)
+
+            if rc != 0:
+                logger.error("git push failed: %s", out)
+                result["error"] = f"git push failed: {out}"
+                return result
 
         logger.info("Pushed branch %s to origin", branch)
         result["success"] = True
@@ -487,10 +606,7 @@ class WorkspaceManager:
         title: str,
         body: str,
     ) -> dict:
-        """Create a pull request using the git provider API.
-
-        Returns {"url": str, "number": int}.
-        """
+        """Create a pull request using the git provider API."""
         project = await self.db.fetchrow(
             "SELECT repo_url, git_provider_id "
             "FROM projects WHERE id = $1",
@@ -535,10 +651,7 @@ class WorkspaceManager:
         title: str,
         body: str,
     ) -> dict:
-        """Create a PR for any repo (not just the project's main repo).
-
-        Returns {"url": str, "number": int}.
-        """
+        """Create a PR for any repo (not just the project's main repo)."""
         token, provider_type, api_base_url = await resolve_git_credentials(
             self.db, git_provider_id, repo_url,
         )
@@ -566,12 +679,16 @@ class WorkspaceManager:
     # File tree
     # ------------------------------------------------------------------
 
-    def get_file_tree(self, workspace_path: str, max_depth: int = 5) -> str:
-        """Build a directory tree string for the workspace repo."""
-        repo_dir = os.path.join(workspace_path, "repo")
-        if not os.path.isdir(repo_dir):
-            repo_dir = workspace_path
-        return build_file_tree_text(repo_dir, max_depth)
+    def get_file_tree(self, workspace_path: str, max_depth: int = 3, max_chars: int = 8000) -> str:
+        """Build a directory tree string for the workspace.
+
+        workspace_path IS the git working directory (no /repo/ subdir).
+        Truncates to max_chars to avoid blowing token budgets on large repos.
+        """
+        tree = build_file_tree_text(workspace_path, max_depth)
+        if len(tree) > max_chars:
+            tree = tree[:max_chars] + f"\n... (truncated, {len(tree) - max_chars} more chars)"
+        return tree
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -589,15 +706,14 @@ class WorkspaceManager:
         clone_url = build_clone_url(repo_url, token, provider_type)
 
         if os.path.isdir(os.path.join(target_dir, ".git")):
-            rc, out = await run_git_command("fetch", "origin", cwd=target_dir)
-            if rc != 0:
-                logger.warning("git fetch failed for %s: %s", target_dir, out)
-                return False
             rc, out = await run_git_command(
-                "reset", "--hard", f"origin/{branch}" if branch != "HEAD" else "FETCH_HEAD",
+                "pull", "--ff-only", "origin",
+                *([] if branch == "HEAD" else [branch]),
                 cwd=target_dir,
             )
-            return rc == 0
+            if rc != 0:
+                logger.warning("git pull --ff-only failed for %s: %s (using as-is)", target_dir, out[:200])
+            return True
 
         os.makedirs(os.path.dirname(target_dir), exist_ok=True)
         args = ["clone", "--depth", "1"]

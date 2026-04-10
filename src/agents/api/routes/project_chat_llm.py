@@ -10,6 +10,7 @@ import json
 import logging
 
 from agents.api.chat_actions import execute_action, get_actions_as_tools, is_action_tool
+from agents.utils.chat_compaction import compact_chat_context
 from agents.utils.json_helpers import safe_json
 from agents.utils.repo_utils import resolve_target_repo
 
@@ -17,6 +18,50 @@ logger = logging.getLogger(__name__)
 
 
 # ── Shared Helpers ───────────────────────────────────────────────────
+
+
+async def _load_and_compact_history(
+    db, *, session_id: str | None, project_id: str, user_id: str,
+    model: str, limit: int = 40, max_tokens: int = 40_000,
+    provider=None, redis=None,
+) -> list[dict]:
+    """Load chat history and apply 4-tier progressive compaction.
+
+    Shared by all response generators so compaction is consistent.
+    Returns a list of message dicts ready for LLM consumption.
+    """
+    if session_id:
+        rows = await db.fetch(
+            "SELECT m.role, m.content, u.display_name AS sender_name "
+            "FROM project_chat_messages m JOIN users u ON u.id = m.user_id "
+            "WHERE m.session_id = $1 ORDER BY m.created_at DESC LIMIT $2",
+            session_id, limit,
+        )
+    else:
+        rows = await db.fetch(
+            "SELECT m.role, m.content, u.display_name AS sender_name "
+            "FROM project_chat_messages m JOIN users u ON u.id = m.user_id "
+            "WHERE m.project_id = $1 AND m.user_id = $2 AND m.session_id IS NULL "
+            "ORDER BY m.created_at DESC LIMIT $3",
+            project_id, user_id, limit,
+        )
+    history = [dict(r) for r in reversed(rows)]
+
+    # Load persisted compaction summary (Tier 3 recovery)
+    existing_summary = None
+    if session_id:
+        sess_row = await db.fetchrow(
+            "SELECT compaction_summary FROM project_chat_sessions WHERE id = $1",
+            session_id,
+        )
+        if sess_row and sess_row.get("compaction_summary"):
+            existing_summary = sess_row["compaction_summary"]
+
+    return await compact_chat_context(
+        history, max_tokens=max_tokens, model=model,
+        provider=provider, db=db, session_id=session_id,
+        existing_summary=existing_summary,
+    )
 
 
 async def resolve_planner_config(db, user_id: str) -> dict | None:
@@ -46,7 +91,9 @@ def _build_project_context(project: dict, settings: dict | None) -> str:
     if not settings:
         return ""
 
-    understanding = settings.get("project_understanding", {})
+    from agents.utils.settings_helpers import read_setting as _rs
+
+    understanding = _rs(settings, "understanding.project", "project_understanding", {})
     if understanding:
         if understanding.get("summary"):
             parts.append(f"Summary: {understanding['summary']}")
@@ -77,7 +124,7 @@ def _build_project_context(project: dict, settings: dict | None) -> str:
                 dep_lines.append(line)
             parts.append("Dependency roles:\n" + "\n".join(dep_lines))
 
-    work_rules = settings.get("work_rules", {})
+    work_rules = _rs(settings, "execution.work_rules", "work_rules", {})
     if work_rules:
         rules_parts = []
         for cat, items in work_rules.items():
@@ -86,7 +133,7 @@ def _build_project_context(project: dict, settings: dict | None) -> str:
         if rules_parts:
             parts.append("Current work rules:\n" + "\n".join(rules_parts))
 
-    debug_ctx = settings.get("debug_context", {})
+    debug_ctx = _rs(settings, "debugging", "debug_context", {})
     if debug_ctx:
         debug_parts = []
         for src in debug_ctx.get("log_sources", []):
@@ -233,39 +280,84 @@ def _build_execution_metadata(tool_events: list[dict], response) -> dict:
 
 import re as _re
 
-# Keyword patterns for instant classification (no LLM call needed).
-# Checked in order — first match wins.
+# ── Intent Detection ───────────────────────────────────────────────
+#
+# Three-layer classification: keywords (instant) → short-message
+# heuristic → context-aware LLM (one fast-model call).
+#
+# The LLM layer receives recent conversation history so it can
+# distinguish follow-ups from mode switches. Few-shot examples
+# anchor the model on the 4 mode definitions.
+
+_VALID_MODES = {"chat", "plan", "debug", "create_task"}
+
+# Keyword patterns for instant classification (no LLM call).
+# Order matters — first match wins. Patterns are carefully scoped
+# to avoid false positives (e.g., "error in the plan" ≠ debug).
 _KEYWORD_RULES: list[tuple[str, "_re.Pattern[str]"]] = [
+    # create_task: explicit task/ticket creation intent
     ("create_task", _re.compile(
-        r"\b(create|add|make|new|open)\b.{0,15}\b(task|ticket|issue|todo|work\s*item)\b",
+        r"(?:^|\b)(create|add|make|new|open|file)\b.{0,15}\b(task|ticket|issue|todo|work\s*item)\b",
         _re.IGNORECASE,
     )),
-    ("debug", _re.compile(
-        r"\b(debug|bug|error|crash|broken|failing|exception|traceback|stack\s*trace|why\s+is.*(?:broken|failing|wrong|slow))\b",
-        _re.IGNORECASE,
-    )),
-    # Only match "plan" when it's an action request, not a reference to
-    # an existing plan (e.g. "the plan wasn't right").  Require either:
-    #   - a verb+plan combo: "let's plan", "create a plan", "make a plan", "build a plan", "need a plan"
-    #   - plan as a verb: "plan this", "plan the", "plan for", "plan out"
-    #   - dedicated planning words: architect, roadmap, strategy
+    # plan: action-oriented planning — user wants to BUILD something
     ("plan", _re.compile(
         r"(?:"
         r"let'?s\s+plan"
-        r"|(?:create|make|build|need|want|write)\s+(?:a\s+)?plan"
+        r"|(?:create|make|build|need|want|write|draft)\s+(?:a\s+)?plan"
         r"|\bplan\s+(?:this|the|for|out|how)\b"
-        r"|\b(architect|roadmap|strategy|how\s+should\s+we\s+build)\b"
+        r"|\b(?:architect|roadmap|how\s+should\s+we\s+(?:build|implement|design))\b"
+        r"|\b(?:create|build|define|need)\s+(?:a\s+)?strategy\b"
+        r"|break\s+(?:this|it)\s+(?:down|into)"
+        # Implementation / feature requests — user wants work done
+        r"|\b(?:want|need|have)\s+to\s+(?:implement|build|add|create|develop|refactor|migrate|set\s*up)"
+        r"|\b(?:implement|build|develop|refactor|migrate|set\s*up)\s+(?:a\s+|the\s+)?(?:new\s+)?\w"
+        r"|\badd\s+(?:a\s+|the\s+)?(?:new\s+)?(?:feature|endpoint|api|page|component|module|service|handler)"
+        r"|\b(?:i\s+want|we\s+need|we\s+should|can\s+you)\b.{0,30}\b(?:implement|build|add|create|develop)"
+        r")",
+        _re.IGNORECASE,
+    )),
+    # debug: investigation/troubleshooting (require problem-oriented context)
+    ("debug", _re.compile(
+        r"(?:"
+        r"\b(?:debug|traceback|stack\s*trace|segfault|core\s*dump)\b"
+        r"|\b(?:why\s+(?:is|does|did|are|do)\b.{0,30}(?:fail|crash|break|error|wrong|slow|hang|timeout))"
+        r"|\b(?:investigate|diagnose|troubleshoot|root\s*cause)\b"
+        r"|\b(?:bug|crash|exception)\s+(?:in|on|at|with|when|after)\b"
         r")",
         _re.IGNORECASE,
     )),
 ]
 
-_VALID_MODES = {"chat", "plan", "debug", "create_task"}
+# Intent classification prompt — few-shot with conversation context.
+_INTENT_SYSTEM = """\
+You classify user messages into exactly one mode. Consider the conversation \
+context to distinguish follow-ups from new intents.
 
-# Minimal prompt — ask for a single word, no JSON overhead.
-_INTENT_PROMPT = """\
-Classify into: chat, plan, debug, create_task. Current: {current_mode}.
-Reply with ONE word only."""
+MODES:
+- **chat**: Questions, explanations, code review, architecture discussion, \
+"how does X work", "explain Y", "what is Z". DEFAULT for ambiguous messages.
+- **plan**: User wants to create an implementation plan with subtasks. \
+Signals: "plan this", "break it down", "how should we implement", "design a solution".
+- **debug**: User wants to investigate a specific bug, error, or failure. \
+Signals: "why is X failing", "debug this", "investigate the crash", "trace the error".
+- **create_task**: User wants to directly create a task/ticket for execution. \
+Signals: "create a task to", "add a ticket for", "make a todo".
+
+RULES:
+1. If the user is continuing a previous topic (e.g., "yes", "do it", \
+"sounds good", "and also"), keep the CURRENT mode.
+2. If ambiguous between chat and plan, prefer chat. But if the user \
+describes WHAT they want built/implemented, that's plan.
+3. "fix X" without investigation context → create_task (they want it done, not debugged).
+4. "look into why X" → debug (they want investigation).
+5. "implement X", "build X", "add feature X", "I want to create X" → plan \
+(they want something built, which needs planning and execution).
+6. "how does X work", "explain X", "what is X" → chat (they want understanding).
+
+Reply in this exact format — nothing else:
+mode: <mode>
+reason: <5-10 words explaining why>"""
 
 
 def _keyword_classify(message: str) -> str | None:
@@ -285,58 +377,75 @@ async def detect_intent(
 ) -> tuple[str, float]:
     """Detect the intent of a user message.
 
-    Fast path: keyword patterns resolve instantly (no LLM call).
-    Slow path: one fast-model LLM call for ambiguous messages.
+    Three-layer classification:
+    1. Keyword patterns (instant, no LLM call)
+    2. Short follow-up heuristic (< 40 chars, keeps current mode)
+    3. Context-aware LLM classification (fast model, few-shot prompt
+       with recent conversation history)
 
     Returns (detected_mode, confidence).
     """
-    # ── Fast path: keyword match ──────────────────────────────────
+    # ── Layer 1: keyword match (instant) ──────────────────────────
     kw_mode = _keyword_classify(user_message)
     if kw_mode:
-        logger.info("detect_intent: keyword match → %s", kw_mode)
+        logger.info("detect_intent: keyword → %s", kw_mode)
         return kw_mode, 1.0
 
-    # ── Fast path: short follow-up keeps current mode ─────────────
-    # Messages under 40 chars with no mode-switching signals are
-    # almost always continuations ("yes", "continue", "ok do it").
+    # ── Layer 2: short follow-up keeps current mode ───────────────
     if len(user_message) < 40 and current_routing_mode in _VALID_MODES:
         return current_routing_mode, 0.8
 
-    # ── Slow path: LLM classification ─────────────────────────────
+    # ── Layer 3: context-aware LLM classification ─────────────────
     from agents.schemas.agent import LLMMessage
 
-    prompt = _INTENT_PROMPT.format(current_mode=current_routing_mode)
+    # Build conversation context so the model can see what came before
+    context_lines = []
+    for msg in (recent_messages or [])[-5:]:
+        role = (msg.get("role") or "user").upper()
+        content = (msg.get("content") or "")[:300]
+        context_lines.append(f"[{role}]: {content}")
+    context_block = "\n".join(context_lines) if context_lines else "(no prior messages)"
+
+    user_prompt = (
+        f"Current mode: {current_routing_mode}\n\n"
+        f"Recent conversation:\n{context_block}\n\n"
+        f"New message to classify:\n{user_message}"
+    )
 
     fast_model = provider.fast_model or provider.default_model
     try:
         response = await provider.send_message(
-            [LLMMessage(role="user", content=user_message)],
+            [LLMMessage(role="user", content=user_prompt)],
             model=fast_model,
-            max_tokens=10,
+            max_tokens=30,
             temperature=0.0,
-            system_prompt=prompt,
+            system_prompt=_INTENT_SYSTEM,
         )
     except Exception as exc:
-        logger.warning("detect_intent: LLM call failed (%s), keeping %s", exc, current_routing_mode)
+        logger.warning("detect_intent: LLM failed (%s), keeping %s", exc, current_routing_mode)
         return current_routing_mode, 0.0
 
-    try:
-        raw = response.content.strip().lower().strip('"').strip("'").strip()
-        # Handle JSON responses: {"mode": "chat"} or just "chat"
-        if raw.startswith("{"):
-            data = json.loads(raw)
-            mode = str(data.get("mode", current_routing_mode)).lower().strip()
-        else:
-            # Plain word response — take the first token
-            mode = raw.split()[0] if raw else current_routing_mode
+    # Parse "mode: <mode>\nreason: <reason>" format
+    raw = (response.content or "").strip().lower()
+    mode = current_routing_mode
+    reason = ""
 
-        if mode in _VALID_MODES:
-            return mode, 0.7
-        logger.warning("detect_intent: invalid mode %r, keeping %s", mode, current_routing_mode)
-        return current_routing_mode, 0.0
-    except Exception:
-        logger.debug("detect_intent: parse failed: %s", response.content[:100])
-        return current_routing_mode, 0.0
+    for line in raw.splitlines():
+        line = line.strip()
+        if line.startswith("mode:"):
+            mode = line.split(":", 1)[1].strip().split()[0]
+        elif line.startswith("reason:"):
+            reason = line.split(":", 1)[1].strip()
+
+    # Fallback: if model just returned a single word
+    if mode not in _VALID_MODES:
+        first_word = raw.split()[0] if raw else ""
+        mode = first_word if first_word in _VALID_MODES else current_routing_mode
+
+    if mode in _VALID_MODES:
+        logger.info("detect_intent: LLM → %s (reason: %s)", mode, reason[:60])
+        return mode, 0.85
+    return current_routing_mode, 0.0
 
 
 # ── Chat Mode (default) ─────────────────────────────────────────────
@@ -388,7 +497,14 @@ async def generate_project_response(
     if linked_todo_id:
         action_tools = get_actions_as_tools("session_task")
     else:
-        action_tools = get_actions_as_tools("project")
+        # Chat mode: NO create_task action. Chat is for discussion and
+        # exploration only. Task creation is handled by plan/create_task
+        # modes via the intent router. This prevents the chat LLM from
+        # bypassing the planning flow.
+        action_tools = [
+            t for t in (get_actions_as_tools("project") or [])
+            if "create_task" not in t.get("name", "")
+        ]
 
     # Load configured repos (main + deps) so LLM knows which repos are available
     context_docs = project.get("context_docs") or []
@@ -402,23 +518,14 @@ async def generate_project_response(
     workspace_path = project.get("workspace_path") or ""
     builtin_tools = get_builtin_tool_schemas(workspace_path, "planner") if workspace_path else []
 
-    if session_id:
-        history = await db.fetch(
-            "SELECT m.role, m.content, u.display_name AS sender_name "
-            "FROM project_chat_messages m JOIN users u ON u.id = m.user_id "
-            "WHERE m.session_id = $1 ORDER BY m.created_at DESC LIMIT 30",
-            session_id,
-        )
-    else:
-        history = await db.fetch(
-            "SELECT m.role, m.content, u.display_name AS sender_name "
-            "FROM project_chat_messages m JOIN users u ON u.id = m.user_id "
-            "WHERE m.project_id = $1 AND m.user_id = $2 AND m.session_id IS NULL "
-            "ORDER BY m.created_at DESC LIMIT 30",
-            project_id,
-            user_id,
-        )
-    history = list(reversed(history))
+    effective_model = model_override or (
+        planner_config.get("model_preference") if planner_config else None
+    ) or provider.default_model
+
+    history = await _load_and_compact_history(
+        db, session_id=session_id, project_id=project_id, user_id=user_id,
+        model=effective_model, limit=30, provider=provider, redis=redis,
+    )
 
     todos = await db.fetch(
         "SELECT title, state, priority, task_type FROM todo_items "
@@ -506,7 +613,11 @@ file paths and current patterns discovered during exploration."""
     else:
         tools_doc += "\n\nNote: No workspace is configured for this project, so codebase exploration tools are not available."
 
-    tools_doc += "\n\nDo NOT directly make code changes — create tasks instead."
+    tools_doc += (
+        "\n\nDo NOT directly make code changes. You are in chat mode — your role is to "
+        "discuss, explore, explain, and answer questions. If the user wants to implement "
+        "something, tell them to switch to Plan mode or say 'plan this' to trigger planning."
+    )
 
     system_prompt = f"""{base_prompt}
 
@@ -732,53 +843,6 @@ def _filter_plan_mode_tools(
     return filtered + (mcp_tools or [])
 
 
-def _compact_chat_history(
-    history: list[dict],
-    max_tokens: int,
-    model: str,
-) -> list[dict]:
-    """Compact old chat history to fit within a token budget.
-
-    Keeps the most recent messages in full.  For older messages, truncates
-    long content (especially assistant messages with code blocks or plan JSON)
-    using a middle strategy that preserves start + end.
-    """
-    from agents.utils.context_budget import truncate_to_budget
-    from agents.utils.token_counter import count_tokens
-
-    if not history:
-        return history
-
-    total_tokens = sum(count_tokens(h["content"] or "", model) for h in history)
-    if total_tokens <= max_tokens:
-        return list(history)
-
-    # Keep last 6 messages (3 exchanges) in full
-    keep_recent = min(6, len(history))
-    recent = history[-keep_recent:]
-    older = history[:-keep_recent]
-
-    recent_tokens = sum(count_tokens(h["content"] or "", model) for h in recent)
-    remaining_budget = max(max_tokens - recent_tokens, 2000)
-
-    if not older:
-        return list(recent)
-
-    per_msg_budget = remaining_budget // len(older)
-
-    compacted: list[dict] = []
-    for msg in older:
-        content = msg["content"] or ""
-        msg_tokens = count_tokens(content, model)
-        if msg_tokens > per_msg_budget:
-            truncated = truncate_to_budget(content, per_msg_budget, model, strategy="middle")
-            compacted.append({"role": msg["role"], "content": truncated})
-        else:
-            compacted.append(msg)
-
-    return compacted + list(recent)
-
-
 PLAN_MODE_SYSTEM = """\
 You are a project planning assistant for "{project_name}".
 {project_context}
@@ -801,27 +865,53 @@ RESPONSE STYLE — MANDATORY:
 - When asked to find a bug or investigate: go read the actual code with tools, then report findings as a short bullet list.
 - When proposing a plan: just output the JSON block with minimal preamble (1 sentence max).
 
+PLAN STRUCTURE — STRICTLY ENFORCED:
+- Exactly ONE task per plan. All work is decomposed into subtasks within that single task.
+- Never create multiple tasks. If the work spans multiple areas, use subtasks with dependencies.
+- Optimize for MAXIMUM PARALLELIZATION: subtasks that can run independently MUST have \
+depends_on: []. Only add a dependency when a subtask truly needs another's output.
+- Think about the critical path — minimize the depth of the dependency chain.
+
+SUBTASK DESCRIPTIONS — EVERY subtask must include ALL of these structured fields:
+- **scope**: Which files, modules, or areas this subtask touches
+- **requirements**: Specific acceptance criteria — what "done" looks like for this subtask
+- **approach**: Implementation direction — how to accomplish it (patterns to follow, APIs to use)
+- **goal**: The high-level objective so the agent can self-validate when finished
+- **context** (optional): Relevant code patterns, existing implementations to follow, constraints. \
+Put your code exploration findings here — file paths, function signatures, data structures the agent needs to know.
+
 When agreed on a plan, output JSON:
 ```json
 {{
   "action": "create_plan",
   "plan_title": "...",
-  "tasks": [{{
+  "task": {{
     "title": "...",
     "description": "...",
     "priority": "medium",
     "task_type": "code",
     "subtasks": [
-      {{"title": "...", "description": "...", "agent_role": "coder", "depends_on": [], "parallel": false, "target_repo": "main"}}
+      {{
+        "title": "...",
+        "agent_role": "coder",
+        "depends_on": [],
+        "target_repo": "main",
+        "review_loop": false,
+        "scope": "src/auth/ — login handler and session middleware",
+        "requirements": "Login endpoint returns JWT token, handles invalid credentials with 401",
+        "approach": "Add POST /auth/login route using existing User model, bcrypt for password verification",
+        "goal": "Users can authenticate via API and receive a JWT for subsequent requests",
+        "context": "See src/api/routes/auth.py for existing patterns. User model in src/models/user.py"
+      }}
     ]
-  }}]
+  }}
 }}
 ```
 
-Rules: ONE task, all work as subtasks. depends_on = 0-based indexes. parallel: true for concurrent work. \
+depends_on = 0-based subtask indexes. Only add when a subtask genuinely needs another's output. \
 Roles: coder, tester, reviewer, debugger, pr_creator, report_writer. \
 Types: code, research, document, general. Priorities: critical, high, medium, low. \
-target_repo: REQUIRED on every subtask — "main" for main repo, or the exact dependency name for dep work.
+target_repo: REQUIRED — "main" for main repo, or the exact dependency name for dep work.
 """
 
 
@@ -925,7 +1015,8 @@ async def generate_plan_response(
             project_ctx_parts.append(shared_ctx)
 
         # Per-dependency understandings — condensed
-        dep_understandings = settings.get("dep_understandings", {})
+        from agents.utils.settings_helpers import read_setting as _rs
+        dep_understandings = _rs(settings, "understanding.dependencies", "dep_understandings", {})
         if dep_understandings and isinstance(dep_understandings, dict):
             dep_ctx_lines = []
             for dep_name, dep_u in dep_understandings.items():
@@ -939,7 +1030,7 @@ async def generate_plan_response(
                 )
 
         # Cross-repo linking — just the overview
-        linking_doc = settings.get("linking_document", {})
+        linking_doc = _rs(settings, "understanding.linking", "linking_document", {})
         if linking_doc and isinstance(linking_doc, dict):
             overview = linking_doc.get("overview", "")
             if overview:
@@ -951,23 +1042,18 @@ async def generate_plan_response(
     # so the planner doesn't need to list_directory constantly
     if workspace_path:
         import os
-        repo_dir = os.path.join(workspace_path, "repo")
-        if os.path.isdir(repo_dir):
-            try:
-                from agents.indexing import build_indexes_and_repo_map
-                index_dir = os.path.join(workspace_path, ".agent_index")
-                repo_map_path = os.path.join(index_dir, "repo_map.txt")
-                if os.path.isfile(repo_map_path):
-                    with open(repo_map_path, "r") as f:
-                        repo_map = f.read()
-                    if repo_map:
-                        if len(repo_map) > 3000:
-                            repo_map = repo_map[:3000] + "\n..."
-                        project_ctx_parts.append(
-                            f"Repo map:\n{repo_map}"
-                        )
-            except Exception:
-                pass
+        try:
+            index_dir = os.path.join(workspace_path, ".agent_index")
+            repo_map_path = os.path.join(index_dir, "repo_map.txt")
+            if os.path.isfile(repo_map_path):
+                with open(repo_map_path, "r") as f:
+                    repo_map = f.read()
+                if repo_map:
+                    if len(repo_map) > 3000:
+                        repo_map = repo_map[:3000] + "\n..."
+                    project_ctx_parts.append(f"Repo map:\n{repo_map}")
+        except Exception:
+            pass
 
     todos = await db.fetch(
         "SELECT title, state, priority, task_type FROM todo_items "
@@ -1015,23 +1101,17 @@ async def generate_plan_response(
     system_prompt += "\n\nMessages from different users are prefixed with [Name]. Address them by name when relevant."
 
     # ── Load & compact chat history ──────────────────────────────────
-    history = await db.fetch(
-        "SELECT m.role, m.content, u.display_name AS sender_name "
-        "FROM project_chat_messages m JOIN users u ON u.id = m.user_id "
-        "WHERE m.session_id = $1 ORDER BY m.created_at DESC LIMIT 40",
-        session_id,
-    )
-    history = list(reversed(history))
-
-    # Determine model for token counting
     plan_send_kwargs: dict = {}
     if model_override:
         plan_send_kwargs["model"] = model_override
     elif planner_config and planner_config.get("model_preference"):
         plan_send_kwargs["model"] = planner_config["model_preference"]
-
     effective_model = plan_send_kwargs.get("model") or provider.default_model
-    history = _compact_chat_history(history, max_tokens=40_000, model=effective_model)
+
+    history = await _load_and_compact_history(
+        db, session_id=session_id, project_id=project_id, user_id=user_id,
+        model=effective_model, limit=40, provider=provider, redis=redis,
+    )
 
     messages = [LLMMessage(role="system", content=system_prompt)]
     for row in history[:-1]:
@@ -1080,7 +1160,7 @@ async def generate_plan_response(
         provider, messages,
         tools=tools_arg,
         tool_executor=_execute_tool,
-        max_rounds=30,
+        max_rounds=100,
         on_activity=on_activity,
         on_tool_event=_on_tool_event,
         on_inject_check=_check_inject,
@@ -1098,7 +1178,7 @@ async def generate_plan_response(
             provider, messages,
             tools=tools_arg,
             tool_executor=_execute_tool,
-            max_rounds=30,
+            max_rounds=100,
             on_activity=on_activity,
             on_tool_event=_on_tool_event,
             **plan_send_kwargs,
@@ -1221,10 +1301,11 @@ async def generate_plan_response(
 async def create_tasks_from_plan(
     *, project_id: str, user_id: str, plan: dict, db, event_bus=None, session_id: str | None = None,
 ) -> list[str]:
-    """Create todo items from a plan.
+    """Create a single todo from a plan.
 
-    When subtasks are defined, creates the task directly in 'in_progress'
-    with sub_tasks inserted into the DB.
+    Structure: 1 plan → 1 todo → N subtasks.
+    Accepts both new format (plan.task) and legacy format (plan.tasks[0])
+    for backward compatibility.
     """
     created_ids = []
     session_linked = False
@@ -1238,16 +1319,28 @@ async def create_tasks_from_plan(
         raw = project_row["context_docs"]
         context_docs = json.loads(raw) if isinstance(raw, str) else raw
 
-    for task in plan.get("tasks", []):
+    # Accept singular "task" (new) or "tasks[0]" (legacy)
+    task = plan.get("task")
+    if not task:
+        tasks = plan.get("tasks") or []
+        task = tasks[0] if tasks else None
+    if not task:
+        logger.warning("[create_tasks] No task found in plan: %s", list(plan.keys()))
+        return []
+
+    # Wrap in single-iteration loop for consistent scope (created_ids, session_linked)
+    for task in [task]:
         subtasks = task.get("subtasks", [])
 
         if subtasks:
+            from agents.api.chat_actions import _build_subtask_description
+
             plan_json = {
                 "summary": task.get("description", task["title"]),
                 "sub_tasks": [
                     {
                         "title": st["title"],
-                        "description": st.get("description", ""),
+                        "description": _build_subtask_description(st),
                         "agent_role": st.get("agent_role", "coder"),
                         "execution_order": i if not st.get("parallel") else 0,
                         "depends_on": st.get("depends_on", []),
@@ -1494,7 +1587,8 @@ async def generate_debug_response(
             project_ctx_parts.append(shared_ctx)
 
         # Debug-specific context (log sources with commands, MCP hints with notes)
-        debug_ctx = settings.get("debug_context", {})
+        from agents.utils.settings_helpers import read_setting as _rs
+        debug_ctx = _rs(settings, "debugging", "debug_context", {})
         if debug_ctx:
             debug_parts = []
             for src in debug_ctx.get("log_sources", []):
@@ -1519,19 +1613,17 @@ async def generate_debug_response(
     # Inject repo map for structural awareness (same as plan mode)
     if workspace_path:
         import os
-        repo_dir = os.path.join(workspace_path, "repo")
-        if os.path.isdir(repo_dir):
-            try:
-                repo_map_path = os.path.join(workspace_path, ".agent_index", "repo_map.txt")
-                if os.path.isfile(repo_map_path):
-                    with open(repo_map_path, "r") as f:
-                        repo_map = f.read()
-                    if repo_map:
-                        if len(repo_map) > 3000:
-                            repo_map = repo_map[:3000] + "\n..."
-                        project_ctx_parts.append(f"Repo map:\n{repo_map}")
-            except Exception:
-                pass
+        try:
+            repo_map_path = os.path.join(workspace_path, ".agent_index", "repo_map.txt")
+            if os.path.isfile(repo_map_path):
+                with open(repo_map_path, "r") as f:
+                    repo_map = f.read()
+                if repo_map:
+                    if len(repo_map) > 3000:
+                        repo_map = repo_map[:3000] + "\n..."
+                    project_ctx_parts.append(f"Repo map:\n{repo_map}")
+        except Exception:
+            pass
 
     project_context = "\n".join(project_ctx_parts)
 
@@ -1541,23 +1633,21 @@ async def generate_debug_response(
         import os
         import subprocess
 
-        repo_dir = os.path.join(workspace_path, "repo")
-        if os.path.isdir(repo_dir):
-            try:
-                result = subprocess.run(
-                    ["git", "log", "--oneline", "--no-decorate", "-20"],
-                    cwd=repo_dir, capture_output=True, text=True, timeout=5,
+        try:
+            result = subprocess.run(
+                ["git", "log", "--oneline", "--no-decorate", "-20"],
+                cwd=workspace_path, capture_output=True, text=True, timeout=5,
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                recent_commits_str = (
+                    "## Recent Commits (last 20)\n"
+                    "Use these as a starting point — drill into diffs for commits "
+                    "that look relevant to the issue.\n```\n"
+                    + result.stdout.strip()
+                    + "\n```"
                 )
-                if result.returncode == 0 and result.stdout.strip():
-                    recent_commits_str = (
-                        "## Recent Commits (last 20)\n"
-                        "Use these as a starting point — drill into diffs for commits "
-                        "that look relevant to the issue.\n```\n"
-                        + result.stdout.strip()
-                        + "\n```"
-                    )
-            except Exception:
-                pass
+        except Exception:
+            pass
 
     tools_doc_parts = []
     if builtin_tools:
@@ -1586,13 +1676,15 @@ async def generate_debug_response(
         debug_context=debug_context_str,
     )
 
-    history = await db.fetch(
-        "SELECT m.role, m.content, u.display_name AS sender_name "
-        "FROM project_chat_messages m JOIN users u ON u.id = m.user_id "
-        "WHERE m.session_id = $1 ORDER BY m.created_at DESC LIMIT 30",
-        session_id,
+    debug_send_kwargs: dict = {}
+    if model_override:
+        debug_send_kwargs["model"] = model_override
+    debug_effective_model = debug_send_kwargs.get("model") or provider.default_model
+
+    history = await _load_and_compact_history(
+        db, session_id=session_id, project_id=project_id, user_id=user_id,
+        model=debug_effective_model, limit=30, provider=provider, redis=redis,
     )
-    history = list(reversed(history))
 
     system_prompt += "\n\nMessages from different users are prefixed with [Name]. Address them by name when relevant."
 
@@ -1735,8 +1827,13 @@ The user wants to create a task. Your job:
 2. If the user's description is vague or missing key details, ask 1-2 clarifying questions.
    Do NOT create a task until you have enough information to define clear sub_tasks.
 3. Once you have a clear picture, use action__create_task to create it.
-4. Include sub_tasks with appropriate agent roles.
-5. Every sub_task MUST have target_repo set — you must know which repo each sub_task targets.
+
+STRUCTURE — STRICTLY ENFORCED:
+- Create exactly ONE task with sub_tasks inside it. Never create multiple tasks.
+- Optimize sub_tasks for MAXIMUM PARALLELIZATION: independent work has depends_on: [].
+- Each sub_task MUST include rich descriptions with: scope, requirements, approach, goal.
+- Every sub_task MUST have target_repo set.
+- Only add depends_on when a sub_task genuinely needs another's output.
 
 IMPORTANT: Do NOT rush to create. A well-specified task with clear sub_tasks is worth \
 more than a quick but vague task. Ask questions first if the scope is unclear.
@@ -1783,7 +1880,8 @@ async def generate_create_task_response(
 
     settings = safe_json(project.get("settings_json"))
     if settings:
-        understanding = settings.get("project_understanding", {})
+        from agents.utils.settings_helpers import read_setting as _rs
+        understanding = _rs(settings, "understanding.project", "project_understanding", {})
         if understanding.get("summary"):
             project_ctx_parts.append(f"Summary: {understanding['summary']}")
         if understanding.get("tech_stack"):
@@ -1831,13 +1929,15 @@ async def generate_create_task_response(
         repos_doc=repos_doc,
     )
 
-    history = await db.fetch(
-        "SELECT m.role, m.content, u.display_name AS sender_name "
-        "FROM project_chat_messages m JOIN users u ON u.id = m.user_id "
-        "WHERE m.session_id = $1 ORDER BY m.created_at DESC LIMIT 20",
-        session_id,
+    ct_send_kwargs: dict = {}
+    if model_override:
+        ct_send_kwargs["model"] = model_override
+    ct_effective_model = ct_send_kwargs.get("model") or provider.default_model
+
+    history = await _load_and_compact_history(
+        db, session_id=session_id, project_id=project_id, user_id=user_id,
+        model=ct_effective_model, limit=20, provider=provider, redis=redis,
     )
-    history = list(reversed(history))
 
     system_prompt += "\n\nMessages from different users are prefixed with [Name]. Address them by name when relevant."
 

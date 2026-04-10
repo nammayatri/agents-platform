@@ -23,6 +23,7 @@ from agents.agents.registry import (
     get_default_system_prompt,
 )
 from agents.config.settings import settings
+from agents.utils.file_utils import build_file_tree_text
 from agents.utils.json_helpers import safe_json
 
 logger = logging.getLogger(__name__)
@@ -81,6 +82,8 @@ async def get_workspace_context(
 ) -> dict[str, Any]:
     """Build workspace context dict with file tree, repo map, and deps info.
 
+    workspace_path IS the git working directory (no /repo/ subdir).
+
     Returns::
         {
             "file_tree": str,       # always present
@@ -89,43 +92,45 @@ async def get_workspace_context(
             "cross_repo_ctx": str,  # .context/ docs pointer
         }
     """
-    from agents.orchestrator.workspace import WorkspaceManager
+    from agents.orchestrator.file_manager import WorkspaceFileManager
 
-    mgr = WorkspaceManager.__new__(WorkspaceManager)
-    file_tree_text = mgr.get_file_tree(workspace_path, max_depth=max_depth)
+    fm = WorkspaceFileManager(workspace_path)
+    file_tree_text = build_file_tree_text(workspace_path, max_depth=min(max_depth, 3))
+    # Cap file tree to avoid blowing token budget on large repos
+    if len(file_tree_text) > 8000:
+        file_tree_text = file_tree_text[:8000] + f"\n... (truncated, use list_directory for details)"
     workspace_block = (
         f"\n\nYou are working inside the project repository root directory.\n"
         f"Project file structure:\n{file_tree_text}\n"
     )
 
-    # List available dependency repos
+    # Deps and sibling repos via file manager
     deps_info = ""
-    task_deps_dir = os.path.join(workspace_path, "deps")
-    if os.path.isdir(task_deps_dir):
-        dep_entries = [d for d in sorted(os.listdir(task_deps_dir))
-                       if os.path.isdir(os.path.join(task_deps_dir, d))]
-        if dep_entries:
-            deps_info = (
-                "\nDependency repos available (read-only) via ../deps/{name}/path:\n"
-            )
-            for d in dep_entries:
-                deps_info += f"  - ../deps/{d}/\n"
+    dep_names = fm.list_deps()
+    if dep_names:
+        deps_info = "\nDependency repos available (read-only) via ../deps/{name}/path:\n"
+        for d in dep_names:
+            deps_info += f"  - ../deps/{d}/\n"
 
-    # Point to .context/ docs
+    siblings = fm.list_sibling_repos()
+    if siblings:
+        deps_info += "\nSibling repos in this task (read-only from this workspace):\n"
+        for s in siblings:
+            deps_info += f"  - ../{s}/\n"
+
+    # Context docs via file manager
     cross_repo_ctx = ""
-    context_dir = os.path.join(workspace_path, ".context")
-    if os.path.isdir(context_dir):
+    ctx_paths = fm.list_context_files()
+    if ctx_paths:
         ctx_files = []
-        if os.path.isfile(os.path.join(context_dir, "UNDERSTANDING.md")):
-            ctx_files.append("- ../.context/UNDERSTANDING.md — main repo architecture, patterns, tech stack")
-        if os.path.isfile(os.path.join(context_dir, "LINKING.md")):
-            ctx_files.append("- ../.context/LINKING.md — how repos relate, data flow, integration patterns")
-        deps_ctx = os.path.join(context_dir, "deps")
-        if os.path.isdir(deps_ctx):
-            dep_files = sorted(f for f in os.listdir(deps_ctx) if f.endswith(".md"))
-            for df in dep_files:
-                name = df.removesuffix(".md")
-                ctx_files.append(f"- ../.context/deps/{df} — {name} dependency architecture and API")
+        for cf in ctx_paths:
+            base = os.path.basename(cf).removesuffix(".md")
+            if "UNDERSTANDING" in cf:
+                ctx_files.append(f"- {cf} — main repo architecture, patterns, tech stack")
+            elif "LINKING" in cf:
+                ctx_files.append(f"- {cf} — how repos relate, data flow, integration patterns")
+            else:
+                ctx_files.append(f"- {cf} — {base} dependency architecture and API")
         if ctx_files:
             cross_repo_ctx = (
                 "\n\nProject context docs available (read with read_file when needed):\n"
@@ -141,11 +146,10 @@ async def get_workspace_context(
     # Git diff (for iterative context)
     diff_stat = ""
     try:
-        repo_dir = os.path.join(workspace_path, "repo")
-        if os.path.isdir(repo_dir):
+        if os.path.isdir(os.path.join(workspace_path, ".git")):
             proc = await asyncio.create_subprocess_exec(
                 "git", "diff", "--stat",
-                cwd=repo_dir,
+                cwd=workspace_path,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
@@ -239,17 +243,8 @@ def get_iteration_context(iteration_log: list[dict], iteration: int) -> str:
 # ------------------------------------------------------------------
 
 
-def get_work_rules_prompt(work_rules: dict) -> str:
-    """Format work rules into a prompt block."""
-    if not work_rules:
-        return ""
-    parts = ["\n\n## Work Rules (you MUST follow these)\n"]
-    for category, items in work_rules.items():
-        if items:
-            parts.append(f"### {category.title()}")
-            for item in items:
-                parts.append(f"- {item}")
-    return "\n".join(parts)
+# Re-export from canonical location for backward compat with agent build_prompt() callers
+from agents.utils.work_rules import format_rules_for_prompt as get_work_rules_prompt  # noqa: F401
 
 
 # ------------------------------------------------------------------
@@ -258,31 +253,13 @@ def get_work_rules_prompt(work_rules: dict) -> str:
 
 
 async def _build_repo_map(workspace_path: str) -> str | None:
-    """Generate tree-sitter + PageRank repo map."""
-    try:
-        from agents.indexing.indexer import RepoIndexer
-        from agents.indexing.repo_map import render_repo_map
-        from agents.utils.token_counter import count_tokens
+    """Generate tree-sitter + PageRank repo map.
 
-        repo_dir = os.path.join(workspace_path, "repo")
-        if not os.path.isdir(repo_dir):
-            return None
-
-        idx_dir = os.path.join(workspace_path, ".agent_index")
-        indexer = RepoIndexer()
-        graph = indexer.index(repo_dir, cache_dir=idx_dir)
-        if graph.symbol_count == 0:
-            return None
-
-        return render_repo_map(
-            graph,
-            token_budget=settings.repo_map_token_budget,
-            count_tokens_fn=lambda t: count_tokens(t, "default"),
-        )
-    except ImportError:
-        logger.debug("tree-sitter indexing not available")
-    except Exception:
-        logger.debug("Repo map generation failed", exc_info=True)
+    workspace_path IS the git working directory.
+    """
+    # Repo map generation removed — agents use search_files and read_file
+    # for codebase exploration. The tree-sitter indexing was too slow for
+    # large repos and provided marginal value over grep-based search.
     return None
 
 
@@ -295,10 +272,9 @@ async def _build_debug_context_block(db: asyncpg.Pool, todo: dict) -> str:
     if not project:
         return ""
 
-    proj_settings = project.get("settings_json") or {}
-    if isinstance(proj_settings, str):
-        proj_settings = json.loads(proj_settings)
-    debug_ctx = proj_settings.get("debug_context") or {}
+    from agents.utils.settings_helpers import parse_settings, read_setting as _rs
+    proj_settings = parse_settings(project.get("settings_json"))
+    debug_ctx = _rs(proj_settings, "debugging", "debug_context") or {}
 
     parts: list[str] = []
 
@@ -341,12 +317,13 @@ async def _build_debug_context_block(db: asyncpg.Pool, todo: dict) -> str:
 
 async def _build_tester_context(db: asyncpg.Pool, todo: dict) -> str:
     """Build tester context with build/test commands."""
+    from agents.utils.settings_helpers import get_build_command_strings, parse_settings
     project = await db.fetchrow(
         "SELECT settings_json FROM projects WHERE id = $1",
         todo["project_id"],
     )
-    proj_settings = safe_json(project.get("settings_json")) if project else {}
-    build_commands = proj_settings.get("build_commands", [])
+    proj_settings = parse_settings(project.get("settings_json")) if project else {}
+    build_commands = get_build_command_strings(proj_settings)
 
     if build_commands:
         cmds = "\n".join(f"  - `{cmd}`" for cmd in build_commands)

@@ -92,8 +92,7 @@ export default function EmailConfigTab({ isAdmin }: Props) {
               setEmailConfigSaving(true)
               setEmailConfigStatus(null)
               try {
-                const res = await fetch('/api/admin/settings/email/test', { method: 'POST', headers: { 'Authorization': `Bearer ${localStorage.getItem('token')}` } })
-                const data = await res.json()
+                const data = await adminApi.testEmail() as { status: string; detail?: string }
                 setEmailConfigStatus(data.status === 'ok' ? 'Test email sent!' : `Error: ${data.detail}`)
               } catch (err) {
                 setEmailConfigStatus(err instanceof Error ? err.message : 'Test failed')

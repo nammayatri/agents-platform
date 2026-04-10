@@ -63,12 +63,10 @@ def build_indexes_and_repo_map(
     except Exception:
         logger.warning("build_indexes: structural indexing failed", exc_info=True)
 
-    # 2. Embedding index (FAISS) — pre-warm the in-memory cache
-    try:
-        from agents.indexing.search_tool import pre_warm_index
-        pre_warm_index(repo_path, cache_dir=effective_cache)
-    except Exception:
-        logger.warning("build_indexes: embedding indexing failed", exc_info=True)
+    # Embedding index is built on-demand when semantic_search is called.
+    # Don't build it eagerly here — it takes minutes on large repos and
+    # blocks the server. The search_tool.get_or_build_index() handles
+    # lazy loading from disk cache.
 
     return repo_map_text
 

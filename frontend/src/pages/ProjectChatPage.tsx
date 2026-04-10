@@ -1366,48 +1366,38 @@ export default function ProjectChatPage() {
                                       )}
                                     </summary>
                                     <div className="ml-7 pl-3 border-l border-gray-800 mt-1 mb-1.5 space-y-1.5 py-1">
-                                      {st.description && (
+                                      {st.scope && (
+                                        <div>
+                                          <span className="text-[10px] text-gray-600 uppercase tracking-wider">Scope</span>
+                                          <p className="text-[11px] text-gray-400 mt-0.5 leading-relaxed">{String(st.scope)}</p>
+                                        </div>
+                                      )}
+                                      {st.requirements && (
+                                        <div>
+                                          <span className="text-[10px] text-gray-600 uppercase tracking-wider">Requirements</span>
+                                          <p className="text-[11px] text-gray-400 mt-0.5 leading-relaxed">{String(st.requirements)}</p>
+                                        </div>
+                                      )}
+                                      {st.approach && (
+                                        <div>
+                                          <span className="text-[10px] text-gray-600 uppercase tracking-wider">Approach</span>
+                                          <p className="text-[11px] text-gray-400 mt-0.5 leading-relaxed">{String(st.approach)}</p>
+                                        </div>
+                                      )}
+                                      {st.goal && (
+                                        <div>
+                                          <span className="text-[10px] text-gray-600 uppercase tracking-wider">Goal</span>
+                                          <p className="text-[11px] text-emerald-400/70 mt-0.5 leading-relaxed">{String(st.goal)}</p>
+                                        </div>
+                                      )}
+                                      {st.context && (
+                                        <div>
+                                          <span className="text-[10px] text-gray-600 uppercase tracking-wider">Context</span>
+                                          <pre className="text-[11px] text-gray-500 mt-0.5 font-mono whitespace-pre-wrap leading-relaxed bg-gray-950 rounded px-2 py-1.5 border border-gray-800/50 max-h-32 overflow-y-auto">{String(st.context)}</pre>
+                                        </div>
+                                      )}
+                                      {!st.scope && !st.requirements && st.description && (
                                         <p className="text-[11px] text-gray-500 leading-relaxed">{String(st.description)}</p>
-                                      )}
-                                      {Array.isArray(st.context?.relevant_files) && st.context!.relevant_files.length > 0 && (
-                                        <div>
-                                          <span className="text-[10px] text-gray-600 uppercase tracking-wider">Files</span>
-                                          <div className="mt-0.5 flex flex-wrap gap-1">
-                                            {st.context!.relevant_files.map((f: string, fi: number) => (
-                                              <span key={fi} className="text-[11px] font-mono text-indigo-400/70 bg-indigo-500/5 px-1.5 py-0.5 rounded">{String(f)}</span>
-                                            ))}
-                                          </div>
-                                        </div>
-                                      )}
-                                      {st.context?.what_to_change && (
-                                        <div>
-                                          <span className="text-[10px] text-gray-600 uppercase tracking-wider">What to change</span>
-                                          <p className="text-[11px] text-gray-500 mt-0.5 leading-relaxed">{String(st.context.what_to_change)}</p>
-                                        </div>
-                                      )}
-                                      {st.context?.current_state && (
-                                        <div>
-                                          <span className="text-[10px] text-gray-600 uppercase tracking-wider">Current state</span>
-                                          <p className="text-[11px] text-gray-500 mt-0.5 leading-relaxed">{String(st.context.current_state)}</p>
-                                        </div>
-                                      )}
-                                      {st.context?.patterns_to_follow && (
-                                        <div>
-                                          <span className="text-[10px] text-gray-600 uppercase tracking-wider">Patterns to follow</span>
-                                          <p className="text-[11px] text-gray-500 mt-0.5 leading-relaxed">{String(st.context.patterns_to_follow)}</p>
-                                        </div>
-                                      )}
-                                      {st.context?.related_code && (
-                                        <div>
-                                          <span className="text-[10px] text-gray-600 uppercase tracking-wider">Related code</span>
-                                          <pre className="text-[11px] text-gray-500 mt-0.5 font-mono whitespace-pre-wrap leading-relaxed bg-gray-950 rounded px-2 py-1.5 border border-gray-800/50 max-h-32 overflow-y-auto">{String(st.context.related_code)}</pre>
-                                        </div>
-                                      )}
-                                      {st.context?.integration_points && (
-                                        <div>
-                                          <span className="text-[10px] text-gray-600 uppercase tracking-wider">Integration points</span>
-                                          <p className="text-[11px] text-gray-500 mt-0.5 leading-relaxed">{String(st.context.integration_points)}</p>
-                                        </div>
                                       )}
                                     </div>
                                   </details>

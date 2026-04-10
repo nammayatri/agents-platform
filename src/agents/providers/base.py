@@ -7,6 +7,7 @@ self-hosted via OpenAI-compatible API) through a uniform interface.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib as _hashlib
 import json as _json
 import logging
@@ -497,6 +498,7 @@ async def _execute_with_cancel(
     exec_task = _aio.ensure_future(coro_fn())
     wait_task = _aio.ensure_future(cancel_event.wait())
 
+    done: set = set()
     try:
         done, pending = await _aio.wait(
             {exec_task, wait_task},
@@ -508,9 +510,8 @@ async def _execute_with_cancel(
         for t in (exec_task, wait_task):
             if t not in done:
                 t.cancel()
-        # Suppress cancellation errors on cleanup
         for t in (exec_task, wait_task):
-            if t not in (done if 'done' in dir() else set()):
+            if t not in done:
                 try:
                     await t
                 except (_aio.CancelledError, Exception):
@@ -952,6 +953,31 @@ async def run_tool_loop(
                 logger.debug("tool_loop: round %d — %s result (%d chars): %s", loop_count, tc_name, len(result_text), result_preview[:200])
                 tool_results.append({"tool_use_id": tc["id"], "content": _truncate_tool_result(result_text)})
 
+                # Detect errors in tool results
+                is_error = False
+                if result_text:
+                    if tc_name == "run_command":
+                        try:
+                            _parsed = _json.loads(result_text)
+                            _exit = _parsed.get("exit_code", 0)
+                            _output = _parsed.get("output", "")
+                            is_error = _exit != 0
+                            # Also flag command-not-found and similar failures
+                            # even when piped (exit 0 from pipe, but command itself failed)
+                            if not is_error and _output:
+                                _fail_patterns = [
+                                    "command not found",
+                                    "No such file or directory",
+                                    "Permission denied",
+                                    "fatal:",
+                                    "FAILED",
+                                ]
+                                is_error = any(p in _output for p in _fail_patterns)
+                        except Exception:
+                            is_error = "error" in result_text[:200].lower()
+                    else:
+                        is_error = "error" in result_text[:100].lower()
+
                 # Fire structured tool_result event
                 if on_tool_event:
                     result_event: dict = {
@@ -960,13 +986,17 @@ async def run_tool_loop(
                         "result_preview": result_preview,
                         "chars": len(result_text),
                     }
-                    # Carry file_path through for result events too
                     _fp = tc_args.get("path", "")
                     if _fp and tc_name in ("read_file", "write_file", "edit_file"):
                         result_event["file_path"] = _fp
-                    if tc_name == "tool_result" or (result_text and "error" in result_text[:50].lower()):
+                    if is_error:
                         result_event["error"] = True
                     await on_tool_event(result_event)
+
+                # Surface command errors in the activity stream
+                if is_error and on_activity and tc_name == "run_command":
+                    err_preview = result_preview[:300] if result_preview else "Command failed"
+                    await on_activity(f"ERROR: {err_preview}")
 
             if response.stop_reason == "cancelled":
                 if tool_results:
@@ -1040,9 +1070,6 @@ async def run_tool_loop(
                     role="user",
                     content=f"[USER GUIDANCE]: {combined}",
                 ))
-                if on_activity:
-                    preview = combined[:80] + ("..." if len(combined) > 80 else "")
-                    await on_activity(f"User guidance received: {preview}")
                 logger.debug("tool_loop: injected %d user message(s) before round %d",
                             len(injected_parts), loop_count + 1)
 
@@ -1066,21 +1093,33 @@ async def run_tool_loop(
         )
 
         if on_activity:
+            # Emit reasoning text before tool calls so the user sees WHY
+            if response.content and response.content.strip():
+                reasoning = response.content.strip()
+                if len(reasoning) > 300:
+                    reasoning = reasoning[:300] + "..."
+                await on_activity(reasoning)
+
             n_tc = len(response.tool_calls) if response.tool_calls else 0
             if n_tc > 0:
-                briefs = [_tool_brief(tc["name"], tc.get("arguments", {})) for tc in response.tool_calls]
-                await on_activity(f"Agent will: {', '.join(briefs)}")
-            else:
-                await on_activity(f"Agent responded (round {loop_count})")
+                # Use human-readable summaries instead of raw function signatures
+                summaries = [_tool_activity_summary(tc["name"], tc.get("arguments", {})) for tc in response.tool_calls]
+                await on_activity(", ".join(summaries))
+            elif not response.content or not response.content.strip():
+                await on_activity(f"Thinking... (round {loop_count})")
 
-        # Fire LLM response event
+        # Fire LLM response event with reasoning text
         if on_tool_event:
-            await on_tool_event({
+            thinking_event: dict = {
                 "type": "llm_thinking",
                 "tokens_in": response.tokens_input,
                 "tokens_out": response.tokens_output,
                 "round": loop_count,
-            })
+            }
+            if response.content and response.content.strip():
+                # Include reasoning text (cap at 500 chars for the event stream)
+                thinking_event["content"] = response.content.strip()[:500]
+            await on_tool_event(thinking_event)
 
         # Context overflow guard — compact old tool rounds if approaching limit
         if response.tokens_input > 0:

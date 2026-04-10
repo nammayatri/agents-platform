@@ -22,7 +22,7 @@ from typing import TYPE_CHECKING
 from agents.orchestrator.agents import get_agent, is_llm_role
 from agents.orchestrator.job_runner import run_llm_job, run_procedural_job
 from agents.orchestrator.run_context import RunContext
-from agents.orchestrator.state_machine import check_all_subtasks_done
+from agents.utils.work_rules import resolve_work_rules
 
 if TYPE_CHECKING:
     from agents.providers.base import AIProvider
@@ -37,6 +37,8 @@ class TaskScheduler:
         self.todo_id = todo_id
         self.ctx = ctx
         self._coordinator_adapter = None  # Lazy init
+        self._dep_workspace_cache: dict[str, str] = {}  # dep_label → workspace path
+        self._dep_workspace_locks: dict[str, asyncio.Lock] = {}  # dep_label → setup lock
 
     # ------------------------------------------------------------------
     # Main entry point
@@ -102,14 +104,10 @@ class TaskScheduler:
 
     async def _handle_plan_ready(self, todo: dict) -> None:
         """Handle plan_ready state: auto-approve or wait for human."""
-        project = await self.ctx.db.fetchrow(
-            "SELECT settings_json FROM projects WHERE id = $1",
-            todo["project_id"],
-        )
-        pr_settings = project["settings_json"] or {} if project else {}
-        if isinstance(pr_settings, str):
-            pr_settings = json.loads(pr_settings)
-        require_plan = pr_settings.get("require_plan_approval", False)
+        from agents.utils.settings_helpers import parse_settings, read_setting
+        project = await self.ctx.load_project(str(todo["project_id"]))
+        pr_settings = parse_settings((project or {}).get("settings_json"))
+        require_plan = read_setting(pr_settings, "planning.require_approval", "require_plan_approval", False)
 
         plan = todo.get("plan_json")
         logger.info(
@@ -172,30 +170,15 @@ class TaskScheduler:
             await self._enter_review(todo)
             return
 
-        # Reset stale sub-tasks from crashed runs
-        stale_statuses = ("assigned", "running")
-        stale = [st for st in sub_tasks if st["status"] in stale_statuses]
-        if stale:
-            logger.warning(
-                "[%s] Resetting %d stale sub-tasks → pending",
-                self.todo_id, len(stale),
-            )
-            for st in stale:
-                await self.ctx.db.execute(
-                    "UPDATE sub_tasks SET status = 'pending', updated_at = NOW() WHERE id = $1",
-                    st["id"],
-                )
-            sub_tasks = await self.ctx.db.fetch(
-                "SELECT * FROM sub_tasks WHERE todo_id = $1 ORDER BY execution_order, created_at",
-                self.todo_id,
-            )
+        # NOTE: Stale subtask recovery is handled by the orchestrator loop's
+        # _recover_orphaned_tasks on startup. Do NOT reset running subtasks
+        # here — they may be legitimately running from a previous dispatch.
 
-        # Set up workspace
-        workspace_path = await self._setup_workspace(todo)
-
-        # Resolve work rules
-        work_rules = await self._resolve_work_rules(todo)
-        max_iterations = todo.get("max_iterations") or 50
+        # Load project once for workspace + work rules (single query)
+        project = await self.ctx.load_project(str(todo["project_id"]))
+        task_root = await self._setup_workspace(todo, project)
+        work_rules = self._resolve_work_rules(todo, project)
+        max_iterations = todo.get("max_iterations") or 500
         provider = await self.ctx.provider_registry.resolve_for_todo(self.todo_id)
 
         # Main execution loop with re-scan
@@ -204,11 +187,10 @@ class TaskScheduler:
                 logger.info("[%s] Task cancelled, aborting execution", self.todo_id)
                 return
 
-            runnable = await self._find_runnable_jobs()
+            runnable, all_done, any_failed = await self._find_runnable_jobs()
             if not runnable:
-                all_done, any_failed = await check_all_subtasks_done(self.ctx.db, self.todo_id)
                 if all_done:
-                    await self._handle_all_done(todo, any_failed, workspace_path, provider)
+                    await self._handle_all_done(todo, any_failed, task_root, provider)
                 return
 
             logger.info(
@@ -218,20 +200,22 @@ class TaskScheduler:
 
             # Dispatch all runnable jobs in parallel
             tasks = []
+            dispatched: list[dict] = []  # Only jobs that actually got dispatched
             workspace_map: dict[str, str] = {}
             for st in runnable:
-                st_workspace = await self._resolve_job_workspace(st, workspace_path)
+                st_workspace = await self._resolve_job_workspace(st, task_root)
                 if st_workspace is None:
                     continue  # Failed workspace setup already handled
                 workspace_map[str(st["id"])] = st_workspace
                 tasks.append(
                     self._dispatch_job(st, provider, st_workspace, work_rules, max_iterations)
                 )
+                dispatched.append(st)
 
             results = await asyncio.gather(*tasks, return_exceptions=True)
 
             # Process results
-            for st, result in zip(runnable, results):
+            for st, result in zip(dispatched, results):
                 if isinstance(result, Exception):
                     logger.error("Job %s failed: %s", st["id"], result, exc_info=result)
                     error_msg = f"{type(result).__name__}: {result}"
@@ -243,6 +227,21 @@ class TaskScheduler:
                 else:
                     # Process spawn declarations
                     await self._process_spawn(st, result)
+
+            # After coder subtasks complete: commit work + re-index.
+            # Group by workspace_path so multi-repo tasks get separate commits.
+            completed_coders = [
+                st for st, r in zip(dispatched, results)
+                if st["agent_role"] == "coder" and not isinstance(r, Exception)
+            ]
+            if completed_coders:
+                coders_by_ws: dict[str, list[dict]] = {}
+                for st in completed_coders:
+                    ws = workspace_map.get(str(st["id"]))
+                    if ws:
+                        coders_by_ws.setdefault(ws, []).append(st)
+                for ws, coders in coders_by_ws.items():
+                    await self._incremental_commit(ws, coders)
 
             # Check for user messages
             user_msg = await self.ctx.check_for_user_messages()
@@ -368,29 +367,24 @@ class TaskScheduler:
     # Helpers
     # ------------------------------------------------------------------
 
-    async def _find_runnable_jobs(self) -> list[dict]:
-        """Find pending jobs whose dependencies are all completed."""
+    async def _find_runnable_jobs(self) -> tuple[list[dict], bool, bool]:
+        """Find pending jobs whose dependencies are all completed.
+
+        Returns (runnable_jobs, all_done, any_failed) to avoid a separate
+        check_all_subtasks_done query — the data is already in hand.
+        """
         sub_tasks = await self.ctx.db.fetch(
             "SELECT * FROM sub_tasks WHERE todo_id = $1 ORDER BY execution_order, created_at",
             self.todo_id,
         )
-        all_st_ids = {str(s["id"]) for s in sub_tasks}
+        if not sub_tasks:
+            return [], True, False
 
-        # Batch fetch dep statuses
-        all_dep_ids: set = set()
-        for st in sub_tasks:
-            if st["status"] == "pending":
-                for dep_id in (st["depends_on"] or []):
-                    if str(dep_id) in all_st_ids:
-                        all_dep_ids.add(dep_id)
-
-        dep_status_map: dict[str, dict] = {}
-        if all_dep_ids:
-            dep_rows = await self.ctx.db.fetch(
-                "SELECT id, status, title FROM sub_tasks WHERE id = ANY($1)",
-                list(all_dep_ids),
-            )
-            dep_status_map = {str(r["id"]): dict(r) for r in dep_rows}
+        # Build lookup from the already-fetched data (no second query needed)
+        all_st_map = {str(s["id"]): s for s in sub_tasks}
+        statuses = [s["status"] for s in sub_tasks]
+        all_done = all(s in ("completed", "failed", "cancelled") for s in statuses)
+        any_failed = any(s == "failed" for s in statuses)
 
         runnable = []
         for st in sub_tasks:
@@ -399,10 +393,10 @@ class TaskScheduler:
             deps = st["depends_on"] or []
             if deps:
                 st_id_str = str(st["id"])
-                # Clean broken deps
-                broken = [str(d) for d in deps if str(d) == st_id_str or str(d) not in all_st_ids]
+                # Clean broken deps (self-refs or refs to non-existent subtasks)
+                broken = [str(d) for d in deps if str(d) == st_id_str or str(d) not in all_st_map]
                 if broken:
-                    valid_deps = [d for d in deps if str(d) != st_id_str and str(d) in all_st_ids]
+                    valid_deps = [d for d in deps if str(d) != st_id_str and str(d) in all_st_map]
                     await self.ctx.db.execute(
                         "UPDATE sub_tasks SET depends_on = $2 WHERE id = $1",
                         st["id"], valid_deps if valid_deps else [],
@@ -412,27 +406,30 @@ class TaskScheduler:
                 if deps:
                     unmet = [
                         d for d in deps
-                        if str(d) in dep_status_map
-                        and dep_status_map[str(d)]["status"] != "completed"
+                        if str(d) in all_st_map
+                        and all_st_map[str(d)]["status"] != "completed"
                     ]
                     if unmet:
                         continue
             runnable.append(dict(st))
 
-        return runnable
+        return runnable, all_done, any_failed
 
-    async def _setup_workspace(self, todo: dict) -> str | None:
-        """Set up task workspace if project has a repo."""
-        project = await self.ctx.db.fetchrow(
-            "SELECT repo_url FROM projects WHERE id = $1", todo["project_id"],
-        )
+    async def _setup_workspace(self, todo: dict, project: dict | None = None) -> str | None:
+        """Set up task workspace if project has a repo.
+
+        Returns task_root (tasks/{todo_id}/).
+        The main repo workspace is at task_root/repos/main/.
+        """
+        if project is None:
+            project = await self.ctx.load_project(str(todo["project_id"]))
         if not project or not project.get("repo_url"):
             return None
 
         try:
-            workspace_path = await self.ctx.workspace_mgr.setup_task_workspace(self.todo_id)
-            logger.info("[%s] Workspace ready at %s", self.todo_id, workspace_path)
-            return workspace_path
+            task_root = await self.ctx.workspace_mgr.setup_task_workspace(self.todo_id)
+            logger.info("[%s] Task root ready at %s", self.todo_id, task_root)
+            return task_root
         except Exception:
             logger.exception("[%s] Workspace setup FAILED", self.todo_id)
             await self.ctx.post_system_message(
@@ -441,55 +438,107 @@ class TaskScheduler:
             await self.ctx.transition_todo("failed")
             return None
 
-    async def _resolve_job_workspace(self, job: dict, default_workspace: str | None) -> str | None:
-        """Resolve workspace for a job, handling dependency repos."""
+    async def _resolve_job_workspace(self, job: dict, task_root: str | None) -> str | None:
+        """Resolve workspace for a job, handling dependency repos.
+
+        Resolution order:
+        1. Already persisted on the subtask (survives crash/restart)
+        2. In-memory cache (same scheduler run, avoids duplicate git ops)
+        3. Fresh setup via workspace_mgr.setup_repo_workspace
+
+        The resolved path is always persisted back to sub_tasks.workspace_path
+        so it becomes the durable source of truth.
+        """
+        from agents.orchestrator.workspace import MAIN_REPO
+
+        # 1. Check if already persisted on the subtask
+        stored_path = job.get("workspace_path")
+        if stored_path and os.path.isdir(stored_path):
+            return stored_path
+
         target_repo = job.get("target_repo")
+
+        # Determine repo_name and repo_url
         if not target_repo:
-            return default_workspace
-
-        dep_label = target_repo.get("name") if isinstance(target_repo, dict) else target_repo
-        try:
-            adapter = self._get_adapter()
-            ws = await adapter._setup_dependency_workspace(job)
-            return ws
-        except Exception as e:
-            logger.error(
-                "[%s] Failed to set up dep workspace for %s: %s",
-                self.todo_id, dep_label, e, exc_info=True,
-            )
-            await self.ctx.db.execute(
-                "UPDATE sub_tasks SET status = 'failed', error_message = $2 WHERE id = $1",
-                job["id"],
-                f"Could not set up dependency workspace for '{dep_label}': {e}",
-            )
-            await self.ctx.post_system_message(
-                f"**Sub-task failed:** Could not clone dependency repo '{dep_label}'."
-            )
+            # Main repo
+            repo_name = MAIN_REPO
+            if task_root:
+                ws = os.path.join(task_root, MAIN_REPO)
+                if os.path.isdir(ws):
+                    await self._persist_subtask_workspace(job["id"], ws)
+                    return ws
             return None
+        else:
+            if isinstance(target_repo, str):
+                import json as _json
+                target_repo = _json.loads(target_repo) if target_repo else {}
+            repo_name = (target_repo.get("name") or "dep").replace("/", "_").replace(" ", "_")
+            repo_url = target_repo.get("repo_url")
+            default_branch = target_repo.get("default_branch") or "main"
+            dep_gp_id = target_repo.get("git_provider_id")
 
-    async def _resolve_work_rules(self, todo: dict) -> dict:
-        """Merge project-level work rules with task-level overrides."""
-        project = await self.ctx.db.fetchrow(
-            "SELECT settings_json FROM projects WHERE id = $1", todo["project_id"],
+        # 2. Return cached workspace if already set up this run
+        if repo_name in self._dep_workspace_cache:
+            ws = self._dep_workspace_cache[repo_name]
+            await self._persist_subtask_workspace(job["id"], ws)
+            return ws
+
+        # Serialize setup per dep to prevent concurrent git operations on same dir
+        if repo_name not in self._dep_workspace_locks:
+            self._dep_workspace_locks[repo_name] = asyncio.Lock()
+
+        async with self._dep_workspace_locks[repo_name]:
+            # Double-check after acquiring lock
+            if repo_name in self._dep_workspace_cache:
+                ws = self._dep_workspace_cache[repo_name]
+                await self._persist_subtask_workspace(job["id"], ws)
+                return ws
+
+            try:
+                ws = await self.ctx.workspace_mgr.setup_repo_workspace(
+                    self.todo_id,
+                    repo_name,
+                    repo_url,
+                    default_branch=default_branch,
+                    git_provider_id=dep_gp_id,
+                )
+                self._dep_workspace_cache[repo_name] = ws
+                await self._persist_subtask_workspace(job["id"], ws)
+                return ws
+            except Exception as e:
+                logger.error(
+                    "[%s] Failed to set up workspace for %s: %s",
+                    self.todo_id, repo_name, e, exc_info=True,
+                )
+                await self.ctx.db.execute(
+                    "UPDATE sub_tasks SET status = 'failed', error_message = $2 WHERE id = $1",
+                    job["id"],
+                    f"Could not set up workspace for '{repo_name}': {e}",
+                )
+                await self.ctx.post_system_message(
+                    f"**Sub-task failed:** Could not clone repo '{repo_name}'."
+                )
+                return None
+
+    async def _persist_subtask_workspace(self, subtask_id, workspace_path: str) -> None:
+        """Store workspace_path on the subtask for crash-resilient lookup."""
+        await self.ctx.db.execute(
+            "UPDATE sub_tasks SET workspace_path = $2 WHERE id = $1",
+            subtask_id, workspace_path,
         )
-        project_settings = project["settings_json"] or {} if project else {}
-        if isinstance(project_settings, str):
-            project_settings = json.loads(project_settings)
-        rules = dict(project_settings.get("work_rules", {}))
 
-        overrides = todo.get("rules_override_json") or {}
-        if isinstance(overrides, str):
-            overrides = json.loads(overrides)
-        for category, values in overrides.items():
-            rules[category] = values
-
-        return rules
+    @staticmethod
+    def _resolve_work_rules(todo: dict, project: dict | None = None) -> dict:
+        """Merge project-level work rules with task-level overrides."""
+        return resolve_work_rules(todo, project)
 
     async def _handle_all_done(
         self, todo: dict, any_failed: bool,
-        workspace_path: str | None, provider: AIProvider,
+        task_root: str | None, provider: AIProvider,
     ) -> None:
         """Handle completion of all sub-tasks."""
+        from agents.orchestrator.workspace import MAIN_REPO
+
         if any_failed:
             # Check retry budget
             if todo["retry_count"] < todo["max_retries"]:
@@ -514,37 +563,61 @@ class TaskScheduler:
                 await self.ctx.transition_todo("failed", error_message=err)
                 return
 
-        # All passed — check guardrails
+        # Main repo workspace for guardrails/code push
+        main_workspace = os.path.join(task_root, MAIN_REPO) if task_root else None
+
+        # All passed — check guardrails (adds tester/reviewer if missing)
         adapter = self._get_adapter()
-        guardrail_created = await adapter._lifecycle.ensure_coding_guardrails(workspace_path)
+        guardrail_created = await adapter._lifecycle.ensure_coding_guardrails(main_workspace)
         if guardrail_created:
             logger.info("[%s] Guardrail subtasks created, will execute on next scan", self.todo_id)
-            return  # Next scan round will pick them up
+            return
 
-        # Check code push
-        code_push_created = await self._ensure_code_push(workspace_path)
-        if code_push_created:
-            return  # Next scan round will execute the PR job
-
-        # Sync indexes back to project
-        if workspace_path:
-            await self._sync_index(workspace_path)
-
-        # Enter testing or review
-        await self._enter_testing_or_review(todo, provider)
-
-    async def _ensure_code_push(self, workspace_path: str | None) -> bool:
-        """Create pr_creator job if coder work was done but no PR exists."""
-        if not workspace_path:
-            return False
-
-        existing_pr = await self.ctx.db.fetchrow(
-            "SELECT id FROM deliverables WHERE todo_id = $1 AND type = 'pull_request'",
+        # Check if testing/review still needed
+        has_pending_testing = await self.ctx.db.fetchval(
+            "SELECT COUNT(*) FROM sub_tasks WHERE todo_id = $1 "
+            "AND agent_role IN ('tester', 'reviewer') AND status = 'pending'",
             self.todo_id,
         )
-        if existing_pr:
+        if has_pending_testing:
+            # Testing/review subtasks exist but haven't run yet
+            return  # Next scan will execute them
+
+        # Check if we already went through testing phase
+        already_tested = await self.ctx.db.fetchval(
+            "SELECT COUNT(*) FROM sub_tasks WHERE todo_id = $1 "
+            "AND agent_role IN ('tester', 'reviewer') AND status = 'completed'",
+            self.todo_id,
+        )
+
+        if not already_tested:
+            # Enter testing/review first — PRs come after
+            if main_workspace:
+                await self._sync_index(main_workspace)
+            await self._enter_testing_or_review(todo, provider)
+            return
+
+        # Testing/review done — create PRs (one per repo)
+        prs_created = await self._ensure_code_push_per_repo(task_root)
+        if prs_created:
+            return  # Next scan will execute the PR jobs
+
+        # Everything done — transition to review/completed
+        await self.ctx.transition_todo("review")
+
+    async def _ensure_code_push_per_repo(self, task_root: str | None) -> bool:
+        """Create one pr_creator job per repo that had completed coder work.
+
+        Groups completed coder subtasks by their target repo and creates
+        a separate PR subtask for each repo. Only creates PRs for repos
+        that don't already have a PR deliverable or pending pr_creator task.
+
+        Returns True if any PR subtasks were created.
+        """
+        if not task_root:
             return False
 
+        # Skip if pr_creator tasks already exist
         existing_pr_task = await self.ctx.db.fetchrow(
             "SELECT id FROM sub_tasks WHERE todo_id = $1 AND agent_role = 'pr_creator' "
             "AND status IN ('pending', 'assigned', 'running')",
@@ -553,46 +626,90 @@ class TaskScheduler:
         if existing_pr_task:
             return False
 
+        # Get all completed coder subtasks
         coder_subtasks = await self.ctx.db.fetch(
             "SELECT * FROM sub_tasks WHERE todo_id = $1 AND agent_role = 'coder' "
-            "AND status = 'completed' ORDER BY created_at DESC",
+            "AND status = 'completed' ORDER BY created_at",
             self.todo_id,
         )
         if not coder_subtasks:
             return False
 
-        all_coder_ids = [str(st["id"]) for st in coder_subtasks]
-        latest_coder = coder_subtasks[0]
-        target_repo_json = latest_coder.get("target_repo")
-        if isinstance(target_repo_json, str):
-            target_repo_json = json.loads(target_repo_json)
+        # Group by target repo
+        by_repo: dict[str, list[dict]] = {}
+        for st in coder_subtasks:
+            target = st.get("target_repo")
+            if isinstance(target, str):
+                try:
+                    target = json.loads(target)
+                except (json.JSONDecodeError, TypeError):
+                    target = None
+            repo_name = "main"
+            if isinstance(target, dict) and target.get("name"):
+                repo_name = target["name"]
+            elif isinstance(target, str) and target:
+                repo_name = target
+            by_repo.setdefault(repo_name, []).append(dict(st))
+
+        # Check which repos already have PRs
+        existing_prs = await self.ctx.db.fetch(
+            "SELECT branch_name FROM deliverables WHERE todo_id = $1 AND type = 'pull_request'",
+            self.todo_id,
+        )
+        existing_branches = {r["branch_name"] for r in existing_prs if r.get("branch_name")}
 
         max_order = await self.ctx.db.fetchval(
             "SELECT COALESCE(MAX(execution_order), 0) FROM sub_tasks WHERE todo_id = $1",
             self.todo_id,
         )
 
-        await self.ctx.post_system_message(
-            "**Code push:** Creating PR sub-task for completed code changes..."
-        )
+        created = 0
+        for repo_name, coders in by_repo.items():
+            # Check if workspace has actual changes
+            ws = os.path.join(task_root, repo_name)
+            if not os.path.isdir(ws):
+                continue
 
-        await self.ctx.db.fetchrow(
-            """
-            INSERT INTO sub_tasks (
-                todo_id, title, description, agent_role,
-                execution_order, depends_on, target_repo
+            coder_ids = [str(st["id"]) for st in coders]
+
+            # Build target_repo JSON for dep repos
+            target_repo_json = None
+            if repo_name != "main":
+                # Get target_repo from the first coder that has it
+                for st in coders:
+                    tr = st.get("target_repo")
+                    if tr and isinstance(tr, dict):
+                        target_repo_json = tr
+                        break
+
+            title = f"Create Pull Request — {repo_name}" if repo_name != "main" else "Create Pull Request"
+
+            await self.ctx.db.fetchrow(
+                """
+                INSERT INTO sub_tasks (
+                    todo_id, title, description, agent_role,
+                    execution_order, depends_on, target_repo, workspace_path
+                )
+                VALUES ($1, $2, $3, 'pr_creator', $4, $5, $6, $7)
+                RETURNING id
+                """,
+                self.todo_id,
+                title,
+                f"Commit changes, push to feature branch, and create PR for {repo_name} repo.",
+                max_order + 1,
+                coder_ids,
+                target_repo_json,
+                ws,
             )
-            VALUES ($1, $2, $3, 'pr_creator', $4, $5, $6)
-            RETURNING id
-            """,
-            self.todo_id,
-            "Create Pull Request",
-            "Commit all workspace changes, push to a feature branch, and create a pull request.",
-            max_order + 1,
-            all_coder_ids,
-            target_repo_json,
-        )
-        return True
+            created += 1
+
+        if created:
+            repos_str = ", ".join(by_repo.keys())
+            await self.ctx.post_system_message(
+                f"**Code push:** Creating {created} PR sub-task(s) for repos: {repos_str}"
+            )
+
+        return created > 0
 
     async def _enter_testing_or_review(self, todo: dict, provider: AIProvider) -> None:
         """Route to testing if code work was done, otherwise review."""
@@ -621,19 +738,47 @@ class TaskScheduler:
         todo = await self.ctx.load_todo()
         await review.run(todo, provider)
 
-    async def _sync_index(self, workspace_path: str) -> None:
-        """Sync task-level code indexes back to project."""
+    async def _incremental_commit(self, workspace_path: str, completed_coders: list[dict]) -> None:
+        """Commit coder subtask work to git immediately after completion.
+
+        workspace_path IS the git working directory (no /repo/ subdir).
+        Each batch of completed coders gets one commit with a descriptive message.
+        """
+        from agents.utils.git_utils import run_git_command
+
+        if not os.path.isdir(os.path.join(workspace_path, ".git")):
+            return
+
         try:
-            from agents.indexing import sync_task_index_to_project
-            task_index_dir = os.path.join(workspace_path, ".agent_index")
-            project_index_dir = os.path.normpath(
-                os.path.join(workspace_path, "..", "..", ".agent_index"),
-            )
-            await asyncio.to_thread(
-                sync_task_index_to_project, task_index_dir, project_index_dir,
-            )
+            rc, _ = await run_git_command("add", "-A", cwd=workspace_path)
+            if rc != 0:
+                return
+
+            rc, _ = await run_git_command("diff", "--cached", "--quiet", cwd=workspace_path)
+            if rc == 0:
+                return  # nothing staged
+
+            titles = [st["title"] for st in completed_coders]
+            if len(titles) == 1:
+                msg = f"[agents] {titles[0]}"
+            else:
+                msg = f"[agents] {len(titles)} subtasks: " + ", ".join(t[:40] for t in titles)
+
+            rc, out = await run_git_command("commit", "-m", msg, "--no-verify", cwd=workspace_path)
+            if rc == 0:
+                _, commit_hash = await run_git_command("rev-parse", "HEAD", cwd=workspace_path)
+                commit_hash = commit_hash.strip()
+                for st in completed_coders:
+                    await self.ctx.db.execute(
+                        "UPDATE sub_tasks SET commit_hash = $2 WHERE id = $1",
+                        st["id"], commit_hash,
+                    )
+                logger.info("[%s] Incremental commit %s: %s", self.todo_id[:8], commit_hash[:10], msg[:80])
+            else:
+                logger.warning("[%s] Incremental commit failed: %s", self.todo_id[:8], out[:200])
         except Exception:
-            logger.debug("[%s] Index sync failed (non-fatal)", self.todo_id[:8], exc_info=True)
+            logger.debug("[%s] Incremental commit error (non-fatal)", self.todo_id[:8], exc_info=True)
+
 
 
 class _CoordinatorAdapter:
@@ -672,7 +817,6 @@ class _CoordinatorAdapter:
         self._ctx_builder = None
         self._executor_inst = None
         self._lifecycle_inst = None
-        self._execution_inst = None
         self._testing_inst = None
         self._review_inst = None
 
@@ -700,13 +844,6 @@ class _CoordinatorAdapter:
             from agents.orchestrator.agent_executor import AgentExecutor
             self._executor_inst = AgentExecutor(self)
         return self._executor_inst
-
-    @property
-    def _execution(self):
-        if self._execution_inst is None:
-            from agents.orchestrator.phases import ExecutionPhase
-            self._execution_inst = ExecutionPhase(self)
-        return self._execution_inst
 
     @property
     def _testing(self):
@@ -757,26 +894,32 @@ class _CoordinatorAdapter:
     async def _report_planning_activity(self, activity):
         await self._run_ctx.report_planning_activity(activity)
 
+    async def _load_chat_history(self) -> list[dict]:
+        session_id = getattr(self, "_chat_session_id", None)
+        if session_id:
+            rows = await self.db.fetch(
+                "SELECT role, content FROM project_chat_messages "
+                "WHERE session_id = $1 ORDER BY created_at ASC",
+                session_id,
+            )
+        else:
+            rows = await self.db.fetch(
+                "SELECT role, content FROM chat_messages WHERE todo_id = $1 ORDER BY created_at ASC",
+                self.todo_id,
+            )
+        return [dict(r) for r in rows]
+
+    @property
+    def _planning(self):
+        from agents.orchestrator.phases import PlanningPhase
+        return PlanningPhase(self)
+
     async def _build_context(self, todo):
         return await self._ctx.build_context(todo)
 
     def _get_builtin_tools(self, workspace_path, role):
         from agents.agents.registry import get_builtin_tool_schemas
         return get_builtin_tool_schemas(workspace_path, role)
-
-    def _get_dep_index_dirs(self, workspace_path):
-        deps_root = os.path.join(workspace_path, ".agent_index_deps")
-        if not os.path.isdir(deps_root):
-            return {}
-        result = {}
-        try:
-            for entry in os.listdir(deps_root):
-                idx = os.path.join(deps_root, entry)
-                if os.path.isdir(idx):
-                    result[entry] = idx
-        except OSError:
-            pass
-        return result
 
     async def _resolve_agent_config(self, role, owner_id):
         row = await self.db.fetchrow(
@@ -786,10 +929,31 @@ class _CoordinatorAdapter:
         )
         return dict(row) if row else None
 
-    async def _setup_dependency_workspace(self, sub_task):
-        """Set up workspace for a dependency repo sub-task."""
-        from agents.config.settings import settings
+    async def _maybe_create_deliverable(self, sub_task, response, run, *, workspace_path=None):
+        from agents.orchestrator.job_runner import _maybe_create_deliverable
+        await _maybe_create_deliverable(self._run_ctx, sub_task, response, run, workspace_path=workspace_path)
 
+    async def _handle_create_subtask_tool(self, parent_subtask, args, workspace_path):
+        from agents.orchestrator.job_runner import _handle_create_subtask_tool
+        return await _handle_create_subtask_tool(self._run_ctx, parent_subtask, args, workspace_path)
+
+    async def _run_quality_checks(self, workspace_path, work_rules, role, *, submit_data=None):
+        from agents.orchestrator.job_runner import _run_quality_checks
+        return await _run_quality_checks(self._run_ctx, workspace_path, work_rules, role, submit_data=submit_data)
+
+    async def _append_progress_log(self, sub_task, iterations_used, outcome, iteration_log):
+        from agents.orchestrator.job_runner import _append_progress_log
+        await _append_progress_log(self._run_ctx, sub_task, iterations_used, outcome, iteration_log)
+
+    async def _persist_execution_events(self, subtask_id, events):
+        from agents.orchestrator.job_runner import _persist_execution_events
+        await _persist_execution_events(self._run_ctx, subtask_id, events)
+
+    async def _setup_dependency_workspace(self, sub_task):
+        """Set up workspace for a dependency repo sub-task.
+
+        Delegates to WorkspaceManager.setup_repo_workspace for unified handling.
+        """
         target_repo = sub_task.get("target_repo")
         if isinstance(target_repo, str):
             target_repo = json.loads(target_repo) if target_repo else None
@@ -801,72 +965,13 @@ class _CoordinatorAdapter:
         if not repo_url:
             raise ValueError(f"No repo_url in target_repo for '{dep_name}'")
 
-        todo = await self._run_ctx.load_todo()
-        project_dir = os.path.join(settings.workspace_root, str(todo["project_id"]))
-        dep_task_dir = os.path.join(project_dir, "tasks", self.todo_id, f"dep_{dep_name}")
-        dep_repo_dir = os.path.join(dep_task_dir, "repo")
-
-        short_id = self.todo_id[:8]
-
-        if os.path.isdir(dep_repo_dir):
-            logger.info("[%s] Reusing existing dep workspace: %s", self.todo_id, dep_task_dir)
-            try:
-                proc = await asyncio.create_subprocess_exec(
-                    "git", "pull", "--rebase",
-                    cwd=dep_repo_dir,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                )
-                await proc.communicate()
-            except Exception:
-                pass
-        else:
-            logger.info("[%s] Cloning dep repo '%s' → %s", self.todo_id, dep_name, dep_task_dir)
-            os.makedirs(dep_task_dir, exist_ok=True)
-
-            project = await self.db.fetchrow(
-                "SELECT git_provider_id FROM projects WHERE id = $1",
-                todo["project_id"],
-            )
-            clone_url = repo_url
-            if project and project.get("git_provider_id"):
-                try:
-                    from agents.infra.crypto import decrypt
-                    gp_row = await self.db.fetchrow(
-                        "SELECT token_enc FROM git_provider_configs WHERE id = $1",
-                        str(project["git_provider_id"]),
-                    )
-                    if gp_row and gp_row.get("token_enc"):
-                        token = decrypt(gp_row["token_enc"])
-                        if "github.com" in repo_url:
-                            clone_url = repo_url.replace("https://", f"https://x-access-token:{token}@")
-                        elif "gitlab" in repo_url:
-                            clone_url = repo_url.replace("https://", f"https://oauth2:{token}@")
-                except Exception:
-                    logger.warning("[%s] Failed to resolve git credentials for dep '%s'", self.todo_id, dep_name)
-
-            proc = await asyncio.create_subprocess_exec(
-                "git", "clone", "--depth=1", clone_url, "repo",
-                cwd=dep_task_dir,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, stderr = await proc.communicate()
-            if proc.returncode != 0:
-                raise RuntimeError(
-                    f"git clone failed for '{dep_name}': {stderr.decode(errors='replace')[:500]}"
-                )
-
-            branch_name = f"task/{short_id}-{dep_name}"
-            proc = await asyncio.create_subprocess_exec(
-                "git", "checkout", "-b", branch_name,
-                cwd=dep_repo_dir,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            await proc.communicate()
-
-        return dep_task_dir
+        return await self.workspace_mgr.setup_repo_workspace(
+            self.todo_id,
+            dep_name,
+            repo_url,
+            default_branch=target_repo.get("default_branch") or "main",
+            git_provider_id=target_repo.get("git_provider_id"),
+        )
 
     async def _handle_user_message(self, user_msg: str, provider) -> None:
         """Handle a user message injected during execution."""
@@ -888,16 +993,3 @@ class _CoordinatorAdapter:
         except Exception:
             logger.warning("[%s] Failed to process user message", self.todo_id, exc_info=True)
 
-    async def _sync_task_index_to_project(self, workspace_path: str) -> None:
-        """Sync task-level code indexes back to project."""
-        try:
-            from agents.indexing import sync_task_index_to_project
-            task_index_dir = os.path.join(workspace_path, ".agent_index")
-            project_index_dir = os.path.normpath(
-                os.path.join(workspace_path, "..", "..", ".agent_index"),
-            )
-            await asyncio.to_thread(
-                sync_task_index_to_project, task_index_dir, project_index_dir,
-            )
-        except Exception:
-            logger.debug("[%s] Index sync failed (non-fatal)", self.todo_id[:8], exc_info=True)

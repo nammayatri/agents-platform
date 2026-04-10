@@ -86,7 +86,12 @@ files and interfaces at integration points
 API calls, imports, configuration references
 7. **API surface**: Key endpoints, interfaces, or entry points
 8. **Testing**: Testing approach, test frameworks, CI/CD patterns
-9. **Important context**: Anything an AI agent should know before working on tasks
+9. **Build & compile workflow**: How to build the project from scratch. Include exact commands, \
+any code generation steps (DSL transpilers, protobuf, codegen), required environment setup \
+(nix, docker, virtualenv), and the order of operations. This is critical — agents will use this \
+to build and verify their changes.
+10. **Important context**: Anything an AI agent should know before working on tasks. Include \
+gotchas, non-obvious conventions, and things that commonly trip up newcomers.
 
 Output a JSON object with these keys:
 - "purpose": string (2-3 sentences)
@@ -98,6 +103,7 @@ Output a JSON object with these keys:
 "shared_interfaces": list of strings, "integration_pattern": string}
 - "api_surface": string (key endpoints or interfaces)
 - "testing_approach": string
+- "build_workflow": string (step-by-step: how to build, compile, run code generation, etc.)
 - "important_context": list of strings (things an agent must know)
 - "summary": string (1 paragraph executive summary)
 """
@@ -158,16 +164,32 @@ class ProjectAnalyzer:
         self.workspace_mgr = WorkspaceManager(db, settings.workspace_root)
 
     async def _publish_progress(self, project_id: str, step: str, detail: str) -> None:
-        """Publish an analysis progress event via Redis pub/sub."""
-        if not self.redis:
-            return
-        try:
-            await self.redis.publish(
-                f"project:{project_id}:analysis",
-                json.dumps({"step": step, "detail": detail}),
-            )
-        except Exception:
-            logger.debug("Failed to publish analysis progress for %s", project_id)
+        """Publish analysis progress via Redis pub/sub AND persist to DB.
+
+        Persisting ensures the frontend can hydrate the current step on
+        page refresh — Redis pub/sub is ephemeral and missed events are
+        lost forever.
+        """
+        # Persist so frontend can hydrate on refresh (single lightweight UPDATE)
+        await self.db.execute(
+            "UPDATE projects SET settings_json = "
+            "jsonb_set(jsonb_set(COALESCE(settings_json, '{}')::jsonb, "
+            "'{analysis_step}', $2::jsonb), '{analysis_detail}', $3::jsonb), "
+            "updated_at = NOW() WHERE id = $1",
+            project_id,
+            json.dumps(step),
+            json.dumps(detail),
+        )
+
+        # Stream to connected WebSocket clients
+        if self.redis:
+            try:
+                await self.redis.publish(
+                    f"project:{project_id}:analysis",
+                    json.dumps({"step": step, "detail": detail}),
+                )
+            except Exception:
+                logger.debug("Failed to publish analysis progress for %s", project_id)
 
     async def analyze(self, project_id: str) -> dict | None:
         """Analyze a project's codebase and store the understanding."""
@@ -187,8 +209,8 @@ class ProjectAnalyzer:
 
         try:
             # Clone/pull the repo into workspace (deps cloned in parallel internally)
-            workspace_path = await self.workspace_mgr.setup_project_workspace(project_id)
-            repo_dir = os.path.join(workspace_path, "repo")
+            project_dir = await self.workspace_mgr.setup_project_workspace(project_id)
+            repo_dir = os.path.join(project_dir, "repo")
 
             if not os.path.isdir(repo_dir):
                 await self._publish_progress(project_id, "failed", "Repository clone failed")
@@ -203,7 +225,7 @@ class ProjectAnalyzer:
             context_docs = project.get("context_docs") or []
             if isinstance(context_docs, str):
                 context_docs = json.loads(context_docs)
-            deps_dir = os.path.join(workspace_path, "deps")
+            deps_dir = os.path.join(project_dir, "deps")
 
             provider_task = asyncio.create_task(self._resolve_provider(project_id))
 
@@ -264,7 +286,7 @@ class ProjectAnalyzer:
                     "project_understanding": analysis,
                 })
                 # Also write to workspace for agent reference
-                analysis_path = os.path.join(workspace_path, "analysis.json")
+                analysis_path = os.path.join(project_dir, "analysis.json")
                 with open(analysis_path, "w") as f:
                     json.dump(analysis, f, indent=2)
 
@@ -275,16 +297,32 @@ class ProjectAnalyzer:
 
                 # Build code indexes (structural + embedding) at project level
                 await self._publish_progress(project_id, "indexing", "Building code search indexes...")
+                _INDEX_TIMEOUT = 180  # 3 minutes — skip if repo is too large
+                main_indexed = False
                 try:
                     from agents.indexing import build_indexes_and_repo_map
 
-                    project_index_dir = os.path.join(workspace_path, ".agent_index")
-                    await asyncio.to_thread(
-                        build_indexes_and_repo_map,
-                        repo_dir,
-                        cache_dir=project_index_dir,
-                    )
-                    logger.info("Project %s: code indexes built at %s", project_id, project_index_dir)
+                    project_index_dir = os.path.join(project_dir, ".agent_index")
+                    try:
+                        await asyncio.wait_for(
+                            asyncio.to_thread(
+                                build_indexes_and_repo_map,
+                                repo_dir,
+                                cache_dir=project_index_dir,
+                            ),
+                            timeout=_INDEX_TIMEOUT,
+                        )
+                        main_indexed = True
+                        logger.info("Project %s: code indexes built at %s", project_id, project_index_dir)
+                    except asyncio.TimeoutError:
+                        logger.warning(
+                            "Project %s: code indexing timed out after %ds (repo too large)",
+                            project_id, _INDEX_TIMEOUT,
+                        )
+                        await self._publish_progress(
+                            project_id, "indexing",
+                            "Code indexing skipped (repo too large). Agents will use file search instead.",
+                        )
                 except Exception:
                     logger.warning("Project %s: code indexing failed (non-fatal)", project_id, exc_info=True)
 
@@ -345,7 +383,10 @@ class ProjectAnalyzer:
                         )
 
                 # Per-dependency code indexing
-                index_metadata: dict = {"main": {}, "deps": {}}
+                index_metadata: dict = {
+                    "main": {"indexed": main_indexed},
+                    "deps": {},
+                }
                 if context_docs:
                     await self._publish_progress(
                         project_id, "dep_indexing", "Indexing dependency repos...",
@@ -362,13 +403,23 @@ class ProjectAnalyzer:
                         )
                         try:
                             dep_index_dir = os.path.join(
-                                workspace_path, ".agent_index_deps", dep_dir_name,
+                                project_dir, ".agent_index_deps", dep_dir_name,
                             )
-                            dep_repo_map = await asyncio.to_thread(
-                                build_indexes_and_repo_map,
-                                dep_dir,
-                                cache_dir=dep_index_dir,
-                            )
+                            try:
+                                dep_repo_map = await asyncio.wait_for(
+                                    asyncio.to_thread(
+                                        build_indexes_and_repo_map,
+                                        dep_dir,
+                                        cache_dir=dep_index_dir,
+                                    ),
+                                    timeout=_INDEX_TIMEOUT,
+                                )
+                            except asyncio.TimeoutError:
+                                logger.warning(
+                                    "Project %s: dep indexing timed out for %s",
+                                    project_id, dep_name,
+                                )
+                                dep_repo_map = None
                             logger.info(
                                 "Project %s: dep index built for %s at %s",
                                 project_id, dep_name, dep_index_dir,
@@ -389,22 +440,21 @@ class ProjectAnalyzer:
                     extra_settings["dep_understandings"] = dep_understandings
                 if linking_document:
                     extra_settings["linking_document"] = linking_document
-                if index_metadata.get("deps"):
-                    extra_settings["index_metadata"] = index_metadata
+                extra_settings["index_metadata"] = index_metadata
                 if extra_settings:
                     await self._update_settings(project_id, extra_settings)
 
                 # Write context files to workspace for agent self-serve reads
                 try:
                     self.write_context_files(
-                        workspace_path=workspace_path,
+                        workspace_path=project_dir,
                         project_name=project["name"],
                         understanding=analysis,
                         dep_understandings=dep_understandings or None,
                         linking_document=linking_document,
                     )
                     logger.info("Project %s: context files written to %s/.context/",
-                                project_id, workspace_path)
+                                project_id, project_dir)
                 except Exception:
                     logger.warning("Project %s: failed to write context files (non-fatal)",
                                    project_id, exc_info=True)
@@ -735,17 +785,17 @@ class ProjectAnalyzer:
         for f in files:
             files_text += f"\n--- [{f['category']}] {f['path']} ---\n{f['content']}\n"
 
-        # Build dependencies section
+        # Build dependencies section — include user-provided descriptions prominently
         deps_text = ""
         if dependencies:
-            deps_text = "\n\nListed dependencies:\n"
+            deps_text = "\n\nProject dependencies (configured by the project owner):\n"
             for dep in dependencies:
-                deps_text += f"- {dep.get('name', '?')}"
-                if dep.get("repo_url"):
-                    deps_text += f" ({dep['repo_url']})"
+                name = dep.get("name", "?")
+                deps_text += f"\n### {name}\n"
                 if dep.get("description"):
-                    deps_text += f": {dep['description']}"
-                deps_text += "\n"
+                    deps_text += f"Description: {dep['description']}\n"
+                if dep.get("repo_url"):
+                    deps_text += f"Repository: {dep['repo_url']}\n"
 
         # Add cloned dependency docs, key files, and tree
         if dep_summaries:
@@ -996,16 +1046,50 @@ class ProjectAnalyzer:
             return {"summary": content, "raw": True}
 
     async def _update_settings(self, project_id: str, updates: dict) -> None:
-        """Merge keys into the project's settings_json."""
+        """Merge keys into the project's settings_json.
+
+        Transparently handles both old and new formats. Analysis-related keys
+        are mapped to the new ``understanding`` namespace when the settings
+        are already in new format.
+
+        When analysis_status is set to a terminal value (complete/failed/no_docs),
+        automatically clears the ephemeral analysis_step/analysis_detail fields
+        so the frontend doesn't show stale progress on next load.
+        """
+        from agents.utils.settings_helpers import is_new_format, parse_settings
+
         current = await self.db.fetchrow(
             "SELECT settings_json FROM projects WHERE id = $1", project_id
         )
-        current_settings = current["settings_json"] if current else {}
-        if isinstance(current_settings, str):
-            current_settings = json.loads(current_settings)
-        if not isinstance(current_settings, dict):
-            current_settings = {}
-        current_settings.update(updates)
+        current_settings = parse_settings(current["settings_json"] if current else None)
+
+        if is_new_format(current_settings):
+            # Map flat analysis keys into the understanding namespace
+            understanding = current_settings.setdefault("understanding", {})
+            key_map = {
+                "analysis_status": "status",
+                "project_understanding": "project",
+                "dep_understandings": "dependencies",
+                "linking_document": "linking",
+            }
+            for old_key, new_key in key_map.items():
+                if old_key in updates:
+                    understanding[new_key] = updates.pop(old_key)
+            # Any remaining keys (index_metadata, etc.) go at top level
+            current_settings.update(updates)
+        else:
+            # Old format — just merge flat
+            current_settings.update(updates)
+
+        # Clean up progress fields on terminal status
+        terminal_status = updates.get("analysis_status")
+        # Also check if we mapped it into understanding.status
+        if terminal_status is None and is_new_format(current_settings):
+            terminal_status = current_settings.get("understanding", {}).get("status")
+        if terminal_status in ("complete", "failed", "no_docs", None):
+            current_settings.pop("analysis_step", None)
+            current_settings.pop("analysis_detail", None)
+
         await self.db.execute(
             "UPDATE projects SET settings_json = $2, updated_at = NOW() WHERE id = $1",
             project_id,

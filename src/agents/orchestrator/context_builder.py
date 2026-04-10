@@ -22,6 +22,10 @@ from agents.agents.registry import (
 from agents.config.settings import settings
 from agents.orchestrator.workspace import WorkspaceManager
 from agents.utils.json_helpers import safe_json
+from agents.utils.work_rules import (
+    filter_rules_for_role as _filter_rules_for_role,
+    format_rules_for_prompt as _format_rules_for_prompt,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +52,7 @@ class ContextBuilder:
 
         # Per-todo-execution caches (lifetime = coordinator lifetime)
         self._cached_memories: list[dict] | None = None
+        self._cached_project_settings: dict | None = None
         self._cached_completed_ids: set[str] = set()
         self._cached_completed_results: list[dict] | None = None
         self._cached_file_tree: dict[str, str] = {}  # workspace_path -> tree_text
@@ -61,6 +66,53 @@ class ContextBuilder:
             "SELECT * FROM todo_items WHERE id = $1", self.todo_id,
         )
         return dict(row)
+
+    async def build_context(self, todo: dict) -> dict:
+        """Build project-level context dict for planning/intake phases.
+
+        Returns basic project metadata (name, repo, branch, dependencies,
+        understanding docs) used by the planner and intake phases.
+        """
+        project = await self.db.fetchrow(
+            "SELECT * FROM projects WHERE id = $1", todo["project_id"]
+        )
+        context = {
+            "project_name": project["name"] if project else "Unknown",
+            "repo_url": project["repo_url"] if project else None,
+            "default_branch": project["default_branch"] if project else "main",
+            "project_description": project["description"] if project else None,
+        }
+        if project and project.get("context_docs"):
+            deps = project["context_docs"]
+            if isinstance(deps, str):
+                deps = json.loads(deps)
+            context["dependencies"] = deps
+            dep_dirs = {}
+            for dep in deps:
+                name = dep.get("name", "")
+                if name:
+                    dir_name = name.replace("/", "_").replace(" ", "_")
+                    dep_dirs[name] = dir_name
+            if dep_dirs:
+                context["dependency_dirs"] = dep_dirs
+
+        if project and project.get("settings_json"):
+            from agents.utils.settings_helpers import parse_settings, read_setting
+            proj_settings = parse_settings(project["settings_json"])
+            understanding = read_setting(proj_settings, "understanding.project", "project_understanding")
+            if understanding:
+                context["project_understanding"] = understanding
+            dep_understandings = read_setting(proj_settings, "understanding.dependencies", "dep_understandings")
+            if dep_understandings:
+                context["dep_understandings"] = dep_understandings
+            linking_doc = read_setting(proj_settings, "understanding.linking", "linking_document")
+            if linking_doc:
+                context["linking_document"] = linking_doc
+            debug_ctx = read_setting(proj_settings, "debugging", "debug_context")
+            if debug_ctx:
+                context["debug_context"] = debug_ctx
+
+        return context
 
     async def get_completed_results(self) -> list[dict]:
         rows = await self.db.fetch(
@@ -83,6 +135,21 @@ class ContextBuilder:
             self._cached_completed_results = await self.get_completed_results()
         return self._cached_completed_results
 
+    async def _get_project_settings_cached(self, project_id: str) -> dict:
+        """Fetch project settings once and cache for coordinator lifetime."""
+        if self._cached_project_settings is None:
+            try:
+                from agents.utils.settings_helpers import parse_settings
+                row = await self.db.fetchrow(
+                    "SELECT settings_json FROM projects WHERE id = $1", project_id,
+                )
+                self._cached_project_settings = parse_settings(
+                    (row or {}).get("settings_json")
+                )
+            except Exception:
+                self._cached_project_settings = {}
+        return self._cached_project_settings
+
     async def _get_memories_cached(self, project_id: str) -> list[dict]:
         """Fetch project memories once and cache for the coordinator lifetime."""
         if self._cached_memories is None:
@@ -102,7 +169,7 @@ class ContextBuilder:
                 self._cached_memories = []
         return self._cached_memories
 
-    def _get_file_tree_cached(self, workspace_path: str, max_depth: int = 4) -> str:
+    def _get_file_tree_cached(self, workspace_path: str, max_depth: int = 3) -> str:
         """Cache file tree per workspace path for the coordinator lifetime."""
         if workspace_path not in self._cached_file_tree:
             self._cached_file_tree[workspace_path] = self.workspace_mgr.get_file_tree(
@@ -110,25 +177,10 @@ class ContextBuilder:
             )
         return self._cached_file_tree[workspace_path]
 
-    @staticmethod
-    def filter_rules_for_role(work_rules: dict, role: str) -> dict:
-        """Return only the rule categories relevant to the given agent role."""
-        defn = get_agent_definition(role)
-        categories = defn.tool_rule_categories if defn else ["general"]
-        return {cat: work_rules[cat] for cat in categories if cat in work_rules}
-
-    @staticmethod
-    def format_rules_for_prompt(rules: dict) -> str:
-        """Format work rules into a string block for injection into prompts."""
-        if not rules:
-            return ""
-        parts = ["\n\n## Work Rules (you MUST follow these)\n"]
-        for category, items in rules.items():
-            if items:
-                parts.append(f"### {category.title()}")
-                for item in items:
-                    parts.append(f"- {item}")
-        return "\n".join(parts)
+    # Canonical implementations in agents.utils.work_rules; exposed here
+    # as static methods for backward compatibility with existing callers.
+    filter_rules_for_role = staticmethod(_filter_rules_for_role)
+    format_rules_for_prompt = staticmethod(_format_rules_for_prompt)
 
     # ------------------------------------------------------------------
     # Main builder: simple (non-iterative) agent prompt
@@ -163,7 +215,7 @@ class ContextBuilder:
         # Build workspace context if available
         workspace_context = ""
         if workspace_path:
-            file_tree = self.workspace_mgr.get_file_tree(workspace_path, max_depth=4)
+            file_tree = self.workspace_mgr.get_file_tree(workspace_path, max_depth=3)
 
             if is_dep_workspace:
                 dep_name = target_repo.get("name", "dependency")
@@ -188,35 +240,30 @@ class ContextBuilder:
                     f"Project file structure:\n{file_tree}\n"
                 )
 
-            # List available dependency repos for reference
-            task_deps_dir = os.path.join(workspace_path, "deps")
-            if os.path.isdir(task_deps_dir):
-                dep_entries = sorted(os.listdir(task_deps_dir))
-                if dep_entries:
-                    workspace_context += (
-                        "\nDependency repositories available for reference (read-only):\n"
-                        "Access via ../deps/{name}/path relative to repo root.\n"
-                    )
-                    for d in dep_entries:
-                        full = os.path.join(task_deps_dir, d)
-                        if os.path.isdir(full):
-                            workspace_context += f"  - ../deps/{d}/\n"
+            # List sibling repos and context docs via file manager
+            from agents.orchestrator.file_manager import WorkspaceFileManager
+            _cb_fm = WorkspaceFileManager(workspace_path)
+            sibling_repos = _cb_fm.list_sibling_repos()
+            if sibling_repos:
+                workspace_context += (
+                    "\nSibling repos in this task (read-only from this workspace):\n"
+                )
+                for d in sibling_repos:
+                    workspace_context += f"  - ../{d}/\n"
 
-        # Point agents to .context/ files instead of injecting inline.
+        # Point agents to .context/ files
         cross_repo_ctx = ""
-        context_dir = os.path.join(workspace_path, ".context") if workspace_path else None
-        if context_dir and os.path.isdir(context_dir):
+        if workspace_path:
             ctx_files = []
-            if os.path.isfile(os.path.join(context_dir, "UNDERSTANDING.md")):
-                ctx_files.append("- ../.context/UNDERSTANDING.md \u2014 main repo architecture, patterns, tech stack")
-            if os.path.isfile(os.path.join(context_dir, "LINKING.md")):
-                ctx_files.append("- ../.context/LINKING.md \u2014 how repos relate, data flow, integration patterns")
-            deps_ctx = os.path.join(context_dir, "deps")
-            if os.path.isdir(deps_ctx):
-                dep_files = sorted(f for f in os.listdir(deps_ctx) if f.endswith(".md"))
-                for df in dep_files:
-                    name = df.removesuffix(".md")
-                    ctx_files.append(f"- ../.context/deps/{df} \u2014 {name} dependency architecture and API")
+            ctx_paths = _cb_fm.list_context_files()
+            for cf in ctx_paths:
+                base = os.path.basename(cf).removesuffix(".md")
+                if "UNDERSTANDING" in cf:
+                    ctx_files.append(f"- {cf} \u2014 main repo architecture, patterns, tech stack")
+                elif "LINKING" in cf:
+                    ctx_files.append(f"- {cf} \u2014 how repos relate, data flow, integration patterns")
+                else:
+                    ctx_files.append(f"- {cf} \u2014 {base} dependency architecture and API")
             if ctx_files:
                 cross_repo_ctx = (
                     "\n\nProject context docs available (read with read_file when needed):\n"
@@ -224,6 +271,9 @@ class ContextBuilder:
                     + "\n"
                 )
 
+        # Inject project understanding summary — tells the agent what the
+        # project is, its architecture, and tech stack so it doesn't waste
+        # tokens rediscovering this on every subtask.
         # Work rules injection
         rules_block = ""
         if work_rules:
@@ -238,17 +288,37 @@ class ContextBuilder:
 
         system += rules_block
 
-        # For debugger agents, inject project-level debug context
+        # Inject project understanding summary
+        proj_settings = await self._get_project_settings_cached(str(todo["project_id"]))
+        from agents.utils.settings_helpers import read_setting as _rs
+        understanding = _rs(proj_settings, "understanding.project", "project_understanding")
+        if understanding and isinstance(understanding, dict):
+            summary = understanding.get("summary", "")
+            tech = ", ".join(understanding.get("tech_stack", []))
+            arch = understanding.get("architecture", "")
+            u_parts = []
+            if summary:
+                u_parts.append(summary)
+            if tech:
+                u_parts.append(f"Tech stack: {tech}")
+            if arch:
+                u_parts.append(f"Architecture: {arch[:500]}")
+            if u_parts:
+                system += "\n\n## Project Overview\n" + "\n".join(u_parts) + "\n"
+
+        # Inject project build/compile context for roles that interact with code.
+        # This prevents each agent from independently rediscovering how the
+        # project builds, what DSL frameworks it uses, etc.
+        if role in ("coder", "tester", "reviewer", "debugger"):
+            build_block = await self.build_tester_context(todo)
+            if build_block:
+                system += build_block
+
+        # For debugger agents, also inject project-level debug context
         if role == "debugger":
             debug_block = await self.build_debug_context_block(todo)
             if debug_block:
                 system += debug_block
-
-        # For tester agents, inject project build/test commands
-        if role == "tester":
-            build_block = await self.build_tester_context(todo)
-            if build_block:
-                system += build_block
 
         # Inject tool descriptions into prompt so all models know what's available
         if workspace_path:
@@ -297,26 +367,24 @@ class ContextBuilder:
         # For debugger: inject recent git log
         debugger_git_context = ""
         if role == "debugger" and workspace_path:
-            repo_dir = os.path.join(workspace_path, "repo")
-            if os.path.isdir(repo_dir):
-                try:
-                    proc = await asyncio.create_subprocess_exec(
-                        "git", "log", "--oneline", "--no-decorate", "-20",
-                        cwd=repo_dir,
-                        stdout=asyncio.subprocess.PIPE,
-                        stderr=asyncio.subprocess.PIPE,
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    "git", "log", "--oneline", "--no-decorate", "-20",
+                    cwd=workspace_path,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                stdout, _ = await proc.communicate()
+                git_log = stdout.decode(errors="replace").strip()
+                if git_log:
+                    debugger_git_context = (
+                        "\n## Recent Commits\n"
+                        "Scan for commits related to the bug area. Use "
+                        "`run_command` with `git diff <hash>~1..<hash>` to inspect suspicious ones.\n"
+                        f"```\n{git_log}\n```"
                     )
-                    stdout, _ = await proc.communicate()
-                    git_log = stdout.decode(errors="replace").strip()
-                    if git_log:
-                        debugger_git_context = (
-                            "\n## Recent Commits\n"
-                            "Scan for commits related to the bug area. Use "
-                            "`run_command` with `git diff <hash>~1..<hash>` to inspect suspicious ones.\n"
-                            f"```\n{git_log}\n```"
-                        )
-                except Exception:
-                    pass
+            except Exception:
+                pass
 
         # Inject previous run context if this is a retry-with-context
         previous_run = intake.get("previous_run") if intake and not isinstance(intake, str) else None
@@ -452,32 +520,33 @@ class ContextBuilder:
                     f"Project file structure:\n{file_tree}\n"
                 )
 
-            # List available dependency repos
-            task_deps_dir = os.path.join(workspace_path, "deps")
-            if os.path.isdir(task_deps_dir):
-                dep_entries = [d for d in sorted(os.listdir(task_deps_dir))
-                               if os.path.isdir(os.path.join(task_deps_dir, d))]
+            # List available dependency repos (sibling dirs under repos/)
+            repos_dir = os.path.dirname(workspace_path)
+            current_repo_name = os.path.basename(workspace_path)
+            if os.path.isdir(repos_dir):
+                dep_entries = sorted(
+                    d for d in os.listdir(repos_dir)
+                    if d != current_repo_name and os.path.isdir(os.path.join(repos_dir, d))
+                )
                 if dep_entries:
                     workspace_context += (
-                        "\nDependency repos available (read-only) via ../deps/{name}/path:\n"
+                        "\nDependency repos available (read-only) via ../{name}/:\n"
                     )
                     for d in dep_entries:
-                        workspace_context += f"  - ../deps/{d}/\n"
+                        workspace_context += f"  - ../{d}/\n"
 
             # Git diff of current changes
             try:
-                repo_dir = os.path.join(workspace_path, "repo")
-                if os.path.isdir(repo_dir):
-                    proc = await asyncio.create_subprocess_exec(
-                        "git", "diff", "--stat",
-                        cwd=repo_dir,
-                        stdout=asyncio.subprocess.PIPE,
-                        stderr=asyncio.subprocess.PIPE,
-                    )
-                    stdout, _ = await proc.communicate()
-                    diff_stat = stdout.decode(errors="replace").strip()
-                    if diff_stat:
-                        workspace_context += f"\nCurrent changes (git diff --stat):\n{diff_stat}\n"
+                proc = await asyncio.create_subprocess_exec(
+                    "git", "diff", "--stat",
+                    cwd=workspace_path,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                stdout, _ = await proc.communicate()
+                diff_stat = stdout.decode(errors="replace").strip()
+                if diff_stat:
+                    workspace_context += f"\nCurrent changes (git diff --stat):\n{diff_stat}\n"
             except Exception:
                 pass
 
@@ -522,22 +591,21 @@ class ContextBuilder:
                 from agents.indexing.repo_map import render_repo_map
                 from agents.utils.token_counter import count_tokens
 
-                repo_dir_for_map = os.path.join(workspace_path, "repo")
-                if os.path.isdir(repo_dir_for_map):
-                    _subtask_idx = os.path.join(workspace_path, ".agent_index")
-                    indexer = RepoIndexer()
-                    graph = indexer.index(repo_dir_for_map, cache_dir=_subtask_idx)
-                    if graph.symbol_count > 0:
-                        repo_map_budget = settings.repo_map_token_budget
-                        repo_map_text = render_repo_map(
-                            graph,
-                            token_budget=repo_map_budget,
-                            count_tokens_fn=lambda t: count_tokens(t, "default"),
-                        )
-                        logger.info(
-                            "[%s] Generated repo map: %d symbols, %d files",
-                            self.todo_id[:8], graph.symbol_count, graph.file_count,
-                        )
+                from agents.orchestrator.workspace import index_dir_for_workspace
+                _subtask_idx = index_dir_for_workspace(workspace_path)
+                indexer = RepoIndexer()
+                graph = indexer.index(workspace_path, cache_dir=_subtask_idx)
+                if graph.symbol_count > 0:
+                    repo_map_budget = settings.repo_map_token_budget
+                    repo_map_text = render_repo_map(
+                        graph,
+                        token_budget=repo_map_budget,
+                        count_tokens_fn=lambda t: count_tokens(t, "default"),
+                    )
+                    logger.info(
+                        "[%s] Generated repo map: %d symbols, %d files",
+                        self.todo_id[:8], graph.symbol_count, graph.file_count,
+                    )
             except ImportError:
                 logger.debug("[%s] tree-sitter indexing not available", self.todo_id[:8])
             except Exception:
@@ -545,12 +613,18 @@ class ContextBuilder:
         if repo_map_text:
             system += f"\n\n## Repository Symbol Map\n{repo_map_text}\n"
 
-        # -- Project Memories (cached across iterations) --
+        # -- Project Memories (cached, budget-capped at ~2000 chars) --
         memories_rows = await self._get_memories_cached(str(todo["project_id"]))
         if memories_rows:
             memories_block = "\n\n## Project Memories (learnings from past tasks)\n"
+            mem_chars = 0
             for m in memories_rows:
-                memories_block += f"- [{m['category']}] {m['content']}\n"
+                line = f"- [{m['category']}] {m['content']}\n"
+                if mem_chars + len(line) > 2000:
+                    memories_block += f"- ... ({len(memories_rows)} total, showing highest confidence)\n"
+                    break
+                memories_block += line
+                mem_chars += len(line)
             system += memories_block
 
         # -- Iteration Learnings (with LLM compaction for old entries) --
@@ -650,26 +724,24 @@ class ContextBuilder:
         # For debugger: inject recent git log
         debugger_git_context = ""
         if role == "debugger" and workspace_path:
-            repo_dir = os.path.join(workspace_path, "repo")
-            if os.path.isdir(repo_dir):
-                try:
-                    proc = await asyncio.create_subprocess_exec(
-                        "git", "log", "--oneline", "--no-decorate", "-20",
-                        cwd=repo_dir,
-                        stdout=asyncio.subprocess.PIPE,
-                        stderr=asyncio.subprocess.PIPE,
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    "git", "log", "--oneline", "--no-decorate", "-20",
+                    cwd=workspace_path,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                stdout, _ = await proc.communicate()
+                git_log = stdout.decode(errors="replace").strip()
+                if git_log:
+                    debugger_git_context = (
+                        "\n## Recent Commits\n"
+                        "Scan for commits related to the bug area. Use "
+                        "`run_command` with `git diff <hash>~1..<hash>` to inspect suspicious ones.\n"
+                        f"```\n{git_log}\n```"
                     )
-                    stdout, _ = await proc.communicate()
-                    git_log = stdout.decode(errors="replace").strip()
-                    if git_log:
-                        debugger_git_context = (
-                            "\n## Recent Commits\n"
-                            "Scan for commits related to the bug area. Use "
-                            "`run_command` with `git diff <hash>~1..<hash>` to inspect suspicious ones.\n"
-                            f"```\n{git_log}\n```"
-                        )
-                except Exception:
-                    pass
+            except Exception:
+                pass
 
         # Build structured user prompt with exploration context
         user_parts = [
@@ -759,10 +831,9 @@ class ContextBuilder:
         if not project:
             return ""
 
-        proj_settings = project.get("settings_json") or {}
-        if isinstance(proj_settings, str):
-            proj_settings = json.loads(proj_settings)
-        debug_ctx = proj_settings.get("debug_context") or {}
+        from agents.utils.settings_helpers import parse_settings, read_setting as _rs
+        proj_settings = parse_settings(project.get("settings_json"))
+        debug_ctx = _rs(proj_settings, "debugging", "debug_context") or {}
 
         parts: list[str] = []
 
@@ -836,35 +907,47 @@ class ContextBuilder:
     # ------------------------------------------------------------------
 
     async def build_tester_context(self, todo: dict) -> str:
-        """Build a context block with build/test commands for tester agents.
+        """Build a context block with build/compile/test knowledge for code agents.
 
-        If the project has configured ``build_commands``, inject them.
-        Otherwise, provide discovery instructions.
+        Combines multiple sources:
+        1. Configured build_commands (explicit)
+        2. build_workflow from project understanding (LLM-generated)
+        3. Discovery instructions as fallback
         """
-        project = await self.db.fetchrow(
-            "SELECT settings_json FROM projects WHERE id = $1",
-            todo["project_id"],
-        )
-        proj_settings = safe_json(project.get("settings_json")) if project else {}
-        build_commands = proj_settings.get("build_commands", [])
+        proj_settings = await self._get_project_settings_cached(str(todo["project_id"]))
+        from agents.utils.settings_helpers import get_build_command_strings, read_setting as _rs
+        build_commands = get_build_command_strings(proj_settings)
+        understanding = _rs(proj_settings, "understanding.project", "project_understanding") or {}
+        build_workflow = understanding.get("build_workflow", "") if isinstance(understanding, dict) else ""
 
+        parts = []
+
+        # LLM-discovered build workflow (from project analysis, capped at 1500 chars)
+        if build_workflow:
+            bw = build_workflow[:1500] + ("..." if len(build_workflow) > 1500 else "")
+            parts.append(
+                f"\n\n## Build & Compile Workflow\n{bw}\n"
+            )
+
+        # Explicit build commands (from project settings — already normalized to strings)
         if build_commands:
             cmds = "\n".join(f"  - `{cmd}`" for cmd in build_commands)
-            return (
-                f"\n\n## Project Build & Test Commands\n"
-                f"The project has these configured build/test commands:\n{cmds}\n"
-                f"You MUST run these commands to validate the implementation. "
-                f"If any fail, investigate and fix the issues before reporting success."
+            parts.append(
+                f"\n\n## Configured Build/Test Commands\n{cmds}\n"
+                f"Run these commands to validate the implementation."
             )
-        else:
-            return (
-                "\n\n## Build & Test Discovery\n"
-                "No build/test commands are configured for this project. "
-                "Discover them by checking:\n"
-                "- `package.json` \u2192 `scripts.test`, `scripts.build`, `scripts.lint`\n"
-                "- `Makefile` or `Taskfile.yml`\n"
-                "- `pyproject.toml` / `setup.py` / `tox.ini`\n"
-                "- `Cargo.toml` (cargo test)\n"
-                "- CI config files (`.github/workflows/`, `.gitlab-ci.yml`)\n\n"
-                "Run the discovered test/build commands to validate the implementation."
-            )
+
+        if parts:
+            return "".join(parts)
+
+        return (
+            "\n\n## Build & Test Discovery\n"
+            "No build/test commands are configured for this project. "
+            "Discover them by checking:\n"
+            "- `package.json` \u2192 `scripts.test`, `scripts.build`, `scripts.lint`\n"
+            "- `Makefile` or `Taskfile.yml`\n"
+            "- `pyproject.toml` / `setup.py` / `tox.ini`\n"
+            "- `Cargo.toml` (cargo test)\n"
+            "- CI config files (`.github/workflows/`, `.gitlab-ci.yml`)\n\n"
+            "Run the discovered test/build commands to validate the implementation."
+        )

@@ -9,6 +9,7 @@ import SettingsPage from './pages/SettingsPage'
 import ProjectSettingsPage from './pages/ProjectSettingsPage'
 import ProjectChatPage from './pages/ProjectChatPage'
 import AgentsPage from './pages/AgentsPage'
+import ProjectPipelinePage from './pages/ProjectPipelinePage'
 import AppShell from './components/layout/AppShell'
 
 function ProtectedLayout() {
@@ -37,6 +38,7 @@ export default function App() {
         <Route path="projects/:projectId/settings" element={<ProjectSettingsPage />} />
         <Route path="projects/:projectId" element={<TodoBoardPage />} />
         <Route path="projects/:projectId/chat" element={<ProjectChatPage />} />
+        <Route path="projects/:projectId/pipeline" element={<ProjectPipelinePage />} />
         <Route path="todos/:todoId" element={<TodoDetailPage />} />
         <Route path="agents" element={<AgentsPage />} />
         <Route path="settings" element={<SettingsPage />} />

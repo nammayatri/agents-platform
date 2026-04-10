@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react'
 import { projects as projectsApi } from '../../services/api'
 import { inputClass } from '../../styles/classes'
+import MarkdownEditor from '../ui/MarkdownEditor'
 import type { DebugLogSource, DebugMcpHint, DebugContext } from '../../types'
 
 interface ProjectDebugTabProps {
@@ -232,15 +233,20 @@ export default function ProjectDebugTab({ projectId, setError }: ProjectDebugTab
 
       {/* Custom Instructions */}
       <div>
-        <label className="block text-xs text-gray-500 mb-1">Custom Debug Instructions</label>
-        <textarea
-          className={`${inputClass} min-h-[80px]`}
-          placeholder="Free-form instructions for the debugger agent. E.g., 'Check Sentry for error reports', 'The API uses structured JSON logging', 'Common issues: Redis connection timeouts under load'"
+        <label className="block text-xs text-gray-500 mb-1.5">Custom Debug Instructions</label>
+        <MarkdownEditor
           value={customInstructions}
-          onChange={(e) => setCustomInstructions(e.target.value)}
-          rows={4}
+          onChange={setCustomInstructions}
+          placeholder={`# Debug Instructions
+
+- Check Sentry for recent error reports
+- The API uses structured JSON logging
+- Common issues: Redis connection timeouts under load
+- Use \`kubectl logs\` for pod-level debugging`}
+          minHeight={150}
+          maxHeight={400}
         />
-        <p className="text-[11px] text-gray-600 mt-1">
+        <p className="text-[11px] text-gray-600 mt-1.5">
           These instructions are injected into every debugger agent's system prompt for this project.
         </p>
       </div>

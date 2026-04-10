@@ -216,10 +216,9 @@ class AgentCoordinator:
                     "SELECT settings_json FROM projects WHERE id = $1",
                     todo["project_id"],
                 )
-                pr_settings = project["settings_json"] or {} if project else {}
-                if isinstance(pr_settings, str):
-                    pr_settings = json.loads(pr_settings)
-                require_plan = pr_settings.get("require_plan_approval", False)
+                from agents.utils.settings_helpers import parse_settings, read_setting
+                pr_settings = parse_settings((project or {}).get("settings_json"))
+                require_plan = read_setting(pr_settings, "planning.require_approval", "require_plan_approval", False)
 
                 plan = todo.get("plan_json")
                 logger.info("[%s] → plan_ready: plan exists=%s require_plan_approval=%s",
@@ -277,7 +276,7 @@ class AgentCoordinator:
         *,
         workspace_path: str | None = None,
         work_rules: dict | None = None,
-        max_iterations: int = 50,
+        max_iterations: int = 500,
     ) -> None:
         """Delegate to AgentExecutor.execute_iterative."""
         await self._executor.execute_iterative(
@@ -304,9 +303,7 @@ class AgentCoordinator:
         if not quality_rules:
             return {"passed": True, "reason": "no quality rules", "learnings": []}
 
-        repo_dir = os.path.join(workspace_path, "repo")
-        if not os.path.isdir(repo_dir):
-            repo_dir = workspace_path
+        repo_dir = workspace_path
 
         all_passed = True
         combined_output = []
@@ -617,21 +614,18 @@ class AgentCoordinator:
 
         # Include stored project understanding from analysis
         if project and project.get("settings_json"):
-            settings = project["settings_json"]
-            if isinstance(settings, str):
-                settings = json.loads(settings)
-            understanding = settings.get("project_understanding")
+            from agents.utils.settings_helpers import parse_settings, read_setting as _rs
+            settings = parse_settings(project["settings_json"])
+            understanding = _rs(settings, "understanding.project", "project_understanding")
             if understanding:
                 context["project_understanding"] = understanding
-            # Include per-dep understandings and linking document
-            dep_understandings = settings.get("dep_understandings")
+            dep_understandings = _rs(settings, "understanding.dependencies", "dep_understandings")
             if dep_understandings:
                 context["dep_understandings"] = dep_understandings
-            linking_doc = settings.get("linking_document")
+            linking_doc = _rs(settings, "understanding.linking", "linking_document")
             if linking_doc:
                 context["linking_document"] = linking_doc
-            # Include debug context so the planner knows debugging capabilities
-            debug_ctx = settings.get("debug_context")
+            debug_ctx = _rs(settings, "debugging", "debug_context")
             if debug_ctx:
                 context["debug_context"] = debug_ctx
 
@@ -893,9 +887,7 @@ class AgentCoordinator:
 
     async def _get_workspace_diff(self, workspace_path: str) -> dict | None:
         """Get git diff from workspace after coder commits."""
-        repo_dir = os.path.join(workspace_path, "repo")
-        if not os.path.isdir(repo_dir):
-            repo_dir = workspace_path
+        repo_dir = workspace_path
 
         async def _run(args):
             proc = await asyncio.create_subprocess_exec(

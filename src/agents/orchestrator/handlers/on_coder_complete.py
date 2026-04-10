@@ -51,9 +51,7 @@ async def handle_coder_completion(
     has_diff = False
     if workspace_path:
         try:
-            repo_dir = os.path.join(workspace_path, "repo")
-            if not os.path.isdir(repo_dir):
-                repo_dir = workspace_path
+            repo_dir = workspace_path
 
             async def _git(args):
                 proc = await asyncio.create_subprocess_exec(

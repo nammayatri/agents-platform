@@ -101,13 +101,17 @@ async def execute_action(tool_name: str, arguments: dict, context: dict) -> str:
 
 @chat_action(
     name="create_task",
-    description="Create a new task for the project. Use when the user describes work they want done. Every sub_task MUST specify target_repo (which repository to work in).",
+    description=(
+        "Create exactly ONE task with sub-tasks for execution. "
+        "All work is organized as sub_tasks within a single task. "
+        "Never call this multiple times for the same request."
+    ),
     scope="project",
     input_schema={
         "type": "object",
         "properties": {
             "title": {"type": "string", "description": "Task title"},
-            "description": {"type": "string", "description": "Detailed task description"},
+            "description": {"type": "string", "description": "High-level task description and overall goal"},
             "priority": {
                 "type": "string",
                 "enum": ["critical", "high", "medium", "low"],
@@ -121,42 +125,82 @@ async def execute_action(tool_name: str, arguments: dict, context: dict) -> str:
             "sub_tasks": {
                 "type": "array",
                 "description": (
-                    "Pre-planned sub-tasks. When provided, the task skips intake/planning "
-                    "and goes directly to execution. Each sub-task MUST specify target_repo."
+                    "Sub-tasks to execute. Optimized for maximum parallelization — "
+                    "only add depends_on when a sub-task genuinely needs another's output."
                 ),
                 "items": {
                     "type": "object",
                     "properties": {
-                        "title": {"type": "string"},
-                        "description": {"type": "string"},
-                        "agent_role": {"type": "string"},
-                        "execution_order": {"type": "integer"},
+                        "title": {"type": "string", "description": "Concise subtask title"},
+                        "agent_role": {
+                            "type": "string",
+                            "description": "Agent role: coder, tester, reviewer, debugger, pr_creator, report_writer",
+                        },
+                        "target_repo": {
+                            "type": "string",
+                            "description": "REQUIRED. 'main' or exact dependency name.",
+                        },
                         "depends_on": {
                             "type": "array",
                             "items": {"type": "integer"},
+                            "description": "0-based indexes of subtasks that must complete first. [] for independent subtasks.",
                         },
                         "review_loop": {
                             "type": "boolean",
                             "description": "Set true for critical code changes needing coder→reviewer→merge cycle",
                         },
-                        "target_repo": {
+                        "scope": {
                             "type": "string",
-                            "description": (
-                                "REQUIRED. Which repository this sub-task works in. "
-                                "Use 'main' for the main project repo. "
-                                "For dependency repo work, use the EXACT dependency name "
-                                "(e.g. 'auth-service'). You must know which repo you are "
-                                "targeting before creating a sub-task."
-                            ),
+                            "description": "Which files, modules, or areas this subtask touches",
+                        },
+                        "requirements": {
+                            "type": "string",
+                            "description": "Specific acceptance criteria — what 'done' looks like",
+                        },
+                        "approach": {
+                            "type": "string",
+                            "description": "Implementation direction — how to accomplish it",
+                        },
+                        "goal": {
+                            "type": "string",
+                            "description": "High-level objective so the agent can self-validate",
+                        },
+                        "context": {
+                            "type": "string",
+                            "description": "Relevant code patterns, existing implementations, file paths, constraints",
                         },
                     },
-                    "required": ["title", "agent_role", "target_repo"],
+                    "required": ["title", "agent_role", "target_repo", "scope", "requirements", "approach", "goal"],
                 },
             },
         },
-        "required": ["title"],
+        "required": ["title", "sub_tasks"],
     },
 )
+def _build_subtask_description(st: dict) -> str:
+    """Build a rich description from the structured subtask fields.
+
+    Combines scope, requirements, approach, goal, and context into a
+    single description string that agents can consume. This preserves
+    all the planner's research findings in the execution context.
+    """
+    parts = []
+    if st.get("scope"):
+        parts.append(f"**Scope:** {st['scope']}")
+    if st.get("requirements"):
+        parts.append(f"**Requirements:** {st['requirements']}")
+    if st.get("approach"):
+        parts.append(f"**Approach:** {st['approach']}")
+    if st.get("goal"):
+        parts.append(f"**Goal:** {st['goal']}")
+    if st.get("context"):
+        parts.append(f"**Context:** {st['context']}")
+    # Fallback to plain description if structured fields are absent
+    if not parts and st.get("description"):
+        return st["description"]
+    return "\n".join(parts) if parts else st.get("description", st.get("title", ""))
+
+
 async def _handle_create_task(arguments: dict, context: dict) -> dict:
     """Create a todo item. Context must include db, project_id, user_id, event_bus."""
     db = context["db"]
@@ -186,7 +230,7 @@ async def _handle_create_task(arguments: dict, context: dict) -> dict:
             "sub_tasks": [
                 {
                     "title": st["title"],
-                    "description": st.get("description", ""),
+                    "description": _build_subtask_description(st),
                     "agent_role": st["agent_role"],
                     "execution_order": st.get("execution_order", i),
                     "depends_on": st.get("depends_on", []),
@@ -707,4 +751,67 @@ async def _handle_cancel_task(arguments: dict, context: dict) -> dict:
         "title": todo["title"],
         "subtasks_cancelled": cancelled_count or 0,
         "reason": arguments.get("reason", ""),
+    }
+
+
+@chat_action(
+    name="save_memory",
+    description=(
+        "Save important knowledge to the project's persistent memory. Use when the user "
+        "asks to 'remember this', 'save this to memory', or when you discover important "
+        "project patterns, conventions, or gotchas that should be remembered for future tasks. "
+        "Memories are injected into every agent's context for all future tasks."
+    ),
+    scope="project",
+    input_schema={
+        "type": "object",
+        "properties": {
+            "content": {
+                "type": "string",
+                "description": "The knowledge to remember. Be specific and actionable.",
+            },
+            "category": {
+                "type": "string",
+                "enum": ["architecture", "pattern", "convention", "pitfall", "dependency", "build", "workflow"],
+                "description": "Category of the memory.",
+            },
+        },
+        "required": ["content", "category"],
+    },
+)
+async def _handle_save_memory(arguments: dict, context: dict) -> dict:
+    """Save knowledge to project memory for future agent reference."""
+    db = context["db"]
+    project_id = context["project_id"]
+    user_id = context["user_id"]
+
+    content = arguments.get("content", "").strip()
+    category = arguments.get("category", "convention")
+    if not content:
+        return {"error": "Memory content is required"}
+
+    # Check for duplicate — don't save if a very similar memory already exists
+    existing = await db.fetch(
+        "SELECT content FROM project_memories WHERE project_id = $1 AND category = $2",
+        project_id, category,
+    )
+    for row in existing:
+        if row["content"].strip().lower() == content.lower():
+            return {"status": "already_exists", "message": "This memory already exists."}
+
+    row = await db.fetchrow(
+        """
+        INSERT INTO project_memories (project_id, category, content, confidence, source_todo_id)
+        VALUES ($1, $2, $3, 1.0, NULL)
+        RETURNING id
+        """,
+        project_id, category, content,
+    )
+
+    logger.info("[save_memory] Saved memory for project %s: [%s] %s", project_id[:8], category, content[:80])
+    return {
+        "action": "memory_saved",
+        "memory_id": str(row["id"]),
+        "category": category,
+        "content": content,
     }

@@ -1,4 +1,4 @@
-import { useState, useCallback, useEffect, useRef } from 'react'
+import { useState, useCallback, useEffect } from 'react'
 import { projects as projectsApi } from '../../services/api'
 import { useAnalysisWebSocket } from '../../hooks/useAnalysisWebSocket'
 import type { DepUnderstanding, LinkingDocument, IndexMetadata } from '../../types'
@@ -83,9 +83,17 @@ export default function ProjectUnderstandingTab({
     setError(detail || 'Analysis failed')
   }, [setAnalysisStatus, setError])
 
-  const { currentStep, detail, completedSteps, reset } = useAnalysisWebSocket(
+  const { currentStep, detail, done: analysisDone, reset } = useAnalysisWebSocket(
     projectId, isAnalyzing, handleComplete, handleFailed,
   )
+
+  // Derive completed steps from the current step index (single source of truth)
+  const currentIdx = currentStep ? STEP_ORDER.indexOf(currentStep) : -1
+  const completedSteps = analysisDone
+    ? STEP_ORDER  // all done
+    : currentIdx > 0
+      ? STEP_ORDER.slice(0, currentIdx)
+      : []
 
   // Load dep understandings when analysis is complete but dep data isn't loaded yet
   useEffect(() => {
@@ -94,32 +102,9 @@ export default function ProjectUnderstandingTab({
     }
   }, [analysisStatus, projectId, depUnderstandings, loadExtraData])
 
-  // Polling fallback: check DB status every 5s when analyzing
-  const setAnalysisStatusRef = useRef(setAnalysisStatus)
-  const setProjectUnderstandingRef = useRef(setProjectUnderstanding)
-  setAnalysisStatusRef.current = setAnalysisStatus
-  setProjectUnderstandingRef.current = setProjectUnderstanding
-
-  useEffect(() => {
-    if (!isAnalyzing || !projectId) return
-    const interval = setInterval(async () => {
-      try {
-        const p = await projectsApi.get(projectId)
-        const settings = typeof p.settings_json === 'string' ? JSON.parse(p.settings_json) : p.settings_json
-        const status = settings?.analysis_status
-        if (status && status !== 'analyzing') {
-          setAnalysisStatusRef.current(status)
-          if (status === 'complete') {
-            setProjectUnderstandingRef.current(settings?.project_understanding || null)
-            setDepUnderstandings(settings?.dep_understandings || null)
-            setLinkingDocument(settings?.linking_document || null)
-            setIndexMetadata(settings?.index_metadata || null)
-          }
-        }
-      } catch { /* ignore polling errors */ }
-    }, 5000)
-    return () => clearInterval(interval)
-  }, [isAnalyzing, projectId])
+  // No polling needed — the WebSocket handler sends a snapshot on connect
+  // (snapshot + stream pattern), and the 'complete'/'failed' events are
+  // delivered via onComplete/onFailed callbacks above.
 
   const handleCancel = async () => {
     if (!projectId) return

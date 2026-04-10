@@ -41,7 +41,25 @@ class IntakePhase:
     async def run(self, todo: dict, provider: AIProvider) -> None:
         """Gather all requirements upfront via AI interview."""
         coord = self._coord
-        context = await coord._build_context(todo)
+
+        # Lightweight context — intake only needs to judge task clarity,
+        # not the full project analysis (saves ~12K tokens per task)
+        project = await coord.db.fetchrow(
+            "SELECT name, repo_url, context_docs FROM projects WHERE id = $1",
+            todo["project_id"],
+        )
+        dep_names = []
+        if project and project.get("context_docs"):
+            docs = project["context_docs"]
+            if isinstance(docs, str):
+                docs = json.loads(docs)
+            dep_names = [d.get("name", "") for d in docs if d.get("name")]
+
+        brief_context = f"Project: {project['name'] if project else 'Unknown'}"
+        if project and project.get("repo_url"):
+            brief_context += f"\nRepo: {project['repo_url']}"
+        if dep_names:
+            brief_context += f"\nDependency repos: {', '.join(dep_names)}"
 
         messages = [
             LLMMessage(role="system", content=INTAKE_SYSTEM_PROMPT),
@@ -51,7 +69,7 @@ class IntakePhase:
                     f"Task: {todo['title']}\n"
                     f"Description: {todo['description'] or 'No description provided'}\n"
                     f"Type: {todo['task_type']}\n"
-                    f"Project context: {json.dumps(context, default=str)}"
+                    f"{brief_context}"
                 ),
             ),
         ]

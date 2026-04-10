@@ -356,106 +356,37 @@ class McpToolExecutor:
 
         return processed
 
-    def _resolve_allowed_dirs(self, workspace_path: str, tool_name: str) -> list[str]:
-        """Compute allowed directories per tool type.
-
-        Read-only tools (read_file, list_directory, search_files) can access
-        the main repo, dependency repos under workspace/deps/, and the
-        main_repo/ symlink (for dep workspaces referencing the main project).
-        Write tools remain restricted to the repo/ directory only.
-        """
-        repo_dir = os.path.join(workspace_path, "repo") if workspace_path else ""
-        allowed = [os.path.realpath(repo_dir)] if repo_dir else []
-
-        read_only_tools = {"read_file", "list_directory", "search_files"}
-        if tool_name in read_only_tools:
-            deps_dir = os.path.join(workspace_path, "deps")
-            if os.path.exists(deps_dir):
-                allowed.append(os.path.realpath(deps_dir))
-            # For dep workspaces: allow reading the main project repo
-            main_repo_dir = os.path.join(workspace_path, "main_repo")
-            if os.path.exists(main_repo_dir):
-                allowed.append(os.path.realpath(main_repo_dir))
-            # Allow reading .context/ docs (project understanding files)
-            context_dir = os.path.join(workspace_path, ".context")
-            if os.path.exists(context_dir):
-                allowed.append(os.path.realpath(context_dir))
-
-        return allowed
-
-    @staticmethod
-    def _check_path_allowed(real_path: str, allowed_dirs: list[str]) -> bool:
-        """Check if a resolved path falls within any allowed directory."""
-        return any(real_path.startswith(d + os.sep) or real_path == d for d in allowed_dirs)
-
-    @staticmethod
-    def _identify_repo(workspace_path: str, real_path: str) -> str:
-        """Identify which repository a resolved file path belongs to.
-
-        Returns a label like 'main', 'ny-react-native', or 'context-docs'.
-        Handles both project workspaces (repo/ = main) and dep workspaces
-        (repo/ = dep, main_repo/ = main).
-        """
-        if not workspace_path:
-            return "main"
-
-        real_ws = os.path.realpath(workspace_path)
-
-        # Check deps/{name}/ first (most specific)
-        deps_dir = os.path.join(real_ws, "deps")
-        real_deps = os.path.realpath(deps_dir) if os.path.exists(deps_dir) else None
-        if real_deps and (real_path.startswith(real_deps + os.sep) or real_path == real_deps):
-            # Extract dep name from path: deps/{name}/...
-            rel = real_path[len(real_deps):].lstrip(os.sep)
-            dep_name = rel.split(os.sep, 1)[0] if rel else ""
-            return dep_name or "dependency"
-
-        # Check main_repo/ (for dep workspaces referencing the main project)
-        main_repo_dir = os.path.join(real_ws, "main_repo")
-        real_main = os.path.realpath(main_repo_dir) if os.path.exists(main_repo_dir) else None
-        if real_main and (real_path.startswith(real_main + os.sep) or real_path == real_main):
-            return "main"
-
-        # Check .context/
-        ctx_dir = os.path.join(real_ws, ".context")
-        real_ctx = os.path.realpath(ctx_dir) if os.path.exists(ctx_dir) else None
-        if real_ctx and (real_path.startswith(real_ctx + os.sep) or real_path == real_ctx):
-            return "context-docs"
-
-        # For dep workspaces, repo/ is the dep repo (indicated by main_repo/ existing).
-        # Extract the dep name from the workspace dir name (format: dep_{name}).
-        if os.path.exists(os.path.join(real_ws, "main_repo")):
-            ws_basename = os.path.basename(real_ws)
-            if ws_basename.startswith("dep_"):
-                return ws_basename[4:]  # strip "dep_" prefix
-            return ws_basename  # fallback to full dirname
-
-        # Default: repo/ directory = main repo
-        return "main"
+    def _get_file_manager(self, workspace_path: str):
+        """Get or create a WorkspaceFileManager for the given workspace."""
+        from agents.orchestrator.file_manager import WorkspaceFileManager
+        # Cache per workspace_path to avoid re-computing on every tool call
+        if not hasattr(self, "_fm_cache"):
+            self._fm_cache = {}
+        if workspace_path not in self._fm_cache:
+            self._fm_cache[workspace_path] = WorkspaceFileManager(workspace_path)
+        return self._fm_cache[workspace_path]
 
     async def _execute_builtin(self, tool_meta: dict, tool_input: dict) -> str:
         """Execute a built-in workspace tool directly (no MCP server)."""
         workspace_path = tool_meta.get("_workspace_path", "")
-        repo_dir = os.path.join(workspace_path, "repo") if workspace_path else ""
+        repo_dir = workspace_path
         tool_name = tool_meta["name"]
+        fm = self._get_file_manager(workspace_path) if workspace_path else None
 
-        logger.debug("builtin[%s]: workspace=%s repo_dir=%s", tool_name, workspace_path, repo_dir)
+        logger.debug("builtin[%s]: workspace=%s", tool_name, workspace_path)
 
         try:
             if tool_name == "read_file":
                 path = tool_input.get("path", "")
-                full_path = os.path.join(repo_dir, path)
-                # Security: ensure path stays within repo or deps (read-only)
-                real_path = os.path.realpath(full_path)
-                allowed_dirs = self._resolve_allowed_dirs(workspace_path, tool_name)
-                if not self._check_path_allowed(real_path, allowed_dirs):
-                    logger.warning("builtin[read_file]: path traversal blocked: %s", path)
-                    return json.dumps({"error": "Path traversal not allowed"})
+                real_path = fm.resolve(path) if fm else os.path.realpath(os.path.join(repo_dir, path))
+                if fm and not fm.can_read(real_path):
+                    logger.warning("builtin[read_file]: access denied: %s", path)
+                    return json.dumps({"error": f"Access denied: {path}"})
                 if not os.path.isfile(real_path):
                     logger.info("builtin[read_file]: file not found: %s (resolved: %s)", path, real_path)
                     return json.dumps({"error": f"File not found: {path}"})
 
-                repo_label = self._identify_repo(workspace_path, real_path)
+                repo_label = fm.identify(real_path) if fm else "main"
 
                 # Try cache first (validates mtime freshness automatically)
                 content = self.file_cache.get(real_path)
@@ -527,18 +458,16 @@ class McpToolExecutor:
             elif tool_name == "write_file":
                 path = tool_input.get("path", "")
                 content = tool_input.get("content", "")
-                full_path = os.path.join(repo_dir, path)
-                real_path = os.path.realpath(full_path)
-                real_repo = os.path.realpath(repo_dir)
-                if not real_path.startswith(real_repo):
-                    logger.warning("builtin[write_file]: path traversal blocked: %s", path)
-                    return json.dumps({"error": "Path traversal not allowed"})
+                real_path = fm.resolve(path) if fm else os.path.realpath(os.path.join(repo_dir, path))
+                if fm and not fm.can_write(real_path):
+                    logger.warning("builtin[write_file]: access denied: %s", path)
+                    return json.dumps({"error": f"Write access denied: {path}"})
                 os.makedirs(os.path.dirname(real_path), exist_ok=True)
                 with open(real_path, "w") as f:
                     f.write(content)
                 # Update cache with the written content (mtime from disk after write)
                 self.file_cache.put(real_path, content)
-                repo_label = self._identify_repo(workspace_path, real_path)
+                repo_label = fm.identify(real_path) if fm else "main"
                 logger.debug("builtin[write_file]: %s → %d bytes written (repo=%s)", path, len(content), repo_label)
                 return json.dumps({"status": "ok", "path": path, "bytes_written": len(content), "repository": repo_label})
 
@@ -548,12 +477,10 @@ class McpToolExecutor:
                 new_text = tool_input.get("new_text", "")
                 if not old_text:
                     return json.dumps({"error": "old_text is required"})
-                full_path = os.path.join(repo_dir, path)
-                real_path = os.path.realpath(full_path)
-                real_repo = os.path.realpath(repo_dir)
-                if not real_path.startswith(real_repo):
-                    logger.warning("builtin[edit_file]: path traversal blocked: %s", path)
-                    return json.dumps({"error": "Path traversal not allowed"})
+                real_path = fm.resolve(path) if fm else os.path.realpath(os.path.join(repo_dir, path))
+                if fm and not fm.can_write(real_path):
+                    logger.warning("builtin[edit_file]: access denied: %s", path)
+                    return json.dumps({"error": f"Write access denied: {path}"})
                 if not os.path.isfile(real_path):
                     logger.info("builtin[edit_file]: file not found: %s", path)
                     return json.dumps({"error": f"File not found: {path}"})
@@ -573,7 +500,7 @@ class McpToolExecutor:
                             "builtin[edit_file]: %s — replaced %d chars with %d chars (method=%s, confidence=%.2f)",
                             path, len(old_text), len(new_text), match.method, match.confidence,
                         )
-                        repo_label = self._identify_repo(workspace_path, real_path)
+                        repo_label = fm.identify(real_path) if fm else "main"
                         return json.dumps({
                             "status": "ok",
                             "path": path,
@@ -603,7 +530,7 @@ class McpToolExecutor:
                     with open(real_path, "w") as f:
                         f.write(new_content)
                     self.file_cache.put(real_path, new_content)
-                    repo_label = self._identify_repo(workspace_path, real_path)
+                    repo_label = fm.identify(real_path) if fm else "main"
                     logger.debug("builtin[edit_file]: %s — replaced %d chars with %d chars (repo=%s)", path, len(old_text), len(new_text), repo_label)
                     return json.dumps({
                         "status": "ok",
@@ -615,16 +542,14 @@ class McpToolExecutor:
 
             elif tool_name == "list_directory":
                 path = tool_input.get("path", "")
-                full_path = os.path.join(repo_dir, path) if path else repo_dir
-                real_path = os.path.realpath(full_path)
-                allowed_dirs = self._resolve_allowed_dirs(workspace_path, tool_name)
-                if not self._check_path_allowed(real_path, allowed_dirs):
-                    logger.warning("builtin[list_directory]: path traversal blocked: %s", path)
-                    return json.dumps({"error": "Path traversal not allowed"})
+                real_path = fm.resolve(path) if fm and path else (fm.repo_dir if fm else repo_dir)
+                if fm and not fm.can_read(real_path):
+                    logger.warning("builtin[list_directory]: access denied: %s", path)
+                    return json.dumps({"error": f"Access denied: {path}"})
                 if not os.path.isdir(real_path):
                     logger.info("builtin[list_directory]: directory not found: %s (resolved: %s)", path, real_path)
                     return json.dumps({"error": f"Directory not found: {path}"})
-                repo_label = self._identify_repo(workspace_path, real_path)
+                repo_label = fm.identify(real_path) if fm else "main"
                 entries = sorted(os.listdir(real_path))
                 result = []
                 for e in entries[:500]:  # limit entries
@@ -642,17 +567,15 @@ class McpToolExecutor:
                     return json.dumps({"error": "No search pattern provided"})
                 search_path = tool_input.get("path", "")
                 file_glob = tool_input.get("file_glob", "*")
-                full_search = os.path.join(repo_dir, search_path) if search_path else repo_dir
-                real_search = os.path.realpath(full_search)
-                allowed_dirs = self._resolve_allowed_dirs(workspace_path, tool_name)
-                if not self._check_path_allowed(real_search, allowed_dirs):
-                    logger.warning("builtin[search_files]: path traversal blocked: %s", search_path)
-                    return json.dumps({"error": "Path traversal not allowed"})
+                real_search = fm.resolve(search_path) if fm and search_path else (fm.repo_dir if fm else repo_dir)
+                if fm and not fm.can_read(real_search):
+                    logger.warning("builtin[search_files]: access denied: %s", search_path)
+                    return json.dumps({"error": f"Access denied: {search_path}"})
                 if not os.path.isdir(real_search):
                     logger.info("builtin[search_files]: directory not found: %s", search_path)
                     return json.dumps({"error": f"Directory not found: {search_path}"})
 
-                repo_label = self._identify_repo(workspace_path, real_search)
+                repo_label = fm.identify(real_search) if fm else "main"
                 logger.debug("builtin[search_files]: pattern=%s path=%s glob=%s repo=%s", pattern, search_path or "/", file_glob, repo_label)
                 cmd = ["grep", "-rn", "--include", file_glob, pattern, "."]
                 proc = await asyncio.create_subprocess_exec(
@@ -784,7 +707,7 @@ class McpToolExecutor:
                     # Strip absolute repo path from output so LLM never sees it
                     if repo_dir:
                         output = output.replace(repo_dir + "/", "").replace(repo_dir, ".")
-                    repo_label = self._identify_repo(workspace_path, os.path.realpath(repo_dir))
+                    repo_label = fm.identify(os.path.realpath(repo_dir)) if fm else "main"
                     logger.debug("builtin[run_command]: exit_code=%d output_len=%d cmd=%s repo=%s",
                                 proc.returncode, len(output), actual_command[:100], repo_label)
                     return json.dumps({
@@ -843,6 +766,49 @@ class McpToolExecutor:
                 except Exception as e:
                     logger.warning("builtin[semantic_search]: failed: %s", e)
                     return json.dumps({"error": f"Semantic search failed: {e}. Use search_files instead."})
+
+            elif tool_name == "web_search":
+                query = tool_input.get("query", "")
+                max_results = min(tool_input.get("max_results", 5), 10)
+                if not query:
+                    return "Error: query is required"
+                try:
+                    from duckduckgo_search import DDGS
+                    with DDGS() as ddgs:
+                        results = list(ddgs.text(query, max_results=max_results))
+                    if not results:
+                        return f"No results found for: {query}"
+                    lines = []
+                    for i, r in enumerate(results, 1):
+                        lines.append(f"{i}. **{r.get('title', 'Untitled')}**")
+                        lines.append(f"   URL: {r.get('href', '')}")
+                        lines.append(f"   {r.get('body', '')}")
+                        lines.append("")
+                    return "\n".join(lines)
+                except ImportError:
+                    return "Error: duckduckgo-search package not installed. Run: pip install duckduckgo-search"
+                except Exception as e:
+                    return f"Search failed: {e}"
+
+            elif tool_name == "web_fetch":
+                url = tool_input.get("url", "")
+                if not url:
+                    return "Error: url is required"
+                try:
+                    import httpx
+                    jina_url = f"https://r.jina.ai/{url}"
+                    async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+                        resp = await client.get(jina_url, headers={
+                            "Accept": "text/markdown",
+                            "X-No-Cache": "true",
+                        })
+                        resp.raise_for_status()
+                        content = resp.text
+                        if len(content) > 15000:
+                            content = content[:15000] + "\n\n[... truncated, page too long]"
+                        return content
+                except Exception as e:
+                    return f"Failed to fetch {url}: {e}"
 
             elif tool_name == "task_complete":
                 summary = tool_input.get("summary", "")

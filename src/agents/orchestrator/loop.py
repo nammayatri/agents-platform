@@ -119,7 +119,17 @@ class EventDrivenOrchestrator:
                         )
                   )
             """)
-            logger.info("Orphan recovery: %s", result)
+            logger.info("Orphan sub_task recovery: %s", result)
+
+            # Also clean up stale agent_runs stuck in 'running'
+            stale_runs = await self.db.execute("""
+                UPDATE agent_runs SET status = 'failed',
+                       error_detail = 'Orphaned: worker died during execution',
+                       completed_at = NOW()
+                WHERE status = 'running'
+                  AND started_at < NOW() - INTERVAL '30 minutes'
+            """)
+            logger.info("Orphan agent_run recovery: %s", stale_runs)
         except Exception:
             logger.warning("Orphan recovery failed", exc_info=True)
 
@@ -337,6 +347,7 @@ class EventDrivenOrchestrator:
                 mcp_executor=McpToolExecutor(self.db),
                 tools_registry=ToolsRegistry(self.db),
                 notifier=self.notifier,
+                event_bus=self.event_bus,
             )
             scheduler = TaskScheduler(todo_id=todo_id, ctx=ctx)
             await scheduler.run()

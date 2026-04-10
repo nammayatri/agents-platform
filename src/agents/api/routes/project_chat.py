@@ -248,9 +248,11 @@ async def send_session_message(
         if chat_mode == "auto":
             last_mode = dict(session).get("last_routing_mode") or "chat"
 
-            # Try keyword classification first (instant, no LLM call).
-            # Only resolve provider + call LLM if keywords are ambiguous.
+            # Keyword and short-message checks are handled inside detect_intent
+            # (layers 1 & 2). Only resolve provider for the LLM layer (layer 3)
+            # if the fast paths don't match.
             from agents.api.routes.project_chat_llm import _keyword_classify
+
             kw_mode = _keyword_classify(body.content)
             if kw_mode:
                 detected_mode, confidence = kw_mode, 1.0
@@ -271,7 +273,7 @@ async def send_session_message(
 
                 recent_msgs = await db.fetch(
                     "SELECT role, content FROM project_chat_messages "
-                    "WHERE session_id = $1 ORDER BY created_at DESC LIMIT 3",
+                    "WHERE session_id = $1 ORDER BY created_at DESC LIMIT 5",
                     session_id,
                 )
                 detected_mode, confidence = await detect_intent(
@@ -281,7 +283,7 @@ async def send_session_message(
                     recent_messages=[dict(m) for m in reversed(recent_msgs)],
                 )
                 logger.info(
-                    "intent: LLM → %s conf=%.2f (last=%s) session=%s",
+                    "intent: LLM → %s conf=%.2f reason via logs (last=%s) session=%s",
                     detected_mode, confidence, last_mode, session_id,
                 )
 

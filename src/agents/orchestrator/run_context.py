@@ -46,6 +46,9 @@ class RunContext:
     tools_registry: ToolsRegistry
     notifier: Notifier
 
+    # Event bus for real-time orchestrator dispatch
+    event_bus: object | None = None  # EventBus (typed as object to avoid circular import)
+
     # Chat routing (resolved once at scheduler start)
     chat_session_id: str | None = None
     chat_project_id: str | None = None
@@ -61,7 +64,8 @@ class RunContext:
 
     async def transition_todo(self, target_state: str, **kwargs) -> dict | None:
         result = await _transition_todo(
-            self.db, self.todo_id, target_state, redis=self.redis, **kwargs,
+            self.db, self.todo_id, target_state,
+            redis=self.redis, event_bus=self.event_bus, **kwargs,
         )
         if result is None:
             logger.warning(
@@ -115,37 +119,21 @@ class RunContext:
 
     async def _post_chat_message(self, role: str, content: str, *, metadata: dict | None = None) -> None:
         if self.chat_session_id:
-            if metadata:
-                await self.db.execute(
-                    "INSERT INTO project_chat_messages "
-                    "(project_id, user_id, role, content, metadata_json, session_id) "
-                    "VALUES ($1, $2, $3, $4, $5, $6)",
-                    self.chat_project_id, self.chat_user_id, role, content,
-                    metadata, self.chat_session_id,
-                )
-            else:
-                await self.db.execute(
-                    "INSERT INTO project_chat_messages "
-                    "(project_id, user_id, role, content, session_id) "
-                    "VALUES ($1, $2, $3, $4, $5)",
-                    self.chat_project_id, self.chat_user_id, role, content,
-                    self.chat_session_id,
-                )
+            await self.db.execute(
+                "INSERT INTO project_chat_messages "
+                "(project_id, user_id, role, content, metadata_json, session_id) "
+                "VALUES ($1, $2, $3, $4, $5, $6)",
+                self.chat_project_id, self.chat_user_id, role, content,
+                metadata, self.chat_session_id,
+            )
         else:
-            if metadata:
-                await self.db.execute(
-                    "INSERT INTO chat_messages (todo_id, role, content, metadata_json) "
-                    "VALUES ($1, $2, $3, $4)",
-                    self.todo_id, role, content, metadata,
-                )
-            else:
-                await self.db.execute(
-                    "INSERT INTO chat_messages (todo_id, role, content) "
-                    "VALUES ($1, $2, $3)",
-                    self.todo_id, role, content,
-                )
+            await self.db.execute(
+                "INSERT INTO chat_messages (todo_id, role, content, metadata_json) "
+                "VALUES ($1, $2, $3, $4)",
+                self.todo_id, role, content, metadata,
+            )
 
-        msg_payload = {"role": role, "content": content}
+        msg_payload: dict = {"role": role, "content": content}
         if metadata:
             msg_payload["metadata_json"] = metadata
         event_data = json.dumps({"type": "chat_message", "message": msg_payload})

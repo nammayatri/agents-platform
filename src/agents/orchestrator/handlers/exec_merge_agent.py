@@ -18,11 +18,10 @@ async def _verify_merge_authorization(ctx: HandlerContext, pr_number: int) -> No
         "WHERE t.id = $1",
         ctx.todo_id,
     )
-    proj_settings = row["settings_json"] or {}
-    if isinstance(proj_settings, str):
-        proj_settings = json.loads(proj_settings)
+    from agents.utils.settings_helpers import parse_settings, read_setting
+    proj_settings = parse_settings(row["settings_json"])
 
-    require = proj_settings.get("require_merge_approval", False)
+    require = read_setting(proj_settings, "git.require_merge_approval", "require_merge_approval", False)
     sub_state = row["sub_state"]
 
     if require and sub_state not in ("merge_approved", "merging"):
@@ -166,11 +165,10 @@ async def execute_merge_agent(
             return
 
         # 4. Check if human approval is required
-        project_settings = project.get("settings_json") or {}
-        if isinstance(project_settings, str):
-            project_settings = json.loads(project_settings)
+        from agents.utils.settings_helpers import get_build_command_strings, parse_settings, read_setting
+        project_settings = parse_settings(project.get("settings_json"))
 
-        require_approval = project_settings.get("require_merge_approval", False)
+        require_approval = read_setting(project_settings, "git.require_merge_approval", "require_merge_approval", False)
         already_approved = todo.get("sub_state") == "merge_approved"
 
         logger.info(
@@ -209,7 +207,7 @@ async def execute_merge_agent(
 
         # 5. Merge the PR
         await ctx.report_progress(st_id, 70, f"Merging PR #{pr_number}")
-        merge_method = project_settings.get("merge_method", "squash")
+        merge_method = read_setting(project_settings, "git.merge_method", "merge_method", "squash")
 
         await _verify_merge_authorization(ctx, pr_number)
 
@@ -240,7 +238,7 @@ async def execute_merge_agent(
         )
 
         # 7. Post-merge build commands
-        build_commands = project_settings.get("build_commands", [])
+        build_commands = get_build_command_strings(project_settings)
         if build_commands and workspace_path:
             await ctx.report_progress(st_id, 85, "Running post-merge builds")
             await run_post_merge_builds(ctx, todo, build_commands, workspace_path)
@@ -252,7 +250,7 @@ async def execute_merge_agent(
         )
 
         # Trigger release pipeline if enabled
-        if project_settings.get("release_pipeline_enabled"):
+        if read_setting(project_settings, "release.enabled", "release_pipeline_enabled", False):
             try:
                 await create_release_subtasks(ctx, sub_task, project_settings)
             except Exception as e:
