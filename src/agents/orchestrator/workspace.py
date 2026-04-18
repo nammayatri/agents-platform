@@ -355,21 +355,20 @@ class WorkspaceManager:
 
         # Try local clone from project deps first (faster than remote)
         project_dep_dir = os.path.join(project_workspace, "deps", repo_name)
+        use_local = False
         if os.path.isdir(os.path.join(project_dep_dir, ".git")):
-            # Pull latest on the project dep first
-            await self._clone_or_pull(
-                repo_url=repo_url,
-                target_dir=project_dep_dir,
-                branch="HEAD",
-                token=token,
-                provider_type=provider_type,
-            )
+            # Verify it's actually a valid git repo (not a corrupt skeleton)
+            rc_check, _ = await run_git_command("rev-parse", "--git-dir", cwd=project_dep_dir)
+            use_local = rc_check == 0
+            if not use_local:
+                logger.warning("[workspace] Project dep %s has corrupt .git, will clone from remote", repo_name)
+
+        if use_local:
             rc, out = await run_git_command(
                 "clone", project_dep_dir, workspace_path,
                 cwd=self.workspace_root,
             )
         else:
-            # No local reference — clone from remote
             authenticated_url = build_clone_url(repo_url, token, provider_type)
             rc, out = await run_git_command(
                 "clone", "--depth", "1", authenticated_url, workspace_path,

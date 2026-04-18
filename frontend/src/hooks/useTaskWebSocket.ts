@@ -104,6 +104,12 @@ export function useTaskWebSocket(todoId: string | null) {
             }
             break
 
+          case 'command_output':
+            if (data.sub_task_id && data.line) {
+              queueActivity(data.sub_task_id, `  ${data.line}`)
+            }
+            break
+
           case 'llm_response':
             if (data.sub_task_id && data.content) {
               setLlmResponse(data.sub_task_id, data.content, data.iteration ?? 0)

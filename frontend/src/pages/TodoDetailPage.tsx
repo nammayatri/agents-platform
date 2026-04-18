@@ -1,10 +1,9 @@
 import { useEffect, useState, useRef } from 'react'
 import { useParams } from 'react-router-dom'
-import { Code2, Loader2, CheckCircle2, AlertCircle, XCircle, FileText, CirclePause, CircleDashed } from 'lucide-react'
+import { Code2, Loader2, CheckCircle2, AlertCircle, XCircle, FileText, CirclePause, CircleDashed, GitBranch } from 'lucide-react'
 import { useTodoStore } from '../stores/todoStore'
 import { useTaskWebSocket } from '../hooks/useTaskWebSocket'
 import { todos as todosApi } from '../services/api'
-import DiffViewer from '../components/DiffViewer'
 import WorkspaceView from '../components/workspace/WorkspaceView'
 import ExecutionLog from '../components/workspace/ExecutionLog'
 import ReviewFeedbackCard from '../components/chat/ReviewFeedbackCard'
@@ -1599,65 +1598,31 @@ export default function TodoDetailPage() {
               </details>
             )}
 
-            {/* Deliverables */}
-            {taskDeliverables.length > 0 && (() => {
-              const currentDeliverables = taskDeliverables.filter((d: Deliverable) => !isTimestampPreviousRun(d.created_at))
-              const previousDeliverables = taskDeliverables.filter((d: Deliverable) => isTimestampPreviousRun(d.created_at))
-              if (currentDeliverables.length === 0 && previousDeliverables.length === 0) return null
-
-              const renderDel = (d: Deliverable) => (
-                <div key={d.id} className="p-3 bg-gray-900 rounded-lg border border-gray-800/50">
-                  <div className="flex items-center gap-2 mb-1 flex-wrap">
-                    <span className="px-1.5 py-0.5 bg-indigo-600/30 border border-indigo-500/20 rounded text-[11px] text-indigo-300">{d.type.replace('_', ' ')}</span>
-                    <span className="text-sm text-gray-300">{d.title}</span>
-                    {d.merged_at && (
-                      <span className="px-1.5 py-0.5 bg-emerald-500/10 border border-emerald-500/20 rounded text-[10px] text-emerald-400/80">
-                        merged{d.merge_method ? ` (${d.merge_method})` : ''}
-                      </span>
-                    )}
-                    {d.pr_state && d.pr_state !== 'merged' && (
-                      <span className="px-1.5 py-0.5 bg-gray-800 rounded text-[10px] text-gray-400">{d.pr_state}</span>
-                    )}
-                    {d.target_repo_name && (
-                      <span className="px-1.5 py-0.5 bg-purple-500/10 border border-purple-500/20 rounded text-[10px] text-purple-400/80 font-mono">{d.target_repo_name}</span>
-                    )}
-                  </div>
-                  {d.pr_url && (
-                    <a href={d.pr_url} target="_blank" rel="noreferrer" className="text-[11px] text-indigo-400 hover:underline">{d.pr_url}</a>
-                  )}
-                  {d.type === 'code_diff' && d.content_json && (d.content_json as Record<string, unknown>).diff ? (
-                    <DiffViewer
-                      diff={(d.content_json as Record<string, unknown>).diff as string}
-                      stats={(d.content_json as Record<string, unknown>).stats as string}
-                      files={(d.content_json as Record<string, unknown>).files as Array<{status: string; path: string}>}
-                    />
-                  ) : d.content_md ? (
-                    <pre className="mt-2 text-[11px] text-gray-500 whitespace-pre-wrap max-h-40 overflow-y-auto font-mono leading-relaxed">{d.content_md}</pre>
-                  ) : null}
-                </div>
-              )
-
-              return (
-                <details className="mt-4" open>
-                  <summary className="text-[10px] text-gray-600 uppercase tracking-wider cursor-pointer hover:text-gray-500">
-                    Deliverables ({currentDeliverables.length}{previousDeliverables.length > 0 ? ` + ${previousDeliverables.length} previous` : ''})
-                  </summary>
-                  <div className="mt-1.5 space-y-1.5">
-                    {currentDeliverables.map(renderDel)}
-                    {previousDeliverables.length > 0 && (
-                      <details className="mt-2">
-                        <summary className="text-[10px] text-gray-600 cursor-pointer hover:text-gray-500">
-                          Previous Run ({previousDeliverables.length})
-                        </summary>
-                        <div className="mt-1.5 space-y-1.5 opacity-40">
-                          {previousDeliverables.map(renderDel)}
-                        </div>
-                      </details>
-                    )}
-                  </div>
-                </details>
-              )
-            })()}
+            {/* Pull Requests */}
+            {taskDeliverables.filter((d: Deliverable) => d.type === 'pull_request' && d.pr_url).length > 0 && (
+              <div className="mt-4 space-y-1.5">
+                {taskDeliverables
+                  .filter((d: Deliverable) => d.type === 'pull_request' && d.pr_url)
+                  .map((d: Deliverable) => (
+                    <div key={d.id} className="flex items-center gap-2 px-3 py-2 bg-gray-900 rounded-lg border border-gray-800/50">
+                      <GitBranch className="w-3.5 h-3.5 text-indigo-400 shrink-0" />
+                      <a href={d.pr_url!} target="_blank" rel="noreferrer" className="text-xs text-indigo-400 hover:underline truncate">
+                        PR #{d.pr_number}: {d.title}
+                      </a>
+                      {d.merged_at && (
+                        <span className="px-1.5 py-0.5 bg-emerald-500/10 rounded text-[10px] text-emerald-400 shrink-0">merged</span>
+                      )}
+                      {d.pr_state && d.pr_state !== 'merged' && (
+                        <span className="px-1.5 py-0.5 bg-gray-800 rounded text-[10px] text-gray-400 shrink-0">{d.pr_state}</span>
+                      )}
+                      {d.target_repo_name && (
+                        <span className="px-1.5 py-0.5 bg-purple-500/10 rounded text-[10px] text-purple-400 font-mono shrink-0">{d.target_repo_name}</span>
+                      )}
+                    </div>
+                  ))
+                }
+              </div>
+            )}
           </CollapsibleSection>
           )
         })()}

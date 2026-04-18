@@ -288,6 +288,22 @@ export const todos = {
         `/todos/${todoId}/workspace/git/subtask-diff/${subtaskId}${qs ? `?${qs}` : ''}`,
       )
     },
+    commits: (todoId: string, repo?: string) => {
+      const params = new URLSearchParams()
+      if (repo) params.set('repo', repo)
+      const qs = params.toString()
+      return request<Array<{ hash: string; author: string; date: string; message: string; files_changed: number; files: Array<{ status: string; path: string }> }>>(
+        `/todos/${todoId}/workspace/git/commits${qs ? `?${qs}` : ''}`,
+      )
+    },
+    commitDetail: (todoId: string, hash: string, repo?: string) => {
+      const params = new URLSearchParams()
+      if (repo) params.set('repo', repo)
+      const qs = params.toString()
+      return request<{ hash: string; message: string; diff: string; stats: string }>(
+        `/todos/${todoId}/workspace/git/commit/${hash}${qs ? `?${qs}` : ''}`,
+      )
+    },
     gitAdd: (todoId: string, paths: string[], repo?: string) =>
       request<GitStatus>(`/todos/${todoId}/workspace/git/add`, {
         method: 'POST',

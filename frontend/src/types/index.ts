@@ -584,7 +584,7 @@ export interface ProjectChatMessage {
 }
 
 export interface WSEvent {
-  type: 'state_change' | 'subtask_update' | 'chat_message' | 'progress' | 'activity' | 'deliverable_created' | 'task_cancelled' | 'llm_response' | 'workspace_commit' | 'workspace_push' | 'tool_start' | 'tool_result' | 'llm_thinking' | 'iteration_start' | 'iteration_end' | 'testing_step' | 'user_inject' | 'index_search' | 'index_build' | 'ping'
+  type: 'state_change' | 'subtask_update' | 'chat_message' | 'progress' | 'activity' | 'deliverable_created' | 'task_cancelled' | 'llm_response' | 'workspace_commit' | 'workspace_push' | 'tool_start' | 'tool_result' | 'llm_thinking' | 'iteration_start' | 'iteration_end' | 'testing_step' | 'user_inject' | 'index_search' | 'index_build' | 'command_output' | 'ping'
   state?: TodoState
   status?: string
   message?: string | { role: string; content: string; id?: string; metadata_json?: Record<string, unknown> }
@@ -597,6 +597,7 @@ export interface WSEvent {
   error_message?: string
   sub_state?: string
   phase?: string
+  line?: string          // command_output line
   ts?: number
   // Streaming execution event fields
   name?: string

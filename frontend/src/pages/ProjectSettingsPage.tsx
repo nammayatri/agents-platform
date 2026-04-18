@@ -338,17 +338,16 @@ export default function ProjectSettingsPage() {
           setError={setError}
         />
       ) : (
-        <div className="flex gap-6 min-h-[600px]">
-          {/* Sidebar */}
-          <nav className="w-52 shrink-0">
-            <div className="space-y-1">
+        <div className="flex flex-col md:flex-row gap-4 md:gap-6 min-h-[400px] md:min-h-[600px]">
+          {/* Sidebar — horizontal scroll on mobile, vertical on desktop */}
+          <nav className="md:w-52 md:shrink-0">
+            <div className="flex md:flex-col gap-1 overflow-x-auto md:overflow-x-visible pb-2 md:pb-0">
               {sidebarGroups.map((group, gi) => {
                 const isExpanded = gi === activeGroupIdx
                 return (
-                  <div key={group.label}>
+                  <div key={group.label} className="shrink-0 md:shrink">
                     <button
                       onClick={() => {
-                        // Click group header → go to first item in group
                         if (!isExpanded) {
                           setActiveSection(group.items[0].key)
                         }
@@ -364,7 +363,7 @@ export default function ProjectSettingsPage() {
                       <ChevronRight className={`w-3 h-3 transition-transform ${isExpanded ? 'rotate-90' : ''}`} />
                     </button>
                     {isExpanded && (
-                      <div className="ml-3 mt-0.5 space-y-0.5 border-l border-gray-800 pl-2">
+                      <div className="hidden md:block ml-3 mt-0.5 space-y-0.5 border-l border-gray-800 pl-2">
                         {group.items.map((item) => (
                           <button
                             key={item.key}
@@ -381,14 +380,32 @@ export default function ProjectSettingsPage() {
                         ))}
                       </div>
                     )}
+                    {/* Mobile: show sub-items inline when expanded */}
+                    {isExpanded && (
+                      <div className="flex md:hidden gap-1 mt-1">
+                        {group.items.map((item) => (
+                          <button
+                            key={item.key}
+                            onClick={() => setActiveSection(item.key)}
+                            className={`px-2 py-1 rounded text-[11px] whitespace-nowrap transition-colors ${
+                              activeSection === item.key
+                                ? 'text-indigo-400 bg-indigo-500/10'
+                                : 'text-gray-500'
+                            }`}
+                          >
+                            {item.label}
+                          </button>
+                        ))}
+                      </div>
+                    )}
                   </div>
                 )
               })}
             </div>
 
-            {/* Delete at bottom */}
+            {/* Delete at bottom — desktop only, on mobile it's in the content area */}
             {userRole === 'owner' && (
-              <div className="mt-8 pt-4 border-t border-gray-800">
+              <div className="hidden md:block mt-8 pt-4 border-t border-gray-800">
                 <button
                   onClick={async () => {
                     if (confirm('Delete this project and all its tasks?')) {

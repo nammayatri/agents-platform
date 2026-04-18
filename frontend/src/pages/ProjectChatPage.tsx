@@ -1069,7 +1069,7 @@ export default function ProjectChatPage() {
       {/* Main chat area */}
       <div className="flex-1 flex flex-col overflow-hidden">
         {/* Header */}
-        <div className="flex items-center justify-between px-4 md:px-6 py-3 border-b border-gray-900">
+        <div className="flex items-center justify-between pl-12 md:pl-4 pr-4 md:px-6 py-3 border-b border-gray-900">
           <div className="flex items-center gap-3">
             <button
               onClick={() => setShowSidebar(!showSidebar)}

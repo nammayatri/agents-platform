@@ -374,6 +374,83 @@ async def workspace_subtask_diff(
     }
 
 
+@router.get("/todos/{todo_id}/workspace/git/commits")
+async def workspace_commits(
+    todo_id: str, user: CurrentUser, db: DB,
+    repo: str = Query(None, description="Repo name: 'main' or dependency name"),
+):
+    """Get commit history from base_commit to HEAD for the task workspace."""
+    repo_dir, _ = await _resolve_task_repo(todo_id, user, db, repo=repo)
+
+    todo = await db.fetchrow(
+        "SELECT base_commit FROM todo_items WHERE id = $1", todo_id,
+    )
+    base = todo["base_commit"] if todo else None
+
+    # Build git log range
+    log_range = f"{base}..HEAD" if base else "-20"
+    rc, output = await run_git_command(
+        "log", log_range,
+        "--format=%H%n%an%n%aI%n%s%n---COMMIT_END---",
+        cwd=repo_dir,
+    )
+    if rc != 0 or not output or not output.strip():
+        return []
+
+    commits = []
+    entries = output.strip().split("---COMMIT_END---")
+    for entry in entries:
+        lines = entry.strip().splitlines()
+        if len(lines) < 4:
+            continue
+        commit_hash = lines[0]
+        # Get changed files for this commit
+        _, name_status = await run_git_command(
+            "diff", "--name-status", f"{commit_hash}~1..{commit_hash}",
+            cwd=repo_dir,
+        )
+        files = []
+        for line in (name_status or "").strip().splitlines():
+            parts = line.split("\t", 1)
+            if len(parts) == 2:
+                files.append({"status": parts[0], "path": parts[1]})
+
+        commits.append({
+            "hash": commit_hash,
+            "author": lines[1],
+            "date": lines[2],
+            "message": lines[3],
+            "files_changed": len(files),
+            "files": files,
+        })
+
+    return commits
+
+
+@router.get("/todos/{todo_id}/workspace/git/commit/{commit_hash}")
+async def workspace_commit_detail(
+    todo_id: str, commit_hash: str, user: CurrentUser, db: DB,
+    repo: str = Query(None, description="Repo name"),
+):
+    """Get the full diff for a specific commit."""
+    repo_dir, _ = await _resolve_task_repo(todo_id, user, db, repo=repo)
+
+    # Validate commit hash format
+    if not commit_hash.replace("-", "").isalnum() or len(commit_hash) < 7:
+        raise HTTPException(status_code=400, detail="Invalid commit hash")
+
+    rc, diff = await run_git_command("diff", f"{commit_hash}~1..{commit_hash}", cwd=repo_dir)
+    _, stats = await run_git_command("diff", "--stat", f"{commit_hash}~1..{commit_hash}", cwd=repo_dir)
+    _, msg = await run_git_command("log", "-1", "--format=%s", commit_hash, cwd=repo_dir)
+
+    return {
+        "hash": commit_hash,
+        "message": (msg or "").strip(),
+        "diff": diff or "",
+        "stats": (stats or "").strip(),
+    }
+
+
 class GitAddInput(BaseModel):
     paths: list[str]
     repo: str | None = None

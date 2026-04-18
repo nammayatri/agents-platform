@@ -564,6 +564,21 @@ async def _execute_single_shot(
         )
         _check_inject, _inject_key = _make_inject_checker(ctx, st_id)
 
+        # Wire up command output streaming to Redis
+        async def _stream_cmd_output(line: str) -> None:
+            try:
+                await ctx.redis.publish(
+                    f"task:{ctx.todo_id}:events",
+                    json.dumps({
+                        "type": "command_output",
+                        "sub_task_id": st_id,
+                        "line": line,
+                    }),
+                )
+            except Exception:
+                pass
+        ctx.mcp_executor.on_command_output = _stream_cmd_output
+
         _token_cb = ctx.build_token_streamer(st_id)
         content, response = await run_tool_loop(
             provider, messages,
@@ -857,6 +872,17 @@ async def _execute_iterative(
                 ctx, st_id, _accumulated_events, workspace_path,
             )
             _check_inject, _ = _make_inject_checker(ctx, st_id)
+
+            # Wire up command output streaming
+            async def _iter_stream_cmd(line: str) -> None:
+                try:
+                    await ctx.redis.publish(
+                        f"task:{ctx.todo_id}:events",
+                        json.dumps({"type": "command_output", "sub_task_id": st_id, "line": line}),
+                    )
+                except Exception:
+                    pass
+            ctx.mcp_executor.on_command_output = _iter_stream_cmd
 
             # Architect/Editor dual-model execution
             if architect_editor_enabled and architect_model and editor_model:

@@ -233,6 +233,10 @@ class McpToolExecutor:
     def __init__(self, db: asyncpg.Pool):
         self.db = db
         self.file_cache = _file_cache
+        # Optional callback for streaming command output lines.
+        # Set by the caller before tool execution starts.
+        # Signature: async (line: str) -> None
+        self.on_command_output: object | None = None
 
     async def execute_tool(
         self,
@@ -695,16 +699,49 @@ class McpToolExecutor:
                     stderr=asyncio.subprocess.STDOUT,
                 )
                 try:
-                    stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=120)
-                    output = stdout.decode(errors="replace")
-                    if len(output) > 50_000:
-                        total_len = len(output)
-                        logger.info("builtin[run_command]: output truncated from %d to 50000 chars", total_len)
-                        output = output[:50_000] + (
-                            f"\n\n... (output truncated at 50K of {total_len} chars. "
+                    # Stream output line-by-line if callback is set
+                    _stream_cb = self.on_command_output
+                    output_lines: list[str] = []
+                    total_chars = 0
+                    _MAX_OUTPUT = 50_000
+                    _STREAM_INTERVAL = 1.0  # throttle streaming to 1/s
+                    _last_stream = 0.0
+
+                    while True:
+                        try:
+                            line_bytes = await asyncio.wait_for(
+                                proc.stdout.readline(), timeout=120,
+                            )
+                        except asyncio.TimeoutError:
+                            proc.kill()
+                            output_lines.append("\n... (timed out after 120s)")
+                            break
+                        if not line_bytes:
+                            break
+                        line = line_bytes.decode(errors="replace")
+                        total_chars += len(line)
+                        if total_chars <= _MAX_OUTPUT:
+                            output_lines.append(line)
+
+                        # Stream to frontend (throttled)
+                        if _stream_cb:
+                            import time
+                            now = time.monotonic()
+                            if now - _last_stream >= _STREAM_INTERVAL:
+                                _last_stream = now
+                                try:
+                                    await _stream_cb(line.rstrip("\n")[:200])
+                                except Exception:
+                                    pass
+
+                    await proc.wait()
+                    output = "".join(output_lines)
+                    if total_chars > _MAX_OUTPUT:
+                        output += (
+                            f"\n\n... (output truncated at 50K of {total_chars} chars. "
                             f"Pipe through head/tail/grep to get specific sections.)"
                         )
-                    # Strip absolute repo path from output so LLM never sees it
+                    # Strip absolute repo path from output
                     if repo_dir:
                         output = output.replace(repo_dir + "/", "").replace(repo_dir, ".")
                     repo_label = fm.identify(os.path.realpath(repo_dir)) if fm else "main"
@@ -723,10 +760,6 @@ class McpToolExecutor:
                     await proc.wait()
                     logger.debug("builtin[run_command]: cancelled, subprocess killed cmd=%s", actual_command[:100])
                     raise
-                except asyncio.TimeoutError:
-                    proc.kill()
-                    logger.warning("builtin[run_command]: timed out after 120s cmd=%s", actual_command[:200])
-                    return json.dumps({"error": "Command timed out after 120s"})
 
             elif tool_name == "semantic_search":
                 query = tool_input.get("query", "")

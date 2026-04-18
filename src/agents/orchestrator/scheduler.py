@@ -411,9 +411,48 @@ class TaskScheduler:
                     ]
                     if unmet:
                         continue
+            # pr_creator must wait for ALL subtasks targeting the same repo,
+            # not just its declared depends_on. New subtasks can be spawned
+            # after the PR task was created (e.g. reviewer spawns fix tasks).
+            if st["agent_role"] == "pr_creator":
+                pr_repo = self._resolve_repo_name(st)
+                blocking = [
+                    s for s in sub_tasks
+                    if str(s["id"]) != str(st["id"])
+                    and s["agent_role"] != "pr_creator"
+                    and self._resolve_repo_name(s) == pr_repo
+                    and s["status"] in ("pending", "assigned", "running")
+                ]
+                if blocking:
+                    # Update depends_on to include the blockers
+                    blocker_ids = [str(b["id"]) for b in blocking]
+                    current_deps = set(str(d) for d in (st["depends_on"] or []))
+                    new_deps = current_deps | set(blocker_ids)
+                    if new_deps != current_deps:
+                        await self.ctx.db.execute(
+                            "UPDATE sub_tasks SET depends_on = $2 WHERE id = $1",
+                            st["id"], list(new_deps),
+                        )
+                    continue
+
             runnable.append(dict(st))
 
         return runnable, all_done, any_failed
+
+    @staticmethod
+    def _resolve_repo_name(st) -> str:
+        """Extract repo name from a subtask's target_repo field."""
+        tr = st.get("target_repo")
+        if isinstance(tr, str):
+            try:
+                tr = json.loads(tr)
+            except (json.JSONDecodeError, TypeError):
+                pass
+        if isinstance(tr, dict) and tr.get("name"):
+            return tr["name"]
+        if isinstance(tr, str) and tr:
+            return tr
+        return "main"
 
     async def _setup_workspace(self, todo: dict, project: dict | None = None) -> str | None:
         """Set up task workspace if project has a repo.
@@ -663,19 +702,50 @@ class TaskScheduler:
             self.todo_id,
         )
 
+        # Get ALL subtasks to check for pending/running work per repo
+        all_subtasks = await self.ctx.db.fetch(
+            "SELECT id, status, agent_role, target_repo FROM sub_tasks "
+            "WHERE todo_id = $1 AND agent_role != 'pr_creator'",
+            self.todo_id,
+        )
+
+        # Build a map of repo_name → list of incomplete subtask IDs
+        def _repo_name_of(st):
+            tr = st.get("target_repo")
+            if isinstance(tr, str):
+                try: tr = json.loads(tr)
+                except: pass
+            if isinstance(tr, dict) and tr.get("name"):
+                return tr["name"]
+            if isinstance(tr, str) and tr:
+                return tr
+            return "main"
+
         created = 0
         for repo_name, coders in by_repo.items():
-            # Check if workspace has actual changes
             ws = os.path.join(task_root, repo_name)
             if not os.path.isdir(ws):
                 continue
 
-            coder_ids = [str(st["id"]) for st in coders]
+            # Collect ALL subtask IDs for this repo that the PR should depend on
+            repo_dep_ids = []
+            has_incomplete = False
+            for st in all_subtasks:
+                if _repo_name_of(st) != repo_name:
+                    continue
+                st_id = str(st["id"])
+                if st["status"] in ("pending", "assigned", "running"):
+                    has_incomplete = True
+                    repo_dep_ids.append(st_id)
+                elif st["status"] == "completed":
+                    repo_dep_ids.append(st_id)
+
+            if not repo_dep_ids:
+                continue
 
             # Build target_repo JSON for dep repos
             target_repo_json = None
             if repo_name != "main":
-                # Get target_repo from the first coder that has it
                 for st in coders:
                     tr = st.get("target_repo")
                     if tr and isinstance(tr, dict):
@@ -683,6 +753,12 @@ class TaskScheduler:
                         break
 
             title = f"Create Pull Request — {repo_name}" if repo_name != "main" else "Create Pull Request"
+
+            if has_incomplete:
+                logger.info(
+                    "[%s] PR for %s: has incomplete subtasks, adding them as dependencies",
+                    self.todo_id, repo_name,
+                )
 
             await self.ctx.db.fetchrow(
                 """
@@ -697,7 +773,7 @@ class TaskScheduler:
                 title,
                 f"Commit changes, push to feature branch, and create PR for {repo_name} repo.",
                 max_order + 1,
-                coder_ids,
+                repo_dep_ids,
                 target_repo_json,
                 ws,
             )
