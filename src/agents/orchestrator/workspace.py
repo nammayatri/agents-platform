@@ -145,11 +145,15 @@ class WorkspaceManager:
         if dep_tasks:
             await asyncio.gather(*dep_tasks, return_exceptions=True)
 
-        await self.db.execute(
-            "UPDATE projects SET workspace_path = $2, updated_at = NOW() WHERE id = $1",
-            project_id,
-            project_dir,
-        )
+        # Only persist workspace_path from the control plane (backend-0).
+        # Worker pods use ephemeral PVCs — don't overwrite the shared DB path.
+        from agents.config.settings import settings as _settings
+        if not _settings.task_pod_mode:
+            await self.db.execute(
+                "UPDATE projects SET workspace_path = $2, updated_at = NOW() WHERE id = $1",
+                project_id,
+                project_dir,
+            )
 
         return project_dir
 

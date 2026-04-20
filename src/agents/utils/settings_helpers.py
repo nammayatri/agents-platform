@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 
 # Sections that the new PUT /settings/{section} endpoint accepts
 VALID_SECTIONS = frozenset({
-    "planning", "execution", "git", "debugging", "release",
+    "planning", "execution", "git", "debugging", "release", "worker",
 })
 
 

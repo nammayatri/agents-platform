@@ -155,6 +155,15 @@ async def get_todo(todo_id: str, user: CurrentUser, db: DB):
             result["provider_model"] = prov["default_model"]
             result["provider_type"] = prov["provider_type"]
 
+    # Attach task pod info if exists
+    pod_row = await db.fetchrow(
+        "SELECT pod_name, pvc_name, namespace, pod_ip, state, image, "
+        "pvc_size_gb, error_message, created_at, started_at, stopped_at "
+        "FROM task_pods WHERE todo_id = $1",
+        todo_id,
+    )
+    result["task_pod"] = dict(pod_row) if pod_row else None
+
     return result
 
 

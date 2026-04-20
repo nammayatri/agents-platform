@@ -42,6 +42,9 @@ dependencies = [
     # Web search (DuckDuckGo, zero-cost, no API key)
     "duckduckgo-search>=7.0.0",
 
+    # Kubernetes client (for per-task pod spawning)
+    "kubernetes>=31.0.0",
+
     # Utilities
     "python-multipart>=0.0.18",
 

@@ -25,6 +25,7 @@ import ProjectReleaseTab from '../components/project/ProjectReleaseTab'
 import ProjectMergePipelineTab from '../components/project/ProjectMergePipelineTab'
 import ProjectPlanningTab from '../components/project/ProjectPlanningTab'
 import ProjectSettingsJsonEditor from '../components/project/ProjectSettingsJsonEditor'
+import ProjectWorkerTab from '../components/project/ProjectWorkerTab'
 
 interface ProjectUnderstanding {
   summary?: string
@@ -86,6 +87,13 @@ const sidebarGroups: SidebarGroup[] = [
       { key: 'dependencies', label: 'Dependencies', Icon: LinkIcon },
       { key: 'understanding', label: 'Understanding', Icon: Brain },
       { key: 'debugging', label: 'Debugging', Icon: Bug },
+    ],
+  },
+  {
+    label: 'Infrastructure',
+    Icon: SettingsIcon,
+    items: [
+      { key: 'worker', label: 'Worker Pods', Icon: SettingsIcon },
     ],
   },
   {
@@ -614,6 +622,13 @@ export default function ProjectSettingsPage() {
                   disabledProviderIds={disabledProviderIds} setDisabledProviderIds={setDisabledProviderIds}
                   disabledSkillIds={disabledSkillIds} setDisabledSkillIds={setDisabledSkillIds}
                   disabledMcpIds={disabledMcpIds} setDisabledMcpIds={setDisabledMcpIds}
+                />
+              )}
+
+              {activeSection === 'worker' && (
+                <ProjectWorkerTab
+                  projectId={projectId!}
+                  setError={setError}
                 />
               )}
 

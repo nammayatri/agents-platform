@@ -656,10 +656,10 @@ class TaskScheduler:
         if not task_root:
             return False
 
-        # Skip if pr_creator tasks already exist
+        # Skip if pr_creator tasks already exist (pending/running OR completed)
         existing_pr_task = await self.ctx.db.fetchrow(
-            "SELECT id FROM sub_tasks WHERE todo_id = $1 AND agent_role = 'pr_creator' "
-            "AND status IN ('pending', 'assigned', 'running')",
+            "SELECT id, status FROM sub_tasks WHERE todo_id = $1 AND agent_role = 'pr_creator' "
+            "AND status IN ('pending', 'assigned', 'running', 'completed')",
             self.todo_id,
         )
         if existing_pr_task:
@@ -690,12 +690,12 @@ class TaskScheduler:
                 repo_name = target
             by_repo.setdefault(repo_name, []).append(dict(st))
 
-        # Check which repos already have PRs
+        # Check which repos already have PRs — skip those
         existing_prs = await self.ctx.db.fetch(
-            "SELECT branch_name FROM deliverables WHERE todo_id = $1 AND type = 'pull_request'",
+            "SELECT target_repo_name FROM deliverables WHERE todo_id = $1 AND type = 'pull_request'",
             self.todo_id,
         )
-        existing_branches = {r["branch_name"] for r in existing_prs if r.get("branch_name")}
+        repos_with_prs = {r["target_repo_name"] or "main" for r in existing_prs}
 
         max_order = await self.ctx.db.fetchval(
             "SELECT COALESCE(MAX(execution_order), 0) FROM sub_tasks WHERE todo_id = $1",
@@ -723,6 +723,9 @@ class TaskScheduler:
 
         created = 0
         for repo_name, coders in by_repo.items():
+            if repo_name in repos_with_prs:
+                logger.info("[%s] Skipping PR for %s — already exists", self.todo_id, repo_name)
+                continue
             ws = os.path.join(task_root, repo_name)
             if not os.path.isdir(ws):
                 continue

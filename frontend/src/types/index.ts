@@ -111,6 +111,19 @@ export interface Project {
     index_metadata?: IndexMetadata
     release_pipeline_enabled?: boolean
     release_config?: ReleaseConfig
+    worker?: {
+      image?: string
+      pvc_size_gb?: number
+      boot_script?: string
+      node_type?: string
+      resources?: {
+        cpu_request?: string
+        memory_request?: string
+        cpu_limit?: string
+        memory_limit?: string
+      }
+      pod_spec_override?: Record<string, unknown>
+    }
   }
   created_at: string
   updated_at: string
@@ -241,6 +254,22 @@ export interface TodoItem {
   provider_name?: string
   provider_model?: string
   provider_type?: string
+  // Task pod info (per-task K8s pod)
+  task_pod?: TaskPod | null
+}
+
+export interface TaskPod {
+  pod_name: string
+  pvc_name: string
+  namespace: string
+  pod_ip?: string
+  state: 'creating' | 'running' | 'stopping' | 'terminated' | 'failed'
+  image: string
+  pvc_size_gb: number
+  error_message?: string
+  created_at: string
+  started_at?: string
+  stopped_at?: string
 }
 
 export interface ChatMessage {

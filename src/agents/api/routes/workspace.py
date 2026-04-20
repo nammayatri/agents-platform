@@ -3,15 +3,21 @@
 Extracted from todos.py to keep route modules focused.
 Resolves the task workspace at {project_workspace}/tasks/{todo_id}/{repo_name}/
 where repo_name is 'main' or the dependency name.
+
+When a task has a running pod (task_pods table), workspace requests are proxied
+to that pod's API server so the response reflects the pod's local PVC filesystem.
 """
 
 import json
+import logging
 import os
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi.responses import Response
 from pydantic import BaseModel
 
 from agents.api.deps import DB, CurrentUser, EventBusDep, Redis, check_project_access
+from agents.config.settings import settings
 from agents.orchestrator.state_machine import transition_subtask
 from agents.utils.file_utils import (
     MAX_FILE_SIZE,
@@ -22,10 +28,69 @@ from agents.utils.file_utils import (
 )
 from agents.utils.git_utils import ensure_authenticated_remote, run_git_command
 
+_logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
 # ── Helpers ──────────────────────────────────────────────────────────
+
+
+async def _get_task_pod_url(db, todo_id: str) -> str | None:
+    """Return the base URL of the task's worker pod, or None if not running."""
+    if settings.task_pod_mode:
+        return None  # We ARE the worker pod, don't proxy to self
+    row = await db.fetchrow(
+        "SELECT pod_ip, pod_port FROM task_pods "
+        "WHERE todo_id = $1 AND state = 'running' AND pod_ip IS NOT NULL",
+        todo_id,
+    )
+    if row and row["pod_ip"]:
+        port = row["pod_port"] or 8000
+        return f"http://{row['pod_ip']}:{port}"
+    return None
+
+
+async def _proxy_to_pod(pod_url: str, request: Request) -> Response:
+    """Forward an HTTP request to the task pod and return its response."""
+    import httpx
+
+    target = f"{pod_url}{request.url.path}"
+    if request.url.query:
+        target += f"?{request.url.query}"
+
+    body = await request.body()
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.request(
+            method=request.method,
+            url=target,
+            headers={
+                k: v for k, v in request.headers.items()
+                if k.lower() not in ("host", "connection")
+            },
+            content=body if body else None,
+        )
+    return Response(
+        content=resp.content,
+        status_code=resp.status_code,
+        headers=dict(resp.headers),
+    )
+
+
+async def _maybe_proxy_workspace(todo_id: str, db, request: Request) -> Response | None:
+    """Check if this workspace request should be proxied to a task pod.
+
+    Returns a Response if proxied, or None to handle locally.
+    """
+    if not settings.k8s_spawn_pods or settings.task_pod_mode:
+        return None
+    pod_url = await _get_task_pod_url(db, todo_id)
+    if not pod_url:
+        return None
+    try:
+        return await _proxy_to_pod(pod_url, request)
+    except Exception as e:
+        _logger.warning("Pod proxy failed for %s: %s (falling back to local)", todo_id[:8], e)
+        return None
 
 
 async def _resolve_task_repo(
@@ -42,14 +107,21 @@ async def _resolve_task_repo(
     if not todo:
         raise HTTPException(status_code=404, detail="Task not found")
     await check_project_access(db, str(todo["project_id"]), user)
-    project = await db.fetchrow(
-        "SELECT workspace_path FROM projects WHERE id = $1",
-        str(todo["project_id"]),
-    )
-    if not project or not project.get("workspace_path"):
-        raise HTTPException(status_code=404, detail="No workspace configured")
 
-    task_dir = os.path.join(str(project["workspace_path"]), "tasks", todo_id)
+    # On worker pods, use local workspace root (PVC mount) instead of DB path
+    if settings.task_pod_mode:
+        project_id = str(todo["project_id"])
+        project_ws = os.path.join(settings.workspace_root, project_id)
+    else:
+        project = await db.fetchrow(
+            "SELECT workspace_path FROM projects WHERE id = $1",
+            str(todo["project_id"]),
+        )
+        if not project or not project.get("workspace_path"):
+            raise HTTPException(status_code=404, detail="No workspace configured")
+        project_ws = str(project["workspace_path"])
+
+    task_dir = os.path.join(project_ws, "tasks", todo_id)
     repo_name = repo or "main"
     if repo_name != "main":
         repo_name = repo_name.replace("/", "_").replace(" ", "_")
@@ -69,20 +141,28 @@ def _raise_path_error(msg: str) -> None:
 
 
 @router.get("/todos/{todo_id}/workspace/repos")
-async def workspace_repos(todo_id: str, user: CurrentUser, db: DB):
+async def workspace_repos(todo_id: str, user: CurrentUser, db: DB, request: Request):
     """List available repos (main + dependency workspaces) for a task."""
+    proxied = await _maybe_proxy_workspace(todo_id, db, request)
+    if proxied:
+        return proxied
     todo = await db.fetchrow("SELECT * FROM todo_items WHERE id = $1", todo_id)
     if not todo:
         raise HTTPException(status_code=404, detail="Task not found")
     await check_project_access(db, str(todo["project_id"]), user)
-    project = await db.fetchrow(
-        "SELECT workspace_path FROM projects WHERE id = $1",
-        str(todo["project_id"]),
-    )
-    if not project or not project.get("workspace_path"):
-        raise HTTPException(status_code=404, detail="No workspace configured")
 
-    task_dir = os.path.join(str(project["workspace_path"]), "tasks", todo_id)
+    if settings.task_pod_mode:
+        project_ws = os.path.join(settings.workspace_root, str(todo["project_id"]))
+    else:
+        project = await db.fetchrow(
+            "SELECT workspace_path FROM projects WHERE id = $1",
+            str(todo["project_id"]),
+        )
+        if not project or not project.get("workspace_path"):
+            raise HTTPException(status_code=404, detail="No workspace configured")
+        project_ws = str(project["workspace_path"])
+
+    task_dir = os.path.join(project_ws, "tasks", todo_id)
     repos = []
     _skip = {"deps", ".context", "indexes"}
 
@@ -107,10 +187,13 @@ async def workspace_repos(todo_id: str, user: CurrentUser, db: DB):
 
 @router.get("/todos/{todo_id}/workspace/tree")
 async def workspace_tree(
-    todo_id: str, user: CurrentUser, db: DB,
+    todo_id: str, user: CurrentUser, db: DB, request: Request,
     repo: str = Query(None, description="Repo name: 'main' or dependency name"),
 ):
     """Get the file tree for a task workspace."""
+    proxied = await _maybe_proxy_workspace(todo_id, db, request)
+    if proxied:
+        return proxied
     repo_dir, _ = await _resolve_task_repo(todo_id, user, db, repo=repo)
     tree = build_file_tree(repo_dir, repo_dir)
     return tree
@@ -118,11 +201,14 @@ async def workspace_tree(
 
 @router.get("/todos/{todo_id}/workspace/file")
 async def workspace_read_file(
-    todo_id: str, user: CurrentUser, db: DB,
+    todo_id: str, user: CurrentUser, db: DB, request: Request,
     path: str = Query(..., description="Relative file path"),
     repo: str = Query(None, description="Repo name: 'main' or dependency name"),
 ):
     """Read a file from the task workspace."""
+    proxied = await _maybe_proxy_workspace(todo_id, db, request)
+    if proxied:
+        return proxied
     repo_dir, _ = await _resolve_task_repo(todo_id, user, db, repo=repo)
     try:
         full_path = validate_workspace_path(repo_dir, path)
@@ -169,8 +255,11 @@ class SaveFileInput(BaseModel):
 
 
 @router.put("/todos/{todo_id}/workspace/file")
-async def workspace_save_file(todo_id: str, body: SaveFileInput, user: CurrentUser, db: DB):
+async def workspace_save_file(todo_id: str, body: SaveFileInput, user: CurrentUser, db: DB, request: Request):
     """Save a file to the task workspace."""
+    proxied = await _maybe_proxy_workspace(todo_id, db, request)
+    if proxied:
+        return proxied
     repo_dir, _ = await _resolve_task_repo(todo_id, user, db, repo=body.repo)
     try:
         full_path = validate_workspace_path(repo_dir, body.path)
@@ -197,10 +286,13 @@ async def workspace_save_file(todo_id: str, body: SaveFileInput, user: CurrentUs
 
 @router.get("/todos/{todo_id}/workspace/git/status")
 async def workspace_git_status(
-    todo_id: str, user: CurrentUser, db: DB,
+    todo_id: str, user: CurrentUser, db: DB, request: Request,
     repo: str = Query(None, description="Repo name: 'main' or dependency name"),
 ):
     """Get git status for the task workspace."""
+    proxied = await _maybe_proxy_workspace(todo_id, db, request)
+    if proxied:
+        return proxied
     repo_dir, _ = await _resolve_task_repo(todo_id, user, db, repo=repo)
 
     rc, branch = await run_git_command("rev-parse", "--abbrev-ref", "HEAD", cwd=repo_dir)
@@ -299,7 +391,7 @@ async def workspace_git_diff(
 
 @router.get("/todos/{todo_id}/workspace/git/task-diff")
 async def workspace_task_diff(
-    todo_id: str, user: CurrentUser, db: DB,
+    todo_id: str, user: CurrentUser, db: DB, request: Request,
     repo: str = Query(None, description="Repo name: 'main' or dependency name"),
 ):
     """Get the overall diff for the entire task (base_commit..HEAD).
@@ -307,6 +399,9 @@ async def workspace_task_diff(
     Returns the cumulative diff of all coder subtask work since the task
     branch was created. Only available after at least one coder has committed.
     """
+    proxied = await _maybe_proxy_workspace(todo_id, db, request)
+    if proxied:
+        return proxied
     repo_dir, _ = await _resolve_task_repo(todo_id, user, db, repo=repo)
 
     todo = await db.fetchrow(
