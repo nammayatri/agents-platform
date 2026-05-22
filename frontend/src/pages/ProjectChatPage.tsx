@@ -291,7 +291,7 @@ export default function ProjectChatPage() {
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null)
   const [messages, setMessages] = useState<ProjectChatMessage[]>([])
   const [input, setInput] = useState('')
-  const [sending, setSending] = useState(false)
+  const [sendingSessionId, setSendingSessionId] = useState<string | null>(null)
   const [showModeDropdown, setShowModeDropdown] = useState(false)
   const [showSidebar, setShowSidebar] = useState(true)
   const [creatingSession, setCreatingSession] = useState(false)
@@ -301,6 +301,8 @@ export default function ProjectChatPage() {
   const inputRef = useRef<HTMLTextAreaElement>(null)
   const deletedSessionIdsRef = useRef<Set<string>>(new Set())
   const activeSessionIdRef = useRef<string | null>(activeSessionId)
+  // Per-session sending: only blocks the session that initiated the send
+  const sending = sendingSessionId != null && sendingSessionId === activeSessionId
   const { activity, activityLog, streamingText, completedStreaming, isStreaming, clearActivity, resetStreaming, incomingMessage, clearIncomingMessage } = useChatSessionWebSocket(activeSessionId)
   const [deleteDialog, setDeleteDialog] = useState<{
     sessionId: string
@@ -577,7 +579,7 @@ export default function ProjectChatPage() {
     if (!content || !projectId || sending) return
     if (!overrideContent) setInput('')
     resetStreaming()
-    setSending(true)
+    setSendingSessionId(activeSessionIdRef.current)
 
     const tempUserMsg: ProjectChatMessage = {
       id: `temp-${Date.now()}`,
@@ -605,6 +607,7 @@ export default function ProjectChatPage() {
           setSessions((prev) => [session, ...prev])
           setActiveSessionId(boundSessionId)
           activeSessionIdRef.current = boundSessionId
+          setSendingSessionId(boundSessionId)
         } finally {
           setCreatingSession(false)
         }
@@ -683,7 +686,7 @@ export default function ProjectChatPage() {
       }
       setMessages((prev) => [...prev, errorMsg])
     } finally {
-      setSending(false)
+      setSendingSessionId(null)
       setShowFeedbackFor(null)
       setFeedbackInput('')
       clearActivity()
@@ -693,7 +696,7 @@ export default function ProjectChatPage() {
 
   const handleAcceptPlan = async () => {
     if (!projectId || !activeSessionId || sending) return
-    setSending(true)
+    setSendingSessionId(activeSessionId)
     try {
       const result = await projectChat.sessions.acceptPlan(projectId, activeSessionId)
       setMessages((prev) => [...prev, result.user_message, result.assistant_message])
@@ -713,13 +716,13 @@ export default function ProjectChatPage() {
       }
       setMessages((prev) => [...prev, errorMsg])
     } finally {
-      setSending(false)
+      setSendingSessionId(null)
     }
   }
 
   const handleApproveTaskPlan = async () => {
     if (!projectId || !activeSessionId || sending) return
-    setSending(true)
+    setSendingSessionId(activeSessionId)
     try {
       const result = await projectChat.sessions.acceptTaskPlan(projectId, activeSessionId)
       setMessages((prev) => [...prev, result.user_message, result.assistant_message])
@@ -747,7 +750,7 @@ export default function ProjectChatPage() {
       }
       setMessages((prev) => [...prev, errorMsg])
     } finally {
-      setSending(false)
+      setSendingSessionId(null)
     }
   }
 
@@ -778,7 +781,7 @@ export default function ProjectChatPage() {
 
   const handleDiscardTaskPlan = async (feedback: string) => {
     if (sending || !feedback.trim() || !projectId || !activeSessionId) return
-    setSending(true)
+    setSendingSessionId(activeSessionId)
     try {
       await projectChat.sessions.discardTaskPlan(projectId, activeSessionId, feedback.trim())
       const discardMsg: ProjectChatMessage = {
@@ -807,7 +810,7 @@ export default function ProjectChatPage() {
       }
       setMessages((prev) => [...prev, errorMsg])
     } finally {
-      setSending(false)
+      setSendingSessionId(null)
       setTaskPlanFeedbackFor(null)
       setTaskPlanFeedback('')
     }
