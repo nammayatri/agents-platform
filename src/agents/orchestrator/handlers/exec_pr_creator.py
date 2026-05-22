@@ -2,12 +2,55 @@
 
 from __future__ import annotations
 
-import json
 import logging
 
 from agents.orchestrator.handlers._base import HandlerContext
+from agents.utils.repo_utils import parse_target_repo, repo_name_of, repo_name_of
 
 logger = logging.getLogger(__name__)
+
+
+async def _verify_pr_preconditions(ctx: HandlerContext, sub_task: dict) -> None:
+    """Hard gate: verify ALL non-PR subtasks for this repo are complete before creating PR.
+
+    This is a deterministic check — no AI involvement. If preconditions aren't met,
+    raises ValueError to fail the subtask immediately.
+    """
+    target_repo_name = repo_name_of(sub_task)
+
+    # Fetch all sibling subtasks for the same todo
+    all_subtasks = await ctx.db.fetch(
+        "SELECT id, status, agent_role, target_repo FROM sub_tasks WHERE todo_id = $1",
+        ctx.todo_id,
+    )
+
+    incomplete = []
+    for st in all_subtasks:
+        if str(st["id"]) == str(sub_task["id"]):
+            continue
+        if st["agent_role"] in ("pr_creator", "merge_agent", "merge_observer"):
+            continue
+        if repo_name_of(st) != target_repo_name:
+            continue
+        if st["status"] not in ("completed", "cancelled"):
+            incomplete.append(f"{st['agent_role']}:{str(st['id'])[:8]} ({st['status']})")
+
+    if incomplete:
+        raise ValueError(
+            f"PR precondition failed: {len(incomplete)} incomplete subtask(s) for repo "
+            f"'{target_repo_name}': {', '.join(incomplete[:5])}"
+        )
+
+    # Idempotency: check if a PR already exists for this branch
+    short_id = str(ctx.todo_id)[:8]
+    expected_branch = f"task/{short_id}" if target_repo_name == "main" else f"task/{short_id}-{target_repo_name}"
+    existing = await ctx.db.fetchrow(
+        "SELECT pr_url FROM deliverables "
+        "WHERE todo_id = $1 AND type = 'pull_request' AND branch_name = $2",
+        ctx.todo_id, expected_branch,
+    )
+    if existing:
+        logger.info("[%s] PR already exists for branch %s: %s", ctx.todo_id, expected_branch, existing["pr_url"])
 
 
 async def execute_pr_creator(
@@ -33,6 +76,9 @@ async def execute_pr_creator(
     )
 
     try:
+        # ── Deterministic pre-conditions (MUST pass before any work) ──
+        await _verify_pr_preconditions(ctx, sub_task)
+
         if not workspace_path:
             raise ValueError("No workspace path available for PR creation")
 
@@ -125,9 +171,7 @@ async def execute_pr_creator(
         if coder_st:
             all_coder_ids.append(str(coder_st["id"]))
 
-        target_repo_json = sub_task.get("target_repo")
-        if isinstance(target_repo_json, str):
-            target_repo_json = json.loads(target_repo_json)
+        target_repo_json = parse_target_repo(sub_task.get("target_repo"))
 
         max_order = await ctx.db.fetchval(
             "SELECT COALESCE(MAX(execution_order), 0) FROM sub_tasks WHERE todo_id = $1",

@@ -1,8 +1,63 @@
-"""Shared utilities for resolving target_repo references against project context_docs."""
+"""Shared utilities for resolving target_repo references against project context_docs.
 
+Canonical helpers for target_repo parsing and repo name extraction.
+All orchestrator code should use these instead of inline json.loads / isinstance checks.
+"""
+
+from __future__ import annotations
+
+import json
 import logging
 
 logger = logging.getLogger(__name__)
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Canonical target_repo parsing
+# ──────────────────────────────────────────────────────────────────────
+
+def parse_target_repo(raw) -> dict | None:
+    """Parse a target_repo field into a dict (or None).
+
+    Handles: None, "", dict, JSON string, plain string name.
+    This is the ONE place that normalizes target_repo from the DB.
+    """
+    if raw is None:
+        return None
+    if isinstance(raw, dict):
+        return raw if raw else None
+    if isinstance(raw, str):
+        if not raw:
+            return None
+        try:
+            parsed = json.loads(raw)
+            return parsed if isinstance(parsed, dict) else None
+        except (json.JSONDecodeError, TypeError):
+            # Plain string name like "my-dep" — wrap it
+            return {"name": raw} if raw.strip() else None
+    return None
+
+
+def repo_name_of(subtask_or_target_repo) -> str:
+    """Extract the repo name from a subtask dict or a raw target_repo value.
+
+    Returns "main" for the main repo, or the dependency name otherwise.
+    This is the ONE canonical repo name resolver.
+    """
+    # Accept either a subtask row (has "target_repo" key) or a raw value
+    if isinstance(subtask_or_target_repo, dict) and "id" in subtask_or_target_repo:
+        raw = subtask_or_target_repo.get("target_repo")
+    else:
+        raw = subtask_or_target_repo
+
+    parsed = parse_target_repo(raw)
+    if not parsed:
+        return "main"
+
+    name = parsed.get("name", "")
+    if isinstance(name, str) and name.strip():
+        return name.strip()
+    return "main"
 
 
 def resolve_target_repo(

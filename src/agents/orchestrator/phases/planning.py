@@ -16,7 +16,7 @@ from agents.schemas.agent import LLMMessage
 from agents.utils.json_helpers import parse_llm_json, safe_json
 
 if TYPE_CHECKING:
-    from agents.orchestrator.coordinator import AgentCoordinator
+    pass  # coord is duck-typed (_CoordinatorAdapter or compatible)
     from agents.providers.base import AIProvider
 
 logger = logging.getLogger(__name__)
@@ -34,13 +34,14 @@ Think like an architect who owns the system. Before touching anything:
 
 ## Workflow
 
-### Phase 1: Understand
+### Phase 1: Understand (FAST — 2-5 tool calls max)
 You are given Project Knowledge below (architecture, patterns, deps, build workflow). \
 READ IT FIRST — it already answers most architectural questions. Only use tools for \
-targeted verification:
-1. Use search_files to find the specific files related to this task
-2. Read 2-3 key files to understand the current code that needs to change
+targeted verification of SPECIFIC files you need to reference in the plan:
+1. Search for the 1-2 specific files related to this task
+2. Read those files to get exact line numbers and function signatures
 3. Do NOT broadly explore — the project knowledge section has the architecture
+4. NEVER explore more than 5 files total — be surgical, not exhaustive
 
 CRITICAL: Every file path you reference in your plan MUST be one you actually read or \
 found via tools. NEVER guess or hallucinate file paths. If you're unsure where something \
@@ -154,7 +155,7 @@ Rules:
 class PlanningPhase:
     """Explore codebase with tools, then decompose task into sub-tasks."""
 
-    def __init__(self, coord: AgentCoordinator) -> None:
+    def __init__(self, coord) -> None:
         self._coord = coord
 
     # ------------------------------------------------------------------
@@ -366,11 +367,20 @@ class PlanningPhase:
         else:
             intake_for_prompt = intake_data
 
-        user_parts.append(f"\nIntake data: {json.dumps(intake_for_prompt, default=str)}")
-        user_parts.append(f"Project context: {json.dumps(context, default=str)}")
+        if intake_for_prompt:
+            # Only include intake data if it has meaningful content beyond defaults
+            useful_intake = {k: v for k, v in intake_for_prompt.items() if v and k not in ("ready",)}
+            if useful_intake:
+                user_parts.append(f"\nIntake data: {json.dumps(useful_intake, default=str)}")
+
+        # NOTE: project context is already injected into the system prompt (project knowledge,
+        # architecture, dependencies, file tree). Do NOT dump it again here — it was causing
+        # massive context bloat and duplicate information that confused the planner.
+
         user_parts.append(
-            "\nExplore the codebase first, then output your execution plan as a JSON object. "
-            "The JSON must be the LAST thing you output — after all tool calls and exploration."
+            "\nProduce your execution plan. Use tools ONLY for targeted file verification "
+            "(2-5 lookups max) — the project knowledge in the system prompt already has the architecture. "
+            "Call submit_result with your plan when ready."
         )
 
         messages = [
@@ -481,7 +491,7 @@ class PlanningPhase:
                     provider, messages,
                     tools=tools_with_submit,
                     tool_executor=_plan_tool_exec,
-                    max_rounds=500,
+                    max_rounds=20,
                     on_activity=lambda msg: coord._report_planning_activity(msg),
                     on_tool_event=_plan_tool_event,
                     on_cancel_check=coord._is_cancelled,
@@ -618,77 +628,34 @@ class PlanningPhase:
                 )
                 raise ValueError("Failed to parse execution plan from LLM after retries")
 
-        # ── Plan review loop: LLM validates quality before proceeding ──
+        # ── Single-shot plan review (no iterative re-planning) ──
+        # The planner already has full project knowledge. A single review check
+        # is enough to catch obvious issues. Iterative re-planning was burning
+        # 2x more LLM calls with diminishing returns.
         task_context = (
             f"Task: {todo['title']}\n"
             f"Description: {todo['description'] or 'N/A'}\n"
             f"Type: {todo['task_type']}"
         )
-        max_review_iterations = 2
-        for review_iter in range(max_review_iterations + 1):
-            review = await self.review_plan(
-                plan, task_context, provider,
-                context=context, workspace_path=workspace_path,
+        review = await self.review_plan(
+            plan, task_context, provider,
+            context=context, workspace_path=workspace_path,
+        )
+        review_metadata = {
+            "action": "plan_review_verdict",
+            "task_id": coord.todo_id,
+            "approved": review["approved"],
+            "feedback": review.get("feedback", ""),
+        }
+        if not review["approved"]:
+            logger.warning(
+                "[%s] Plan review rejected but proceeding (feedback: %s)",
+                coord.todo_id, review.get("feedback", "")[:200],
             )
-
-            review_metadata = {
-                "action": "plan_review_verdict",
-                "task_id": coord.todo_id,
-                "approved": review["approved"],
-                "feedback": review.get("feedback", ""),
-                "iteration": review_iter + 1,
-            }
-
-            if review["approved"]:
-                logger.info("[%s] Plan review approved (iteration %d)", coord.todo_id, review_iter)
-                await coord._post_system_message(
-                    f"**Plan review:** Approved",
-                    metadata=review_metadata,
-                )
-                break
-
-            if review_iter == max_review_iterations:
-                logger.warning(
-                    "[%s] Plan review: max iterations (%d) reached, proceeding with current plan",
-                    coord.todo_id, max_review_iterations,
-                )
-                await coord._post_system_message(
-                    f"**Plan review:** Max revisions reached, proceeding with current plan.",
-                    metadata=review_metadata,
-                )
-                break
-
-            feedback = review.get("feedback", "Plan needs improvement.")
-            await coord._post_system_message(
-                f"**Plan review (iteration {review_iter + 1}):** Revising plan...\n\n{feedback}",
-                metadata=review_metadata,
-            )
-            previous_plan = plan
-            plan = await self.re_plan_with_feedback(
-                plan, feedback, provider, todo, context,
-                workspace_path=workspace_path,
-                planner_tools=planner_tools,
-                planner_system_prompt=planner_prompt,
-            )
-
-            # Detect when re-plan failed and returned the same plan unchanged
-            prev_titles = {st.get("title") for st in previous_plan.get("sub_tasks", [])}
-            new_titles = {st.get("title") for st in plan.get("sub_tasks", [])}
-            if prev_titles == new_titles and len(prev_titles) == len(plan.get("sub_tasks", [])):
-                logger.warning(
-                    "[%s] Re-plan returned identical plan (re-plan extraction likely failed), stopping review loop",
-                    coord.todo_id,
-                )
-                await coord._post_system_message(
-                    f"**Plan review:** Re-plan could not produce a revised plan. Proceeding with current plan.",
-                    metadata={**review_metadata, "replan_failed": True},
-                )
-                break
-
-            await coord.db.execute(
-                "UPDATE todo_items SET plan_json = $2, updated_at = NOW() WHERE id = $1",
-                coord.todo_id, plan,
-            )
+        await coord._post_system_message(
+            f"**Plan review:** {'Approved' if review['approved'] else 'Proceeding with plan'}",
+            metadata=review_metadata,
+        )
 
         # Store final plan
         await coord.db.execute(
@@ -1046,7 +1013,7 @@ class PlanningPhase:
                     provider, messages,
                     tools=tools_for_replan,
                     tool_executor=_replan_tool_exec,
-                    max_rounds=500,
+                    max_rounds=10,
                     on_activity=lambda msg: coord._report_planning_activity(msg),
                     on_cancel_check=coord._is_cancelled,
                     on_token=_replan_token_cb,

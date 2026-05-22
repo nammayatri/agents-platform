@@ -6,8 +6,48 @@ import json
 import logging
 
 from agents.orchestrator.handlers._base import HandlerContext
+from agents.utils.repo_utils import parse_target_repo, repo_name_of
 
 logger = logging.getLogger(__name__)
+
+
+async def _verify_merge_preconditions(ctx: HandlerContext, sub_task: dict) -> None:
+    """Hard gate: verify ALL non-merge subtasks for this repo are complete before merging.
+
+    Deterministic check — no AI involvement. Fails fast if preconditions aren't met.
+    """
+    target_repo_name = repo_name_of(sub_task)
+
+    all_subtasks = await ctx.db.fetch(
+        "SELECT id, status, agent_role, target_repo FROM sub_tasks WHERE todo_id = $1",
+        ctx.todo_id,
+    )
+
+    incomplete = []
+    for st in all_subtasks:
+        if str(st["id"]) == str(sub_task["id"]):
+            continue
+        if st["agent_role"] in ("merge_agent", "merge_observer", "release_build_watcher", "release_deployer"):
+            continue
+        if repo_name_of(st) != target_repo_name:
+            continue
+        if st["status"] not in ("completed", "cancelled"):
+            incomplete.append(f"{st['agent_role']}:{str(st['id'])[:8]} ({st['status']})")
+
+    if incomplete:
+        raise ValueError(
+            f"Merge precondition failed: {len(incomplete)} incomplete subtask(s) for repo "
+            f"'{target_repo_name}': {', '.join(incomplete[:5])}"
+        )
+
+    # Verify a PR deliverable exists
+    pr_exists = await ctx.db.fetchval(
+        "SELECT 1 FROM deliverables WHERE todo_id = $1 AND type = 'pull_request' "
+        "AND pr_number IS NOT NULL",
+        ctx.todo_id,
+    )
+    if not pr_exists:
+        raise ValueError("Merge precondition failed: no PR deliverable found")
 
 
 async def _verify_merge_authorization(ctx: HandlerContext, pr_number: int) -> None:
@@ -61,6 +101,9 @@ async def execute_merge_agent(
     )
 
     try:
+        # ── Deterministic pre-conditions (MUST pass before any work) ──
+        await _verify_merge_preconditions(ctx, sub_task)
+
         todo = await ctx.load_todo()
         project = await ctx.db.fetchrow(
             "SELECT * FROM projects WHERE id = $1", todo["project_id"]
@@ -69,9 +112,7 @@ async def execute_merge_agent(
             raise ValueError("No repo configured for merge")
 
         # Resolve target_repo to filter the correct PR deliverable
-        target_repo = sub_task.get("target_repo")
-        if isinstance(target_repo, str):
-            target_repo = json.loads(target_repo)
+        target_repo = parse_target_repo(sub_task.get("target_repo"))
         target_repo_name = target_repo.get("name") if target_repo else None
 
         if target_repo_name:

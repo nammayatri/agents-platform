@@ -68,7 +68,10 @@ export function useChatSessionWebSocket(sessionId: string | null) {
   const completedStreamingRef = useRef('')
   // Track the active session ID so onmessage handlers from stale connections
   // can detect they belong to a previous session and discard events.
+  // Updated synchronously during render (not in an effect) so the guard
+  // is always current before any WS events can fire between paint and effects.
   const activeSessionRef = useRef(sessionId)
+  activeSessionRef.current = sessionId
 
   const clearActivity = useCallback(() => {
     setActivity(null)
@@ -101,7 +104,6 @@ export function useChatSessionWebSocket(sessionId: string | null) {
   // Reset all state when the session changes (prevents cross-session leakage)
   // Then restore any persisted data for the new session.
   useEffect(() => {
-    activeSessionRef.current = sessionId
     setActivity(null)
     setStreamingText('')
     setIsStreaming(false)

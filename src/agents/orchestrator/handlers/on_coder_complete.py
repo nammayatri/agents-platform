@@ -26,9 +26,8 @@ async def handle_coder_completion(
     """Coder completed -> create a reviewer subtask with diff context."""
     chain_id = sub_task.get("review_chain_id") or sub_task["id"]
 
-    target_repo_json = sub_task.get("target_repo")
-    if isinstance(target_repo_json, str):
-        target_repo_json = json.loads(target_repo_json)
+    from agents.utils.repo_utils import parse_target_repo
+    target_repo_json = parse_target_repo(sub_task.get("target_repo"))
 
     # ── handle ──
     # Build the reviewer description: capture git diff, coder output, etc.

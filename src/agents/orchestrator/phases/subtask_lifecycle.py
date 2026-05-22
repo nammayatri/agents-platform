@@ -21,7 +21,7 @@ from agents.orchestrator.handlers._shared import (
 )
 
 if TYPE_CHECKING:
-    from agents.orchestrator.coordinator import AgentCoordinator
+    pass  # coord is duck-typed (_CoordinatorAdapter or compatible)
     from agents.providers.base import AIProvider
 
 logger = logging.getLogger(__name__)
@@ -30,7 +30,7 @@ logger = logging.getLogger(__name__)
 class SubtaskLifecycle:
     """Thin facade — all handler logic lives in handlers/."""
 
-    def __init__(self, coord: AgentCoordinator) -> None:
+    def __init__(self, coord) -> None:
         self._coord = coord
 
     def _ctx(self) -> HandlerContext:

@@ -12,7 +12,7 @@ from agents.schemas.agent import LLMMessage
 from agents.utils.json_helpers import parse_llm_json
 
 if TYPE_CHECKING:
-    from agents.orchestrator.coordinator import AgentCoordinator
+    pass  # coord is duck-typed (_CoordinatorAdapter or compatible)
     from agents.providers.base import AIProvider
 
 logger = logging.getLogger(__name__)
@@ -38,7 +38,7 @@ _MAX_TEST_RETRIES = 2  # Max times to loop back for test fixes
 class TestingPhase:
     """Dedicated testing phase: install deps, build, run tests."""
 
-    def __init__(self, coord: AgentCoordinator) -> None:
+    def __init__(self, coord) -> None:
         self._coord = coord
 
     # ------------------------------------------------------------------

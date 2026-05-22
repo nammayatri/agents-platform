@@ -6,10 +6,10 @@ create fix subtasks (needs_changes).
 
 from __future__ import annotations
 
-import json
 import logging
 
 from agents.orchestrator.handlers._base import HandlerContext
+from agents.utils.repo_utils import parse_target_repo
 from agents.orchestrator.handlers._shared import (
     build_fix_description_for_file,
     create_pr_creator_subtask,
@@ -140,9 +140,7 @@ async def _create_fix_subtasks(
         return
 
     # Multi-file -> parallel fix sub-tasks + pre-created reviewer
-    target_repo_json = reviewer_st.get("target_repo")
-    if isinstance(target_repo_json, str):
-        target_repo_json = json.loads(target_repo_json)
+    target_repo_json = parse_target_repo(reviewer_st.get("target_repo"))
 
     base_order = (reviewer_st.get("execution_order") or 0) + 1
     base_title = reviewer_st["title"].removeprefix("Review: ")
@@ -218,9 +216,7 @@ async def _create_single_fix_subtask(
     structured_issues: list | None = None,
 ) -> None:
     """Create a single coder fix sub-task (legacy path)."""
-    target_repo_json = reviewer_st.get("target_repo")
-    if isinstance(target_repo_json, str):
-        target_repo_json = json.loads(target_repo_json)
+    target_repo_json = parse_target_repo(reviewer_st.get("target_repo"))
 
     desc_parts = ["Address the reviewer's feedback and fix the following issues:\n"]
 

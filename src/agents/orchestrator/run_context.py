@@ -62,10 +62,11 @@ class RunContext:
     # State transitions
     # ------------------------------------------------------------------
 
-    async def transition_todo(self, target_state: str, **kwargs) -> dict | None:
+    async def transition_todo(self, target_state: str, *, user_initiated: bool = False, **kwargs) -> dict | None:
         result = await _transition_todo(
             self.db, self.todo_id, target_state,
-            redis=self.redis, event_bus=self.event_bus, **kwargs,
+            redis=self.redis, event_bus=self.event_bus,
+            user_initiated=user_initiated, **kwargs,
         )
         if result is None:
             logger.warning(
@@ -270,3 +271,18 @@ class RunContext:
 
     async def check_for_user_messages(self) -> str | None:
         return await self.redis.lpop(f"task:{self.todo_id}:chat_input")
+
+    async def load_chat_history(self) -> list[dict]:
+        """Load chat history for the current task or session."""
+        if self.chat_session_id:
+            rows = await self.db.fetch(
+                "SELECT role, content FROM project_chat_messages "
+                "WHERE session_id = $1 ORDER BY created_at ASC",
+                self.chat_session_id,
+            )
+        else:
+            rows = await self.db.fetch(
+                "SELECT role, content FROM chat_messages WHERE todo_id = $1 ORDER BY created_at ASC",
+                self.todo_id,
+            )
+        return [dict(r) for r in rows]

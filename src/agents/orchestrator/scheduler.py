@@ -17,11 +17,13 @@ import asyncio
 import json
 import logging
 import os
+from collections import defaultdict
 from typing import TYPE_CHECKING
 
 from agents.orchestrator.agents import get_agent, is_llm_role
 from agents.orchestrator.job_runner import run_llm_job, run_procedural_job
 from agents.orchestrator.run_context import RunContext
+from agents.utils.repo_utils import parse_target_repo, repo_name_of
 from agents.utils.work_rules import resolve_work_rules
 
 if TYPE_CHECKING:
@@ -38,7 +40,8 @@ class TaskScheduler:
         self.ctx = ctx
         self._coordinator_adapter = None  # Lazy init
         self._dep_workspace_cache: dict[str, str] = {}  # dep_label → workspace path
-        self._dep_workspace_locks: dict[str, asyncio.Lock] = {}  # dep_label → setup lock
+        # defaultdict ensures atomic lock creation — no race between check and create
+        self._dep_workspace_locks: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
 
     # ------------------------------------------------------------------
     # Main entry point
@@ -157,12 +160,10 @@ class TaskScheduler:
         )
         logger.info("[%s] Found %d sub-tasks in DB", self.todo_id, len(sub_tasks))
         for st in sub_tasks:
-            tr = st.get("target_repo")
-            tr_label = (tr.get("name") if isinstance(tr, dict) else tr) if tr else "main"
             logger.info(
                 "[%s]   st id=%s status=%s role=%s title=%s deps=%s target_repo=%s",
                 self.todo_id, st["id"], st["status"], st["agent_role"],
-                st["title"], st["depends_on"], tr_label,
+                st["title"], st["depends_on"], repo_name_of(st),
             )
 
         if not sub_tasks:
@@ -415,12 +416,12 @@ class TaskScheduler:
             # not just its declared depends_on. New subtasks can be spawned
             # after the PR task was created (e.g. reviewer spawns fix tasks).
             if st["agent_role"] == "pr_creator":
-                pr_repo = self._resolve_repo_name(st)
+                pr_repo = repo_name_of(st)
                 blocking = [
                     s for s in sub_tasks
                     if str(s["id"]) != str(st["id"])
                     and s["agent_role"] != "pr_creator"
-                    and self._resolve_repo_name(s) == pr_repo
+                    and repo_name_of(s) == pr_repo
                     and s["status"] in ("pending", "assigned", "running")
                 ]
                 if blocking:
@@ -438,21 +439,6 @@ class TaskScheduler:
             runnable.append(dict(st))
 
         return runnable, all_done, any_failed
-
-    @staticmethod
-    def _resolve_repo_name(st) -> str:
-        """Extract repo name from a subtask's target_repo field."""
-        tr = st.get("target_repo")
-        if isinstance(tr, str):
-            try:
-                tr = json.loads(tr)
-            except (json.JSONDecodeError, TypeError):
-                pass
-        if isinstance(tr, dict) and tr.get("name"):
-            return tr["name"]
-        if isinstance(tr, str) and tr:
-            return tr
-        return "main"
 
     async def _setup_workspace(self, todo: dict, project: dict | None = None) -> str | None:
         """Set up task workspace if project has a repo.
@@ -495,7 +481,7 @@ class TaskScheduler:
         if stored_path and os.path.isdir(stored_path):
             return stored_path
 
-        target_repo = job.get("target_repo")
+        target_repo = parse_target_repo(job.get("target_repo"))
 
         # Determine repo_name and repo_url
         if not target_repo:
@@ -508,9 +494,6 @@ class TaskScheduler:
                     return ws
             return None
         else:
-            if isinstance(target_repo, str):
-                import json as _json
-                target_repo = _json.loads(target_repo) if target_repo else {}
             repo_name = (target_repo.get("name") or "dep").replace("/", "_").replace(" ", "_")
             repo_url = target_repo.get("repo_url")
             default_branch = target_repo.get("default_branch") or "main"
@@ -523,9 +506,7 @@ class TaskScheduler:
             return ws
 
         # Serialize setup per dep to prevent concurrent git operations on same dir
-        if repo_name not in self._dep_workspace_locks:
-            self._dep_workspace_locks[repo_name] = asyncio.Lock()
-
+        # defaultdict(asyncio.Lock) ensures atomic lock creation
         async with self._dep_workspace_locks[repo_name]:
             # Double-check after acquiring lock
             if repo_name in self._dep_workspace_cache:
@@ -579,25 +560,40 @@ class TaskScheduler:
         from agents.orchestrator.workspace import MAIN_REPO
 
         if any_failed:
-            # Check retry budget
-            if todo["retry_count"] < todo["max_retries"]:
+            from agents.utils.error_classification import is_retryable_error
+
+            failed_tasks = await self.ctx.db.fetch(
+                "SELECT id, title, error_message, error_type, retry_count FROM sub_tasks "
+                "WHERE todo_id = $1 AND status = 'failed'",
+                self.todo_id,
+            )
+
+            # Separate retryable vs permanent failures
+            retryable = [
+                f for f in failed_tasks
+                if is_retryable_error(f.get("error_message"), f.get("error_type"))
+            ]
+            permanent = [f for f in failed_tasks if f not in retryable]
+
+            if retryable and todo["retry_count"] < todo["max_retries"]:
                 await self.ctx.db.execute(
                     "UPDATE todo_items SET retry_count = retry_count + 1 WHERE id = $1",
                     self.todo_id,
                 )
+                retryable_ids = [f["id"] for f in retryable]
                 await self.ctx.db.execute(
                     "UPDATE sub_tasks SET status = 'pending', retry_count = retry_count + 1 "
-                    "WHERE todo_id = $1 AND status = 'failed'",
-                    self.todo_id,
+                    "WHERE id = ANY($1)",
+                    retryable_ids,
                 )
-                await self.ctx.post_system_message("**Retrying failed sub-tasks...**")
+                retry_titles = ", ".join(f["title"] for f in retryable)
+                msg = f"**Retrying {len(retryable)} transient failure(s):** {retry_titles}"
+                if permanent:
+                    perm_titles = ", ".join(f["title"] for f in permanent)
+                    msg += f"\n**Permanent failures (not retrying):** {perm_titles}"
+                await self.ctx.post_system_message(msg)
                 return
             else:
-                failed_tasks = await self.ctx.db.fetch(
-                    "SELECT title, error_message FROM sub_tasks "
-                    "WHERE todo_id = $1 AND status = 'failed'",
-                    self.todo_id,
-                )
                 err = "; ".join(f"{f['title']}: {f['error_message']}" for f in failed_tasks)
                 await self.ctx.transition_todo("failed", error_message=err)
                 return
@@ -656,13 +652,16 @@ class TaskScheduler:
         if not task_root:
             return False
 
-        # Skip if pr_creator tasks already exist (pending/running OR completed)
-        existing_pr_task = await self.ctx.db.fetchrow(
-            "SELECT id, status FROM sub_tasks WHERE todo_id = $1 AND agent_role = 'pr_creator' "
-            "AND status IN ('pending', 'assigned', 'running', 'completed')",
+        # Skip if any pr_creator tasks already exist for this todo.
+        # NOTE: This method is protected by the todo-level lock in EventDrivenOrchestrator,
+        # so only one scheduler instance runs per todo at a time. The check-then-insert
+        # is safe under this lock. The broad status filter is defense-in-depth.
+        existing_pr_count = await self.ctx.db.fetchval(
+            "SELECT COUNT(*) FROM sub_tasks WHERE todo_id = $1 AND agent_role = 'pr_creator' "
+            "AND status NOT IN ('failed', 'cancelled')",
             self.todo_id,
         )
-        if existing_pr_task:
+        if existing_pr_count and existing_pr_count > 0:
             return False
 
         # Get all completed coder subtasks
@@ -677,18 +676,7 @@ class TaskScheduler:
         # Group by target repo
         by_repo: dict[str, list[dict]] = {}
         for st in coder_subtasks:
-            target = st.get("target_repo")
-            if isinstance(target, str):
-                try:
-                    target = json.loads(target)
-                except (json.JSONDecodeError, TypeError):
-                    target = None
-            repo_name = "main"
-            if isinstance(target, dict) and target.get("name"):
-                repo_name = target["name"]
-            elif isinstance(target, str) and target:
-                repo_name = target
-            by_repo.setdefault(repo_name, []).append(dict(st))
+            by_repo.setdefault(repo_name_of(st), []).append(dict(st))
 
         # Check which repos already have PRs — skip those
         existing_prs = await self.ctx.db.fetch(
@@ -709,18 +697,6 @@ class TaskScheduler:
             self.todo_id,
         )
 
-        # Build a map of repo_name → list of incomplete subtask IDs
-        def _repo_name_of(st):
-            tr = st.get("target_repo")
-            if isinstance(tr, str):
-                try: tr = json.loads(tr)
-                except: pass
-            if isinstance(tr, dict) and tr.get("name"):
-                return tr["name"]
-            if isinstance(tr, str) and tr:
-                return tr
-            return "main"
-
         created = 0
         for repo_name, coders in by_repo.items():
             if repo_name in repos_with_prs:
@@ -734,7 +710,7 @@ class TaskScheduler:
             repo_dep_ids = []
             has_incomplete = False
             for st in all_subtasks:
-                if _repo_name_of(st) != repo_name:
+                if repo_name_of(st) != repo_name:
                     continue
                 st_id = str(st["id"])
                 if st["status"] in ("pending", "assigned", "running"):
@@ -750,9 +726,9 @@ class TaskScheduler:
             target_repo_json = None
             if repo_name != "main":
                 for st in coders:
-                    tr = st.get("target_repo")
-                    if tr and isinstance(tr, dict):
-                        target_repo_json = tr
+                    parsed = parse_target_repo(st.get("target_repo"))
+                    if parsed and parsed.get("repo_url"):
+                        target_repo_json = parsed
                         break
 
             title = f"Create Pull Request — {repo_name}" if repo_name != "main" else "Create Pull Request"
@@ -843,7 +819,9 @@ class TaskScheduler:
             else:
                 msg = f"[agents] {len(titles)} subtasks: " + ", ".join(t[:40] for t in titles)
 
-            rc, out = await run_git_command("commit", "-m", msg, "--no-verify", cwd=workspace_path)
+            # Run hooks during incremental commits to catch issues early.
+            # This prevents expensive fix-subtask loops when PR creation fails on hooks.
+            rc, out = await run_git_command("commit", "-m", msg, cwd=workspace_path)
             if rc == 0:
                 _, commit_hash = await run_git_command("rev-parse", "HEAD", cwd=workspace_path)
                 commit_hash = commit_hash.strip()
@@ -854,7 +832,12 @@ class TaskScheduler:
                     )
                 logger.info("[%s] Incremental commit %s: %s", self.todo_id[:8], commit_hash[:10], msg[:80])
             else:
-                logger.warning("[%s] Incremental commit failed: %s", self.todo_id[:8], out[:200])
+                # Hook failure during incremental commit: log but don't crash.
+                # The pre-commit fix flow in PR creator will handle this properly.
+                logger.warning(
+                    "[%s] Incremental commit failed (pre-commit hooks?): %s",
+                    self.todo_id[:8], out[:300],
+                )
         except Exception:
             logger.debug("[%s] Incremental commit error (non-fatal)", self.todo_id[:8], exc_info=True)
 
@@ -974,19 +957,7 @@ class _CoordinatorAdapter:
         await self._run_ctx.report_planning_activity(activity)
 
     async def _load_chat_history(self) -> list[dict]:
-        session_id = getattr(self, "_chat_session_id", None)
-        if session_id:
-            rows = await self.db.fetch(
-                "SELECT role, content FROM project_chat_messages "
-                "WHERE session_id = $1 ORDER BY created_at ASC",
-                session_id,
-            )
-        else:
-            rows = await self.db.fetch(
-                "SELECT role, content FROM chat_messages WHERE todo_id = $1 ORDER BY created_at ASC",
-                self.todo_id,
-            )
-        return [dict(r) for r in rows]
+        return await self._run_ctx.load_chat_history()
 
     @property
     def _planning(self):
@@ -1033,11 +1004,9 @@ class _CoordinatorAdapter:
 
         Delegates to WorkspaceManager.setup_repo_workspace for unified handling.
         """
-        target_repo = sub_task.get("target_repo")
-        if isinstance(target_repo, str):
-            target_repo = json.loads(target_repo) if target_repo else None
-        if not target_repo or not isinstance(target_repo, dict):
-            raise ValueError(f"Invalid target_repo: {target_repo}")
+        target_repo = parse_target_repo(sub_task.get("target_repo"))
+        if not target_repo:
+            raise ValueError(f"Invalid target_repo: {sub_task.get('target_repo')}")
 
         repo_url = target_repo.get("repo_url")
         dep_name = (target_repo.get("name") or "dep").replace("/", "_").replace(" ", "_")
@@ -1053,22 +1022,40 @@ class _CoordinatorAdapter:
         )
 
     async def _handle_user_message(self, user_msg: str, provider) -> None:
-        """Handle a user message injected during execution."""
-        from agents.schemas.agent import LLMMessage
+        """Handle a user message injected during execution.
 
-        await self._run_ctx.post_system_message(f"**User message received:** {user_msg}")
+        Deterministic routing based on message content:
+        - Cancel/stop commands → transition to cancelled
+        - Pause commands → transition to awaiting_response
+        - Everything else → acknowledge and queue for next planning cycle
+        No standalone AI calls with zero context.
+        """
+        msg_lower = user_msg.strip().lower()
 
-        messages = [
-            LLMMessage(role="system", content=(
-                "The user has sent a message during task execution. "
-                "Determine if any changes are needed to the current plan."
-            )),
-            LLMMessage(role="user", content=user_msg),
-        ]
-        try:
-            response = await provider.send_message(messages, temperature=0.1, max_tokens=1024)
-            await self._run_ctx.track_tokens(response)
-            await self._run_ctx.post_assistant_message(response.content)
-        except Exception:
-            logger.warning("[%s] Failed to process user message", self.todo_id, exc_info=True)
+        # Deterministic command handling
+        if msg_lower in ("cancel", "stop", "abort"):
+            await self._run_ctx.post_system_message(
+                "**User requested cancellation.** Stopping task."
+            )
+            await self._run_ctx.transition_todo("cancelled")
+            return
+
+        if msg_lower in ("pause", "wait", "hold"):
+            await self._run_ctx.post_system_message(
+                "**Task paused** by user request. Resume from the dashboard."
+            )
+            await self._run_ctx.db.execute(
+                "UPDATE todo_items SET sub_state = 'awaiting_response', updated_at = NOW() "
+                "WHERE id = $1",
+                self._run_ctx.todo_id,
+            )
+            return
+
+        # For all other messages: acknowledge and store for context.
+        # The message is already persisted in chat history (via Redis rpush).
+        # Next planning/re-planning cycle will see it as part of conversation context.
+        await self._run_ctx.post_system_message(
+            f"**User message received:** {user_msg}\n\n"
+            "_This will be considered in the next review/planning cycle._"
+        )
 

@@ -7,13 +7,13 @@ These are used by multiple handler modules and converted from
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import os
 import re
 from typing import TYPE_CHECKING
 
 from agents.utils.json_helpers import parse_llm_json
+from agents.utils.repo_utils import parse_target_repo, repo_name_of
 
 from agents.orchestrator.handlers._base import HandlerContext
 
@@ -45,9 +45,7 @@ async def resolve_git_for_subtask(
     )
     from agents.infra.crypto import decrypt
 
-    target_repo = sub_task.get("target_repo")
-    if isinstance(target_repo, str):
-        target_repo = json.loads(target_repo)
+    target_repo = parse_target_repo(sub_task.get("target_repo"))
 
     if target_repo and target_repo.get("repo_url"):
         repo_url = target_repo["repo_url"]
@@ -173,21 +171,9 @@ async def ensure_coding_guardrails(ctx: HandlerContext, workspace_path: str | No
         return False
 
     # Group coders by repo name
-    import json as _json
     coders_by_repo: dict[str, list[dict]] = {}
     for st in unreviewed_coders:
-        target = st.get("target_repo")
-        if isinstance(target, str):
-            try:
-                target = _json.loads(target)
-            except (ValueError, TypeError):
-                target = None
-        repo_name = "main"
-        if isinstance(target, dict) and target.get("name"):
-            repo_name = target["name"]
-        elif isinstance(target, str) and target:
-            repo_name = target
-        coders_by_repo.setdefault(repo_name, []).append(dict(st))
+        coders_by_repo.setdefault(repo_name_of(st), []).append(dict(st))
 
     # Check existing tester/reviewer subtasks per repo
     existing_guardrails = await ctx.db.fetch(
@@ -198,18 +184,7 @@ async def ensure_coding_guardrails(ctx: HandlerContext, workspace_path: str | No
     # Build set of (repo_name, role) that already exist
     existing_pairs: set[tuple[str, str]] = set()
     for row in existing_guardrails:
-        tr = row.get("target_repo")
-        if isinstance(tr, str):
-            try:
-                tr = _json.loads(tr)
-            except (ValueError, TypeError):
-                pass
-        rn = "main"
-        if isinstance(tr, dict) and tr.get("name"):
-            rn = tr["name"]
-        elif isinstance(tr, str) and tr:
-            rn = tr
-        existing_pairs.add((rn, row["agent_role"]))
+        existing_pairs.add((repo_name_of(row), row["agent_role"]))
 
     created: list[tuple[str, str]] = []
 
@@ -482,9 +457,7 @@ async def finalize_subtask_workspace(
         todo = await ctx.load_todo()
         short_id = str(ctx.todo_id)[:8]
 
-        target_repo = sub_task.get("target_repo")
-        if isinstance(target_repo, str):
-            target_repo = json.loads(target_repo)
+        target_repo = parse_target_repo(sub_task.get("target_repo"))
 
         if target_repo and target_repo.get("repo_url"):
             dep_name = (target_repo.get("name") or "dep").replace("/", "_").replace(" ", "_")
@@ -603,10 +576,7 @@ async def create_release_subtasks(
 ) -> None:
     """Create chained release pipeline subtasks after a successful merge."""
     # Resolve per-repo release config (backwards compat: fall back to legacy single key)
-    merge_st_target = merge_subtask.get("target_repo")
-    if isinstance(merge_st_target, str):
-        merge_st_target = json.loads(merge_st_target)
-    _repo_name = (merge_st_target or {}).get("name", "main")
+    _repo_name = repo_name_of(merge_subtask)
     release_configs = project_settings.get("release_configs", {})
     release_config = release_configs.get(_repo_name) or project_settings.get("release_config", {})
     if not release_config:
@@ -614,9 +584,7 @@ async def create_release_subtasks(
         return
 
     merge_st_id = str(merge_subtask["id"])
-    target_repo_json = merge_subtask.get("target_repo")
-    if isinstance(target_repo_json, str):
-        target_repo_json = json.loads(target_repo_json)
+    target_repo_json = parse_target_repo(merge_subtask.get("target_repo"))
 
     max_order = await ctx.db.fetchval(
         "SELECT COALESCE(MAX(execution_order), 0) FROM sub_tasks WHERE todo_id = $1",
@@ -721,9 +689,7 @@ async def create_pr_creator_subtask(
     if approved_id not in depends_on:
         depends_on.append(approved_id)
 
-    target_repo_json = approved_st.get("target_repo")
-    if isinstance(target_repo_json, str):
-        target_repo_json = json.loads(target_repo_json)
+    target_repo_json = parse_target_repo(approved_st.get("target_repo"))
 
     row = await ctx.db.fetchrow(
         """

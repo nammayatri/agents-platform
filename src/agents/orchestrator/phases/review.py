@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING
 from agents.config.settings import settings
 
 if TYPE_CHECKING:
-    from agents.orchestrator.coordinator import AgentCoordinator
+    pass  # coord is duck-typed (_CoordinatorAdapter or compatible)
     from agents.providers.base import AIProvider
 
 logger = logging.getLogger(__name__)
@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 class ReviewPhase:
     """Finalize task: build deterministic summary, create PR if needed, complete."""
 
-    def __init__(self, coord: AgentCoordinator) -> None:
+    def __init__(self, coord) -> None:
         self._coord = coord
 
     async def run(self, todo: dict, provider: AIProvider) -> None:

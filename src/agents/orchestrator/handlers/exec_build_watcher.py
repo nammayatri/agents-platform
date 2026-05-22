@@ -41,10 +41,8 @@ async def execute_build_watcher(
         if isinstance(project_settings, str):
             project_settings = json.loads(project_settings)
         # Resolve per-repo release config
-        _target = sub_task.get("target_repo")
-        if isinstance(_target, str):
-            _target = json.loads(_target)
-        _repo_name = (_target or {}).get("name", "main")
+        from agents.utils.repo_utils import repo_name_of
+        _repo_name = repo_name_of(sub_task)
         release_configs = project_settings.get("release_configs", {})
         release_config = release_configs.get(_repo_name) or project_settings.get("release_config", {})
         build_config = release_config.get("build", {})

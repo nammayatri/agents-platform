@@ -13,7 +13,7 @@ from agents.orchestrator.state_machine import check_all_subtasks_done
 from agents.utils.work_rules import resolve_work_rules as _resolve_work_rules
 
 if TYPE_CHECKING:
-    from agents.orchestrator.coordinator import AgentCoordinator
+    pass  # coord is duck-typed (_CoordinatorAdapter or compatible)
     from agents.providers.base import AIProvider
 
 logger = logging.getLogger(__name__)
@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 class ExecutionPhase:
     """Execute sub-tasks in parallel, respecting dependencies."""
 
-    def __init__(self, coord: AgentCoordinator) -> None:
+    def __init__(self, coord) -> None:
         self._coord = coord
 
     # ------------------------------------------------------------------

@@ -30,6 +30,45 @@ def classify_error(exc: Exception) -> str:
     return "transient"
 
 
+# Error types that are permanent — retrying will not help
+_PERMANENT_ERRORS = {"auth_error", "context_length"}
+
+# Error types that are transient — retrying may succeed
+_TRANSIENT_ERRORS = {"timeout", "rate_limit", "network", "transient"}
+
+
+def is_retryable_error(error_message: str | None, error_type: str | None = None) -> bool:
+    """Determine if a failed subtask should be retried based on its error.
+
+    Permanent errors (auth, invalid config, missing resources) should NOT be retried.
+    Transient errors (timeout, rate limit, network) SHOULD be retried.
+    """
+    if error_type and error_type in _PERMANENT_ERRORS:
+        return False
+    if error_type and error_type in _TRANSIENT_ERRORS:
+        return True
+
+    # Heuristic: check error message for permanent failure indicators
+    if not error_message:
+        return True  # unknown error, retry by default
+    msg = error_message.lower()
+    permanent_indicators = [
+        "precondition failed",
+        "not authorized",
+        "unauthorized",
+        "authentication",
+        "invalid config",
+        "no repo_url",
+        "no repo configured",
+        "invalid target_repo",
+        "not found",
+        "permission denied",
+    ]
+    if any(ind in msg for ind in permanent_indicators):
+        return False
+    return True
+
+
 def validate_debugger_output(submit_data: dict | None) -> dict:
     """Validate that a debugger produced substantive findings.
 

@@ -64,17 +64,21 @@ async def github_webhook(project_id: str, request: Request):
 
     body = await request.body()
 
-    # Verify signature
+    # Verify signature — REQUIRED. Reject if no secret configured.
     secret = await _get_webhook_secret(db, project_id, "github")
-    if secret:
-        sig = request.headers.get("X-Hub-Signature-256")
-        if not _verify_github_signature(body, secret, sig):
-            raise HTTPException(status_code=403, detail="Invalid signature")
-    else:
+    if not secret:
         logger.warning(
-            "No webhook secret for project %s (github), accepting unverified",
+            "Webhook rejected: no secret configured for project %s (github)",
             project_id[:8],
         )
+        raise HTTPException(
+            status_code=403,
+            detail="No webhook secret configured for this project. "
+            "Configure a webhook secret in project settings.",
+        )
+    sig = request.headers.get("X-Hub-Signature-256")
+    if not _verify_github_signature(body, secret, sig):
+        raise HTTPException(status_code=403, detail="Invalid signature")
 
     event_type = request.headers.get("X-GitHub-Event", "")
     try:
@@ -118,12 +122,21 @@ async def gitlab_webhook(project_id: str, request: Request):
 
     body = await request.body()
 
-    # Verify token
+    # Verify token — REQUIRED. Reject if no secret configured.
     secret = await _get_webhook_secret(db, project_id, "gitlab")
-    if secret:
-        token = request.headers.get("X-Gitlab-Token")
-        if not _verify_gitlab_token(secret, token):
-            raise HTTPException(status_code=403, detail="Invalid token")
+    if not secret:
+        logger.warning(
+            "Webhook rejected: no secret configured for project %s (gitlab)",
+            project_id[:8],
+        )
+        raise HTTPException(
+            status_code=403,
+            detail="No webhook secret configured for this project. "
+            "Configure a webhook secret in project settings.",
+        )
+    token = request.headers.get("X-Gitlab-Token")
+    if not _verify_gitlab_token(secret, token):
+        raise HTTPException(status_code=403, detail="Invalid token")
 
     try:
         payload = json.loads(body)

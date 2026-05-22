@@ -21,7 +21,7 @@ from agents.providers.base import AIProvider
 from agents.utils.error_classification import classify_error, validate_debugger_output
 
 if TYPE_CHECKING:
-    from agents.orchestrator.coordinator import AgentCoordinator
+    pass  # coord is duck-typed (_CoordinatorAdapter or compatible)
 
 logger = logging.getLogger(__name__)
 
@@ -33,12 +33,12 @@ class AgentExecutor:
 
     Parameters
     ----------
-    coord : AgentCoordinator
+    coord 
         Back-reference to the coordinator that owns this executor.
         Used to access shared infrastructure (DB, Redis, state helpers).
     """
 
-    def __init__(self, coord: AgentCoordinator) -> None:
+    def __init__(self, coord) -> None:
         self._coord = coord
         # Shorthand aliases for frequently accessed attributes
         self.db = coord.db

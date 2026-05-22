@@ -117,9 +117,10 @@ async def trigger_merge_pipeline(
         run_id[:8], pr_number, project_id[:8], test_mode,
     )
 
-    # Spawn executor as background task
+    # Spawn executor as background task (store reference to prevent silent exception loss)
     executor = MergePipelineExecutor(db, redis, run_id, project_id)
-    asyncio.create_task(executor.execute())
+    task = asyncio.create_task(executor.execute(), name=f"pipeline-{run_id[:8]}")
+    task.add_done_callback(_pipeline_task_done)
 
     # Publish initial event
     await _publish(redis, project_id, {
@@ -133,6 +134,15 @@ async def trigger_merge_pipeline(
     return run_id
 
 
+def _pipeline_task_done(task: asyncio.Task) -> None:
+    """Log unhandled exceptions from fire-and-forget pipeline tasks."""
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc:
+        logger.error("Pipeline task %s failed: %s", task.get_name(), exc, exc_info=exc)
+
+
 class MergePipelineExecutor:
     """Executes a single pipeline run: test phase → deploy phase."""
 
@@ -141,6 +151,7 @@ class MergePipelineExecutor:
         self.redis = redis
         self.run_id = run_id
         self.project_id = project_id
+        self._project_name: str | None = None  # cached to avoid N+1 queries
 
     async def execute(self):
         run = await self._load_run()
@@ -345,7 +356,7 @@ class MergePipelineExecutor:
         for i, cmd_template in enumerate(commands):
             cmd = interpolate(cmd_template, variables)
             if kube_context:
-                cmd = f"kubectl --context={kube_context} " + cmd.replace("kubectl ", "", 1)
+                cmd = f"kubectl --context={shlex.quote(kube_context)} " + cmd.replace("kubectl ", "", 1)
 
             await self._publish_progress(
                 "deploying", f"Running command {i + 1}/{len(commands)}: {cmd[:100]}"
@@ -402,12 +413,14 @@ class MergePipelineExecutor:
         if not row:
             return None
         result = dict(row)
-        # Populate project_name lazily
-        project = await self.db.fetchrow(
-            "SELECT name FROM projects WHERE id = $1", self.project_id,
-        )
-        if project:
-            result["_project_name"] = project["name"]
+        # Cache project name (queried once, reused across polling iterations)
+        if self._project_name is None:
+            project = await self.db.fetchrow(
+                "SELECT name FROM projects WHERE id = $1", self.project_id,
+            )
+            if project:
+                self._project_name = project["name"]
+        result["_project_name"] = self._project_name or ""
         return result
 
     async def _update_status(
@@ -618,6 +631,7 @@ async def recover_in_flight_runs(db, redis):
         project_id = str(row["project_id"])
         logger.info("[pipeline] Recovering in-flight run %s", run_id[:8])
         executor = MergePipelineExecutor(db, redis, run_id, project_id)
-        asyncio.create_task(executor.execute())
+        task = asyncio.create_task(executor.execute(), name=f"pipeline-recover-{run_id[:8]}")
+        task.add_done_callback(_pipeline_task_done)
     if rows:
         logger.info("[pipeline] Recovered %d in-flight pipeline runs", len(rows))

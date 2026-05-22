@@ -8,6 +8,7 @@ import logging
 import time
 
 from agents.orchestrator.handlers._base import HandlerContext
+from agents.utils.repo_utils import parse_target_repo
 
 logger = logging.getLogger(__name__)
 
@@ -58,9 +59,7 @@ async def execute_merge_observer(
             raise ValueError("No repo configured for merge observation")
 
         # Resolve target_repo for correct PR lookup
-        target_repo = sub_task.get("target_repo")
-        if isinstance(target_repo, str):
-            target_repo = json.loads(target_repo)
+        target_repo = parse_target_repo(sub_task.get("target_repo"))
         target_repo_name = target_repo.get("name") if target_repo else None
 
         if target_repo_name:

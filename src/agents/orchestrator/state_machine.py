@@ -17,6 +17,10 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 # Valid state transitions for TODO items
+# NOTE: failed/completed → in_progress is ONLY for user-initiated retries (e.g., retry a
+# failed PR creation from the UI). Automated orchestrator code must NEVER use this path —
+# use intake for proper re-planning instead. The transition_todo() function enforces this
+# via the require_retry flag.
 VALID_TRANSITIONS: dict[str, set[str]] = {
     "scheduled": {"intake", "cancelled"},
     "intake": {"planning", "failed", "cancelled"},
@@ -25,9 +29,15 @@ VALID_TRANSITIONS: dict[str, set[str]] = {
     "in_progress": {"testing", "review", "failed", "planning", "cancelled"},
     "testing": {"review", "in_progress", "failed", "cancelled"},
     "review": {"completed", "in_progress", "failed", "cancelled"},
-    "failed": {"intake", "in_progress"},  # in_progress for subtask-level retry (e.g. PR creation)
+    "failed": {"intake", "in_progress"},
     "cancelled": {"intake"},
-    "completed": {"intake", "in_progress"},  # in_progress for subtask-level retry (e.g. PR creation)
+    "completed": {"intake", "in_progress"},
+}
+
+# Transitions that require explicit user intent (not automated orchestrator actions)
+_RETRY_ONLY_TRANSITIONS: set[tuple[str, str]] = {
+    ("failed", "in_progress"),
+    ("completed", "in_progress"),
 }
 
 # Valid sub-task transitions
@@ -57,6 +67,7 @@ async def transition_todo(
     result_summary: str | None = None,
     event_bus: EventBus | None = None,
     redis=None,
+    user_initiated: bool = False,
 ) -> dict | None:
     """Atomically transition a TODO item to a new state with validation.
 
@@ -64,6 +75,9 @@ async def transition_todo(
     transition so the event-driven orchestrator can react immediately.
     If redis is provided, publishes a state_change event to the WebSocket
     pub/sub channel for real-time UI updates.
+
+    user_initiated: Must be True for retry transitions (failed/completed → in_progress).
+    Prevents automated code from accidentally re-entering execution without proper flow.
     """
     row = await db.fetchrow("SELECT state FROM todo_items WHERE id = $1", todo_id)
     if not row:
@@ -72,6 +86,12 @@ async def transition_todo(
     current = row["state"]
     if not validate_transition(current, target_state):
         raise ValueError(f"Invalid transition: {current} -> {target_state}")
+
+    if (current, target_state) in _RETRY_ONLY_TRANSITIONS and not user_initiated:
+        raise ValueError(
+            f"Transition {current} -> {target_state} requires user_initiated=True. "
+            f"Automated code should use 'intake' for re-planning."
+        )
 
     is_terminal = target_state in ("completed", "cancelled")
     completed_at = datetime.now(timezone.utc) if is_terminal else None

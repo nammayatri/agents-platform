@@ -493,14 +493,17 @@ async def accept_task_plan(
             for r in rows
         ]
 
-    # Create the task in DB
+    # Create the task directly in in_progress state — the plan was already
+    # created and approved by the user in the chat interface, so we skip
+    # intake/planning/plan_ready entirely. This avoids a race where the
+    # orchestrator could pick up plan_ready before we transition to in_progress.
     todo = await db.fetchrow(
         """
         INSERT INTO todo_items (
             project_id, creator_id, title, description, priority, task_type,
-            state, plan_json, intake_data, chat_session_id
+            state, sub_state, plan_json, intake_data, chat_session_id
         )
-        VALUES ($1, $2, $3, $4, $5, $6, 'plan_ready', $7, $8, $9)
+        VALUES ($1, $2, $3, $4, $5, $6, 'in_progress', 'executing', $7, $8, $9)
         RETURNING *
         """,
         project_id,
@@ -568,11 +571,9 @@ async def accept_task_plan(
                     sub_task_ids[i], dep_ids,
                 )
 
-    # Transition to in_progress and emit event
-    from agents.orchestrator.state_machine import transition_todo
+    # Emit event to wake the orchestrator — todo is already in_progress
     from agents.orchestrator.events import TaskEvent
 
-    await transition_todo(db, todo_id, "in_progress", sub_state="executing", event_bus=event_bus)
     await event_bus.publish(TaskEvent(event_type="task_activated", todo_id=todo_id, state="in_progress"))
 
     # Store confirmation messages

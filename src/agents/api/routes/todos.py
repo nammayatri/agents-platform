@@ -314,7 +314,7 @@ async def retry_subtask(
     )
 
     if todo["state"] in ("completed", "failed"):
-        result = await transition_todo(db, todo_id, "in_progress", event_bus=event_bus)
+        result = await transition_todo(db, todo_id, "in_progress", event_bus=event_bus, user_initiated=True)
         if not result:
             await transition_todo(db, todo_id, "intake", event_bus=event_bus)
             result = await transition_todo(db, todo_id, "in_progress", event_bus=event_bus)
@@ -759,7 +759,7 @@ async def trigger_subtask(
         )
 
     if todo["state"] not in ("in_progress",):
-        await transition_todo(db, todo_id, "in_progress", event_bus=event_bus)
+        await transition_todo(db, todo_id, "in_progress", event_bus=event_bus, user_initiated=True)
 
     await event_bus.publish(TaskEvent(
         event_type="state_changed",
@@ -862,7 +862,7 @@ async def _retry_pr_creation(db, redis, event_bus, todo_id: str, todo: dict) -> 
             target_repo_json,
         )
 
-    result = await transition_todo(db, todo_id, "in_progress", event_bus=event_bus)
+    result = await transition_todo(db, todo_id, "in_progress", event_bus=event_bus, user_initiated=True)
     if not result:
         await transition_todo(db, todo_id, "intake", event_bus=event_bus)
         result = await transition_todo(db, todo_id, "in_progress", event_bus=event_bus)
