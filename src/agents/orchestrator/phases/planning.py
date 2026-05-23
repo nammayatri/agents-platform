@@ -460,11 +460,14 @@ class PlanningPhase:
 
                 tools_with_submit = list(planner_tools) + [plan_submit_tool]
 
+                _plan_stop = asyncio.Event()
+
                 async def _plan_tool_exec(name: str, args: dict) -> str:
                     nonlocal _captured_plan_data
                     if name == "submit_result":
                         _captured_plan_data = args
-                        return json.dumps({"status": "received"})
+                        _plan_stop.set()  # Signal tool loop to stop
+                        return json.dumps({"status": "received", "message": "Plan captured. Do not call any more tools."})
                     return await coord.mcp_executor.execute_tool(
                         name, args, planner_tools,
                     )
@@ -491,11 +494,12 @@ class PlanningPhase:
                     provider, messages,
                     tools=tools_with_submit,
                     tool_executor=_plan_tool_exec,
-                    max_rounds=20,
+                    max_rounds=500,
                     on_activity=lambda msg: coord._report_planning_activity(msg),
                     on_tool_event=_plan_tool_event,
                     on_cancel_check=coord._is_cancelled,
                     on_token=_plan_token_cb,
+                    cancel_event=_plan_stop,
                     temperature=0.1,
                     max_tokens=16384,
                 )
@@ -628,34 +632,75 @@ class PlanningPhase:
                 )
                 raise ValueError("Failed to parse execution plan from LLM after retries")
 
-        # ── Single-shot plan review (no iterative re-planning) ──
-        # The planner already has full project knowledge. A single review check
-        # is enough to catch obvious issues. Iterative re-planning was burning
-        # 2x more LLM calls with diminishing returns.
+        # ── Iterative plan review loop ──
+        # Plan → review → feedback → re-plan → review until approved or cap hit.
         task_context = (
             f"Task: {todo['title']}\n"
             f"Description: {todo['description'] or 'N/A'}\n"
             f"Type: {todo['task_type']}"
         )
-        review = await self.review_plan(
-            plan, task_context, provider,
-            context=context, workspace_path=workspace_path,
-        )
-        review_metadata = {
-            "action": "plan_review_verdict",
-            "task_id": coord.todo_id,
-            "approved": review["approved"],
-            "feedback": review.get("feedback", ""),
-        }
-        if not review["approved"]:
-            logger.warning(
-                "[%s] Plan review rejected but proceeding (feedback: %s)",
-                coord.todo_id, review.get("feedback", "")[:200],
+        max_review_iterations = 2
+        for review_iter in range(max_review_iterations + 1):
+            review = await self.review_plan(
+                plan, task_context, provider,
+                context=context, workspace_path=workspace_path,
             )
-        await coord._post_system_message(
-            f"**Plan review:** {'Approved' if review['approved'] else 'Proceeding with plan'}",
-            metadata=review_metadata,
-        )
+
+            review_metadata = {
+                "action": "plan_review_verdict",
+                "task_id": coord.todo_id,
+                "approved": review["approved"],
+                "feedback": review.get("feedback", ""),
+                "iteration": review_iter + 1,
+            }
+
+            if review["approved"]:
+                logger.info("[%s] Plan review approved (iteration %d)", coord.todo_id, review_iter)
+                await coord._post_system_message(
+                    "**Plan review:** Approved",
+                    metadata=review_metadata,
+                )
+                break
+
+            if review_iter == max_review_iterations:
+                logger.warning(
+                    "[%s] Plan review: max iterations (%d) reached, proceeding with current plan",
+                    coord.todo_id, max_review_iterations,
+                )
+                await coord._post_system_message(
+                    "**Plan review:** Max revisions reached, proceeding with current plan.",
+                    metadata=review_metadata,
+                )
+                break
+
+            feedback = review.get("feedback", "Plan needs improvement.")
+            await coord._post_system_message(
+                f"**Plan review (iteration {review_iter + 1}):** Revising plan...\n\n{feedback}",
+                metadata=review_metadata,
+            )
+            previous_plan = plan
+            plan = await self.re_plan_with_feedback(
+                plan, feedback, provider, todo, context,
+                workspace_path=workspace_path,
+                planner_tools=planner_tools,
+                planner_system_prompt=planner_prompt,
+            )
+
+            # Detect when re-plan returned identical plan (extraction failure)
+            prev_titles = {st.get("title") for st in previous_plan.get("sub_tasks", [])}
+            new_titles = {st.get("title") for st in plan.get("sub_tasks", [])}
+            if prev_titles == new_titles and len(prev_titles) == len(plan.get("sub_tasks", [])):
+                logger.warning("[%s] Re-plan returned identical plan, stopping review loop", coord.todo_id)
+                await coord._post_system_message(
+                    "**Plan review:** Re-plan could not produce a revised plan. Proceeding.",
+                    metadata={**review_metadata, "replan_failed": True},
+                )
+                break
+
+            await coord.db.execute(
+                "UPDATE todo_items SET plan_json = $2, updated_at = NOW() WHERE id = $1",
+                coord.todo_id, plan,
+            )
 
         # Store final plan
         await coord.db.execute(
@@ -999,11 +1044,14 @@ class PlanningPhase:
             if planner_tools:
                 from agents.providers.base import run_tool_loop
 
+                _replan_stop = asyncio.Event()
+
                 async def _replan_tool_exec(name: str, args: dict) -> str:
                     nonlocal _captured_plan
                     if name == "submit_result":
-                        _captured_plan = args  # Capture the plan data directly
-                        return json.dumps({"status": "received"})
+                        _captured_plan = args
+                        _replan_stop.set()
+                        return json.dumps({"status": "received", "message": "Plan captured. Do not call any more tools."})
                     return await coord.mcp_executor.execute_tool(
                         name, args, planner_tools,
                     )
@@ -1013,10 +1061,11 @@ class PlanningPhase:
                     provider, messages,
                     tools=tools_for_replan,
                     tool_executor=_replan_tool_exec,
-                    max_rounds=10,
+                    max_rounds=500,
                     on_activity=lambda msg: coord._report_planning_activity(msg),
                     on_cancel_check=coord._is_cancelled,
                     on_token=_replan_token_cb,
+                    cancel_event=_replan_stop,
                     temperature=0.1,
                     max_tokens=16384,
                 )
