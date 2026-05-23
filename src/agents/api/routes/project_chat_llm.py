@@ -20,6 +20,66 @@ logger = logging.getLogger(__name__)
 # ── Shared Helpers ───────────────────────────────────────────────────
 
 
+async def _build_tasks_context(db, project_id: str, *, linked_todo_id: str | None = None) -> str:
+    """Build a concise but complete task context string for the LLM.
+
+    Includes all tasks with their state, subtask summary, and error info.
+    Active/recent tasks get more detail than old completed ones.
+    """
+    todos = await db.fetch(
+        "SELECT id, title, state, sub_state, priority, task_type, error_message, "
+        "created_at, updated_at "
+        "FROM todo_items WHERE project_id = $1 ORDER BY created_at DESC LIMIT 30",
+        project_id,
+    )
+    if not todos:
+        return ""
+
+    # Batch-fetch subtask summaries for all todos in one query
+    todo_ids = [t["id"] for t in todos]
+    subtask_rows = await db.fetch(
+        "SELECT todo_id, agent_role, status, title FROM sub_tasks "
+        "WHERE todo_id = ANY($1) ORDER BY execution_order, created_at",
+        todo_ids,
+    )
+    subtasks_by_todo: dict[str, list] = {}
+    for st in subtask_rows:
+        subtasks_by_todo.setdefault(str(st["todo_id"]), []).append(st)
+
+    lines: list[str] = []
+    for t in todos:
+        tid = str(t["id"])
+        is_linked = tid == str(linked_todo_id) if linked_todo_id else False
+        state_label = t["state"]
+        if t.get("sub_state"):
+            state_label += f"/{t['sub_state']}"
+
+        line = f"- [{state_label}] ({t['priority']}) {t['title']}"
+        if is_linked:
+            line += " ← LINKED TO THIS CHAT"
+
+        sts = subtasks_by_todo.get(tid, [])
+        if sts:
+            status_counts: dict[str, int] = {}
+            for st in sts:
+                status_counts[st["status"]] = status_counts.get(st["status"], 0) + 1
+            summary_parts = [f"{cnt} {s}" for s, cnt in status_counts.items()]
+            line += f" | subtasks: {', '.join(summary_parts)}"
+
+        if t["state"] == "failed" and t.get("error_message"):
+            line += f" | error: {t['error_message'][:120]}"
+
+        lines.append(line)
+
+        # For linked or active tasks, show subtask details
+        if (is_linked or t["state"] in ("in_progress", "testing", "failed")) and sts:
+            for st in sts:
+                st_line = f"    [{st['status']}] ({st['agent_role']}) {st['title']}"
+                lines.append(st_line)
+
+    return "Project tasks:\n" + "\n".join(lines)
+
+
 async def _load_and_compact_history(
     db, *, session_id: str | None, project_id: str, user_id: str,
     model: str, limit: int = 40, max_tokens: int = 40_000,
@@ -516,6 +576,10 @@ async def generate_project_response(
     ]
 
     workspace_path = project.get("workspace_path") or ""
+    # Ensure project repo is up-to-date before chat reads from it
+    if workspace_path:
+        from agents.orchestrator.workspace import ensure_project_repo_fresh
+        await ensure_project_repo_fresh(db, project_id)
     builtin_tools = get_builtin_tool_schemas(workspace_path, "planner") if workspace_path else []
 
     effective_model = model_override or (
@@ -527,15 +591,11 @@ async def generate_project_response(
         model=effective_model, limit=30, provider=provider, redis=redis,
     )
 
-    todos = await db.fetch(
-        "SELECT title, state, priority, task_type FROM todo_items "
-        "WHERE project_id = $1 ORDER BY created_at DESC LIMIT 20",
-        project_id,
-    )
+    # Only include task context when there's a linked task the user is actively managing.
+    # General project chat doesn't need the full task list — project knowledge is sufficient.
     tasks_ctx = ""
-    if todos:
-        task_lines = [f"  - [{t['state']}] ({t['priority']}) {t['title']}" for t in todos]
-        tasks_ctx = "\n\nExisting tasks:\n" + "\n".join(task_lines)
+    if linked_todo_id:
+        tasks_ctx = "\n\n" + await _build_tasks_context(db, project_id, linked_todo_id=linked_todo_id)
 
     settings = safe_json(project.get("settings_json"))
     project_ctx = ""
@@ -549,19 +609,6 @@ async def generate_project_response(
         base_prompt = get_default_system_prompt("planner")
 
     if linked_todo_id:
-        linked_todo = await db.fetchrow(
-            "SELECT title, state, sub_state FROM todo_items WHERE id = $1", linked_todo_id,
-        )
-        linked_subtasks = await db.fetch(
-            "SELECT id, title, agent_role, status, execution_order FROM sub_tasks "
-            "WHERE todo_id = $1 ORDER BY execution_order, created_at",
-            linked_todo_id,
-        )
-        linked_task_ctx = f"\n\nLinked task: \"{linked_todo['title']}\" [{linked_todo['state']}]"
-        if linked_subtasks:
-            st_lines = [f"  - [{st['status']}] ({st['agent_role']}) {st['title']} (id: {st['id']})" for st in linked_subtasks]
-            linked_task_ctx += "\nSubtasks:\n" + "\n".join(st_lines)
-        tasks_ctx = linked_task_ctx + tasks_ctx
 
         tools_doc = """
 You have the following task management actions for the linked task:
@@ -1054,15 +1101,6 @@ async def generate_plan_response(
                     project_ctx_parts.append(f"Repo map:\n{repo_map}")
         except Exception:
             pass
-
-    todos = await db.fetch(
-        "SELECT title, state, priority, task_type FROM todo_items "
-        "WHERE project_id = $1 ORDER BY created_at DESC LIMIT 20",
-        project_id,
-    )
-    if todos:
-        task_lines = [f"  - [{t['state']}] ({t['priority']}) {t['title']}" for t in todos]
-        project_ctx_parts.append("Existing tasks:\n" + "\n".join(task_lines))
 
     project_context = "\n\n".join(project_ctx_parts)
 
@@ -1887,14 +1925,6 @@ async def generate_create_task_response(
         if understanding.get("tech_stack"):
             project_ctx_parts.append(f"Tech stack: {', '.join(understanding['tech_stack'])}")
 
-    todos = await db.fetch(
-        "SELECT title, state, priority, task_type FROM todo_items "
-        "WHERE project_id = $1 ORDER BY created_at DESC LIMIT 10",
-        project_id,
-    )
-    if todos:
-        task_lines = [f"  - [{t['state']}] ({t['priority']}) {t['title']}" for t in todos]
-        project_ctx_parts.append("Existing tasks:\n" + "\n".join(task_lines))
 
     project_context = "\n".join(project_ctx_parts)
 

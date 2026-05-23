@@ -8,12 +8,15 @@ interface ProjectPlanningTabProps {
   setPlanningGuidelines: (v: string) => void
   requirePlanApproval: boolean
   setRequirePlanApproval: (v: boolean) => void
+  toolsOnly: boolean
+  setToolsOnly: (v: boolean) => void
   setError: (err: string) => void
 }
 
 export default function ProjectPlanningTab({
   projectId, planningGuidelines, setPlanningGuidelines,
-  requirePlanApproval, setRequirePlanApproval, setError,
+  requirePlanApproval, setRequirePlanApproval,
+  toolsOnly, setToolsOnly, setError,
 }: ProjectPlanningTabProps) {
   const [saving, setSaving] = useState(false)
 
@@ -30,6 +33,7 @@ export default function ProjectPlanningTab({
       await projectsApi.updateSettingsSection(projectId, 'planning', {
         guidelines: planningGuidelines,
         require_approval: requirePlanApproval,
+        tools_only: toolsOnly,
       })
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Failed to save')
@@ -66,6 +70,30 @@ export default function ProjectPlanningTab({
             </span>
             <p className="text-[11px] text-gray-600">
               When enabled, plans pause for your review before execution begins.
+            </p>
+          </div>
+        </label>
+      </div>
+
+      {/* Tools-Only Mode Toggle */}
+      <div>
+        <label className="flex items-center gap-3 cursor-pointer group">
+          <div className="relative">
+            <input
+              type="checkbox"
+              checked={toolsOnly}
+              onChange={(e) => setToolsOnly(e.target.checked)}
+              className="sr-only peer"
+            />
+            <div className="w-9 h-5 bg-gray-800 border border-gray-700 rounded-full peer-checked:bg-amber-600 peer-checked:border-amber-500 transition-colors" />
+            <div className="absolute top-0.5 left-0.5 w-4 h-4 bg-gray-500 rounded-full peer-checked:translate-x-4 peer-checked:bg-white transition-all" />
+          </div>
+          <div>
+            <span className="text-sm text-gray-300 group-hover:text-white transition-colors">
+              Tools-only exploration
+            </span>
+            <p className="text-[11px] text-gray-600">
+              Skip pre-analyzed project knowledge. The planner explores the codebase from scratch using tools only, like Claude Code.
             </p>
           </div>
         </label>

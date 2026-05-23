@@ -194,6 +194,7 @@ export const todos = {
   update: (id: string, data: TodoUpdatePayload) =>
     request<TodoItem>(`/todos/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
   cancel: (id: string) => request<TodoItem>(`/todos/${id}/cancel`, { method: 'POST' }),
+  delete: (id: string) => request<{ status: string; todo_id: string }>(`/todos/${id}`, { method: 'DELETE' }),
   retry: (id: string, withContext?: boolean) =>
     request<TodoItem>(`/todos/${id}/retry`, {
       method: 'POST',

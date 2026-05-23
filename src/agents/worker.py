@@ -204,9 +204,10 @@ async def _main(todo_id: str) -> None:
     if boot_script:
         run_boot_script(boot_script, workspace_root)
 
-    # Connect to shared DB + Redis
+    # Connect to shared DB + Redis (with jsonb codec matching the main backend)
+    from agents.db.connection import _init_connection
     db_url = os.environ.get("DATABASE_URL", settings.database_url)
-    db = await asyncpg.create_pool(db_url, min_size=2, max_size=10)
+    db = await asyncpg.create_pool(db_url, min_size=2, max_size=10, init=_init_connection)
     redis_client = aioredis.from_url(
         os.environ.get("REDIS_URL", settings.redis_url),
         decode_responses=True,

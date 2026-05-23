@@ -8,8 +8,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
-import re
 from typing import TYPE_CHECKING
 
 from agents.utils.json_helpers import parse_llm_json

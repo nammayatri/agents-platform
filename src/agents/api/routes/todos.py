@@ -167,6 +167,44 @@ async def get_todo(todo_id: str, user: CurrentUser, db: DB):
     return result
 
 
+@router.delete("/todos/{todo_id}")
+async def delete_todo(todo_id: str, user: CurrentUser, db: DB, redis: Redis):
+    """Permanently delete a task and all its data (subtasks, runs, deliverables).
+
+    Only allowed for tasks in terminal states (completed, failed, cancelled)
+    or tasks that haven't started yet (scheduled, intake, plan_ready).
+    Active tasks must be cancelled first.
+    """
+    todo = await db.fetchrow("SELECT project_id, state FROM todo_items WHERE id = $1", todo_id)
+    if not todo:
+        raise HTTPException(status_code=404)
+    await check_project_access(db, str(todo["project_id"]), user)
+
+    if todo["state"] in ("in_progress", "testing", "planning"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cannot delete an active task (state: {todo['state']}). Cancel it first.",
+        )
+
+    # Unlink any chat sessions referencing this todo (no CASCADE on that FK)
+    await db.execute(
+        "UPDATE project_chat_sessions SET linked_todo_id = NULL WHERE linked_todo_id = $1",
+        todo_id,
+    )
+
+    # Delete the todo — all child tables (sub_tasks, deliverables, chat_messages,
+    # agent_runs, orchestrator_locks, task_pods) cascade automatically.
+    await db.execute("DELETE FROM todo_items WHERE id = $1", todo_id)
+
+    # Notify UI
+    await redis.publish(
+        f"task:{todo_id}:events",
+        json.dumps({"type": "deleted"}),
+    )
+
+    return {"status": "deleted", "todo_id": todo_id}
+
+
 ALLOWED_TODO_UPDATE_COLS = {"title", "description", "priority", "labels"}
 
 

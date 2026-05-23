@@ -140,6 +140,7 @@ export default function ProjectSettingsPage() {
   const [mergeMethod, setMergeMethod] = useState<'merge' | 'squash' | 'rebase'>('squash')
   const [requireMergeApproval, setRequireMergeApproval] = useState(false)
   const [requirePlanApproval, setRequirePlanApproval] = useState(false)
+  const [planningToolsOnly, setPlanningToolsOnly] = useState(false)
   const [memories, setMemories] = useState<ProjectMemory[]>([])
   const [memoriesLoading, setMemoriesLoading] = useState(false)
   const [architectEditorEnabled, setArchitectEditorEnabled] = useState(false)
@@ -175,6 +176,7 @@ export default function ProjectSettingsPage() {
       const planning = settings.planning || {}
       setPlanningGuidelines(planning.guidelines || '')
       setRequirePlanApproval(planning.require_approval ?? settings.require_plan_approval ?? false)
+      setPlanningToolsOnly(planning.tools_only ?? false)
 
       const execution = settings.execution || {}
       setWorkRules(execution.work_rules || settings.work_rules || {})
@@ -458,6 +460,8 @@ export default function ProjectSettingsPage() {
                   setPlanningGuidelines={setPlanningGuidelines}
                   requirePlanApproval={requirePlanApproval}
                   setRequirePlanApproval={setRequirePlanApproval}
+                  toolsOnly={planningToolsOnly}
+                  setToolsOnly={setPlanningToolsOnly}
                   setError={setError}
                 />
               )}

@@ -1,5 +1,5 @@
 import { useEffect, useState, useRef } from 'react'
-import { useParams } from 'react-router-dom'
+import { useParams, useNavigate } from 'react-router-dom'
 import { Code2, Loader2, CheckCircle2, AlertCircle, XCircle, FileText, CirclePause, CircleDashed, GitBranch } from 'lucide-react'
 import { useTodoStore } from '../stores/todoStore'
 import { useTaskWebSocket } from '../hooks/useTaskWebSocket'
@@ -99,6 +99,7 @@ function CollapsibleSection({ title, count, defaultOpen = true, children }: {
 
 export default function TodoDetailPage() {
   const { todoId } = useParams<{ todoId: string }>()
+  const navigate = useNavigate()
   const todos = useTodoStore((s) => s.todos)
   const chatMessages = useTodoStore((s) => s.chatMessages)
   const deliverablesByTodo = useTodoStore((s) => s.deliverablesByTodo)
@@ -108,6 +109,7 @@ export default function TodoDetailPage() {
   const fetchDeliverables = useTodoStore((s) => s.fetchDeliverables)
   const sendChat = useTodoStore((s) => s.sendChat)
   const cancelTodo = useTodoStore((s) => s.cancelTodo)
+  const deleteTodo = useTodoStore((s) => s.deleteTodo)
   const retryTodo = useTodoStore((s) => s.retryTodo)
   const triggerSubTask = useTodoStore((s) => s.triggerSubTask)
   const acceptDeliverables = useTodoStore((s) => s.acceptDeliverables)
@@ -794,7 +796,31 @@ export default function TodoDetailPage() {
               >
                 Retry with Context
               </button>
+              <button
+                onClick={async () => {
+                  if (todoId && confirm('Delete this task permanently? This cannot be undone.')) {
+                    await deleteTodo(todoId)
+                    navigate(-1)
+                  }
+                }}
+                className="px-3 py-1.5 text-sm text-red-400 hover:text-red-300 transition-colors"
+              >
+                Delete
+              </button>
             </div>
+          )}
+          {['scheduled', 'plan_ready'].includes(todo.state) && (
+            <button
+              onClick={async () => {
+                if (todoId && confirm('Delete this task permanently? This cannot be undone.')) {
+                  await deleteTodo(todoId)
+                  navigate(-1)
+                }
+              }}
+              className="px-3 py-1.5 text-sm text-red-400 hover:text-red-300 transition-colors"
+            >
+              Delete
+            </button>
           )}
         </div>
 

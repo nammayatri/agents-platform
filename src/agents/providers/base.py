@@ -557,13 +557,13 @@ def _truncate_tool_result(text: str) -> str:
     return result
 
 
-def _trim_old_tool_results(messages: list[LLMMessage], keep_full: int = 6) -> None:
+def _trim_old_tool_results(messages: list[LLMMessage], keep_full: int = 10) -> None:
     """Trim tool results in older messages to short previews.
 
     Keeps the most recent ``keep_full`` tool-result messages at full size.
-    Older ones are trimmed to 400 chars per result with a hint to re-request,
-    freeing memory from file contents / search outputs the LLM no longer
-    needs in detail.
+    Older ones are trimmed to 800 chars per result with a hint to re-request.
+    This preserves enough context for the LLM to remember what it read
+    without needing to re-read the same files.
     """
     tr_indices = [i for i, m in enumerate(messages) if m.tool_results]
     if len(tr_indices) <= keep_full:
@@ -571,13 +571,12 @@ def _trim_old_tool_results(messages: list[LLMMessage], keep_full: int = 6) -> No
     for idx in tr_indices[:-keep_full]:
         for tr in messages[idx].tool_results:
             content = tr.get("content", "")
-            if len(content) > 500:
-                preview = content[:400]
+            if len(content) > 1000:
+                preview = content[:800]
                 total = len(content)
                 tr["content"] = (
                     f"{preview}\n\n"
-                    f"... (trimmed from {total} chars — this is an older result. "
-                    f"Re-read the file or re-run the tool if you need the full content.)"
+                    f"... (trimmed from {total} chars — re-read if you need full content.)"
                 )
 
 
@@ -1136,12 +1135,13 @@ async def run_tool_loop(
                     messages[:] = _compact_messages_for_overflow(messages)
                 if on_activity:
                     await on_activity("Compacting context (approaching limit)...")
-            elif loop_count > 0 and loop_count % 15 == 0 and len(messages) > 10:
-                # Periodic compaction by message count to prevent unbounded growth
-                logger.info("tool_loop: periodic compaction at round %d (%d messages)", loop_count, len(messages))
-                messages[:] = _compact_messages_for_overflow(messages)
-                if on_activity:
-                    await on_activity("Compacting context (periodic cleanup)...")
+            # NOTE: No fixed-interval periodic compaction. The old `loop_count % 15`
+            # compaction was destroying tool results too aggressively — the LLM would
+            # lose file contents after 15 rounds and re-read the same files in a loop.
+            # Instead, we rely on:
+            #   1. _trim_old_tool_results() every round (keeps last 6 full, trims older)
+            #   2. The 60% context window check above (compacts when actually needed)
+            # This lets the LLM accumulate context naturally until the window fills.
 
     truncated = loop_count >= max_rounds and bool(response.tool_calls)
     if truncated:

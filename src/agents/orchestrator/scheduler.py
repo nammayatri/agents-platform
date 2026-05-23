@@ -341,7 +341,6 @@ class TaskScheduler:
         target_repo, execution_order: int,
     ) -> str:
         """Insert a spawned job into sub_tasks and return its ID."""
-        from agents.orchestrator.agent_result import JobSpec
         row = await self.ctx.db.fetchrow(
             """
             INSERT INTO sub_tasks (

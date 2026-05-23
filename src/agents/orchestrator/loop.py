@@ -361,8 +361,16 @@ class EventDrivenOrchestrator:
                 and todo["state"] in ("in_progress", "testing")
                 and not settings.task_pod_mode  # don't recurse if we ARE a worker pod
             ):
-                await self._ensure_task_pod(todo)
-                return
+                try:
+                    await self._ensure_task_pod(todo)
+                    return
+                except Exception as pod_err:
+                    # K8s pod spawning failed (auth, quota, etc.) — fall back to
+                    # running the task in-process rather than failing the task.
+                    logger.warning(
+                        "Task pod spawn failed for %s, falling back to in-process: %s",
+                        todo_id[:8], pod_err,
+                    )
 
             from agents.providers.mcp_executor import McpToolExecutor
             from agents.providers.tools_registry import ToolsRegistry
@@ -421,6 +429,28 @@ class EventDrivenOrchestrator:
             await self.locks.release(todo_id)
             self.active_tasks.pop(todo_id, None)
 
+            # Eagerly clean up pod + PVC when task reaches terminal state
+            if settings.k8s_spawn_pods:
+                try:
+                    final_state = await self.db.fetchval(
+                        "SELECT state FROM todo_items WHERE id = $1", todo_id,
+                    )
+                    if final_state in ("completed", "cancelled", "failed", "review"):
+                        from agents.infra.k8s_spawner import (
+                            cleanup_task_resources,
+                            update_pod_state,
+                        )
+                        pod = await self.db.fetchrow(
+                            "SELECT pod_name, namespace, state FROM task_pods WHERE todo_id = $1",
+                            todo_id,
+                        )
+                        if pod and pod["state"] in ("creating", "running"):
+                            logger.info("Task %s done (%s), cleaning up pod", todo_id[:8], final_state)
+                            await cleanup_task_resources(todo_id, pod["namespace"])
+                            await update_pod_state(self.db, todo_id, "terminated")
+                except Exception:
+                    pass  # Health check will catch it
+
     async def _ensure_task_pod(self, todo: dict) -> None:
         """Spawn or verify a task pod for in_progress execution.
 
@@ -460,7 +490,11 @@ class EventDrivenOrchestrator:
                     self.db, todo_id, "failed",
                     error_message=f"Pod phase: {status['phase']}",
                 )
-            # If Succeeded or NotFound, fall through to recreate
+            # Dead/NotFound — delete the old pod (if it exists) before recreating.
+            # PVC is NOT deleted — it retains the workspace so work resumes.
+            from agents.infra.k8s_spawner import delete_task_pod
+            await delete_task_pod(todo_id, pod_record.get("namespace"))
+            logger.info("Task %s: old pod deleted, PVC retained, recreating", todo_id[:8])
 
         # Load project settings for worker config
         project = await self.db.fetchrow(
@@ -593,8 +627,9 @@ class EventDrivenOrchestrator:
                         error_message=f"Cleanup failed: {e}",
                     )
 
-            # 2. Detect dead pods whose tasks are still in_progress — mark as failed
-            #    so the fallback poll can re-spawn them
+            # 2. Detect dead pods whose tasks are still in_progress.
+            #    Reset their running subtasks to pending so the re-spawned pod
+            #    picks up work from where it left off (PVC retains workspace).
             active_pods = await self.db.fetch(
                 """
                 SELECT tp.todo_id, tp.pod_name, tp.namespace, tp.created_at
@@ -608,30 +643,46 @@ class EventDrivenOrchestrator:
                 todo_id = str(row["todo_id"])
                 try:
                     status = await get_pod_status(row["pod_name"], row["namespace"])
-                    if status["phase"] in ("Failed", "Unknown"):
+                    if status["phase"] in ("Failed", "Unknown", "NotFound"):
+                        reason = status["phase"]
                         logger.warning(
-                            "Task pod for %s is dead (phase=%s), marking failed for re-spawn",
-                            todo_id[:8], status["phase"],
+                            "Task pod for %s is dead (phase=%s), recovering subtasks for re-spawn",
+                            todo_id[:8], reason,
                         )
+                        # Reset running/assigned subtasks to pending so they restart
+                        reset = await self.db.execute(
+                            "UPDATE sub_tasks SET status = 'pending', progress_pct = 0, "
+                            "progress_message = 'Reset: worker pod died' "
+                            "WHERE todo_id = $1 AND status IN ('assigned', 'running')",
+                            todo_id,
+                        )
+                        # Mark stale agent_runs as failed
+                        await self.db.execute(
+                            "UPDATE agent_runs SET status = 'failed', "
+                            "error_detail = 'Worker pod died during execution', "
+                            "completed_at = NOW() "
+                            "WHERE todo_id = $1 AND status = 'running'",
+                            todo_id,
+                        )
+                        # Mark pod as failed — fallback poll will re-create it
                         await update_pod_state(
                             self.db, todo_id, "failed",
-                            error_message=f"Pod died: {status['phase']}",
+                            error_message=f"Pod died: {reason}",
                         )
-                    elif status["phase"] == "NotFound":
-                        # Pod disappeared — mark failed so fallback poll re-creates it
-                        await update_pod_state(
-                            self.db, todo_id, "failed",
-                            error_message="Pod not found (node eviction or crash)",
+                        logger.info(
+                            "Task %s: pod died, subtasks reset (%s), will re-spawn",
+                            todo_id[:8], reset,
                         )
                 except Exception:
                     pass  # K8s API flake — will retry next health check
 
-            # 3. Clean up pods marked 'terminated' for >1h (PVC deletion)
+            # 3. Clean up terminated pods — delete PVC after 10 minutes
+            #    (keeps workspace briefly in case of immediate retry)
             old_rows = await self.db.fetch(
                 """
                 SELECT todo_id, namespace FROM task_pods
                 WHERE state = 'terminated'
-                  AND stopped_at < NOW() - INTERVAL '1 hour'
+                  AND stopped_at < NOW() - INTERVAL '10 minutes'
                 """,
             )
             for row in old_rows:

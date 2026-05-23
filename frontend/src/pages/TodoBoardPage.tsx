@@ -36,7 +36,7 @@ export default function TodoBoardPage() {
   const { projectId } = useParams<{ projectId: string }>()
   const navigate = useNavigate()
   const [searchParams, setSearchParams] = useSearchParams()
-  const { todos, fetchTodos, createTodo, retryTodo, isLoading, isCreating, createError, clearCreateError, providers, fetchProviders } = useTodoStore()
+  const { todos, fetchTodos, createTodo, retryTodo, deleteTodo, isLoading, isCreating, createError, clearCreateError, providers, fetchProviders } = useTodoStore()
   const [showCreate, setShowCreate] = useState(false)
   const [newTitle, setNewTitle] = useState('')
   const [newDesc, setNewDesc] = useState('')
@@ -191,6 +191,11 @@ export default function TodoBoardPage() {
   const handleRetry = async (todoId: string) => {
     await retryTodo(todoId)
     if (projectId) fetchTodos(projectId)
+  }
+
+  const handleDelete = async (todoId: string) => {
+    if (!confirm('Delete this task permanently?')) return
+    await deleteTodo(todoId)
   }
 
   const hasFilters = searchQuery.trim() !== '' || dateFilter !== 'all'
@@ -444,7 +449,7 @@ export default function TodoBoardPage() {
                     </div>
                   )}
                   {group.items.map((todo) => (
-                    <TaskCard key={todo.id} todo={todo} onRetry={() => handleRetry(todo.id)} />
+                    <TaskCard key={todo.id} todo={todo} onRetry={() => handleRetry(todo.id)} onDelete={() => handleDelete(todo.id)} />
                   ))}
                 </div>
               </div>
@@ -470,7 +475,7 @@ function ColumnHeader({ label, count, dotColor }: { label: string; count: number
 
 /* ── Task Card ────────────────────────────────────────────────── */
 
-function TaskCard({ todo, onRetry }: { todo: TodoItem; onRetry: () => void }) {
+function TaskCard({ todo, onRetry, onDelete }: { todo: TodoItem; onRetry: () => void; onDelete: () => void }) {
   const priority = PRIORITY_CONFIG[todo.priority] || PRIORITY_CONFIG.medium
   const completedCount = todo.sub_tasks?.filter((s) => s.status === 'completed').length ?? 0
   const totalCount = todo.sub_tasks?.length ?? 0
@@ -478,6 +483,7 @@ function TaskCard({ todo, onRetry }: { todo: TodoItem; onRetry: () => void }) {
   const timeAgo = getRelativeTime(todo.updated_at || todo.created_at)
   const isFailed = todo.state === 'failed'
   const isCancelled = todo.state === 'cancelled'
+  const isTerminal = isFailed || isCancelled || todo.state === 'completed'
   const isActive = todo.state === 'in_progress' || todo.state === 'testing'
 
   return (
@@ -558,6 +564,16 @@ function TaskCard({ todo, onRetry }: { todo: TodoItem; onRetry: () => void }) {
             Retry
           </button>
         </div>
+      )}
+
+      {/* Delete action for terminal states */}
+      {isTerminal && (
+        <button
+          onClick={(e) => { e.preventDefault(); e.stopPropagation(); onDelete() }}
+          className="hidden group-hover:block mt-1.5 text-[10px] text-red-400 hover:text-red-300 transition-colors"
+        >
+          Delete
+        </button>
       )}
     </Link>
   )

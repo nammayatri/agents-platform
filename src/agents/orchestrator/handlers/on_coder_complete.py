@@ -9,7 +9,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import os
 
 from agents.orchestrator.handlers._base import HandlerContext
 from agents.orchestrator.handlers._shared import propagate_dependencies

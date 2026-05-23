@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 
 from agents.orchestrator.handlers._base import HandlerContext
-from agents.utils.repo_utils import parse_target_repo, repo_name_of, repo_name_of
+from agents.utils.repo_utils import parse_target_repo, repo_name_of
 
 logger = logging.getLogger(__name__)
 
@@ -41,16 +41,22 @@ async def _verify_pr_preconditions(ctx: HandlerContext, sub_task: dict) -> None:
             f"'{target_repo_name}': {', '.join(incomplete[:5])}"
         )
 
-    # Idempotency: check if a PR already exists for this branch
-    short_id = str(ctx.todo_id)[:8]
-    expected_branch = f"task/{short_id}" if target_repo_name == "main" else f"task/{short_id}-{target_repo_name}"
+    # Idempotency: block if a PR deliverable already exists for this repo
     existing = await ctx.db.fetchrow(
-        "SELECT pr_url FROM deliverables "
-        "WHERE todo_id = $1 AND type = 'pull_request' AND branch_name = $2",
-        ctx.todo_id, expected_branch,
+        "SELECT pr_url, pr_number FROM deliverables "
+        "WHERE todo_id = $1 AND type = 'pull_request' "
+        "AND (target_repo_name = $2 OR ($2 = 'main' AND target_repo_name IS NULL))",
+        ctx.todo_id, target_repo_name,
     )
     if existing:
-        logger.info("[%s] PR already exists for branch %s: %s", ctx.todo_id, expected_branch, existing["pr_url"])
+        logger.info(
+            "[%s] PR already exists for repo %s: %s — skipping duplicate creation",
+            ctx.todo_id, target_repo_name, existing["pr_url"],
+        )
+        raise ValueError(
+            f"PR already exists for repo '{target_repo_name}': {existing['pr_url']}. "
+            f"Skipping duplicate PR creation."
+        )
 
 
 async def execute_pr_creator(

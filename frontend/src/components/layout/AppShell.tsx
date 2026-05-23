@@ -55,9 +55,7 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
     <div className="w-60 h-full flex flex-col">
       {/* Header */}
       <div className="h-[53px] flex items-center gap-3 px-4 border-b border-gray-900">
-        <div className="w-7 h-7 rounded-lg bg-gradient-to-br from-indigo-500/20 to-indigo-600/10 border border-indigo-500/20 flex items-center justify-center shrink-0">
-          <span className="text-xs font-bold text-indigo-400">A</span>
-        </div>
+        <img src="/logo.png" alt="Agent Platform" className="w-7 h-7 rounded-lg shrink-0 object-contain" />
         <span className={`text-sm font-semibold text-white tracking-wide whitespace-nowrap ${isMobile ? '' : labelCls}`}>
           Agent Platform
         </span>

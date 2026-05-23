@@ -51,6 +51,51 @@ logger = logging.getLogger(__name__)
 # Reserved repo name for the main project repository
 MAIN_REPO = "main"
 
+# Module-level debounce for project repo freshness pulls
+_last_pull_times: dict[str, float] = {}
+
+
+async def ensure_project_repo_fresh(
+    db, project_id: str, max_age_seconds: int = 300,
+) -> None:
+    """Pull the project repo if it hasn't been pulled recently.
+
+    Called before chat/plan sessions so the LLM sees current code.
+    Debounced per project — won't pull more than once per max_age_seconds.
+    Non-blocking on failure (stale repo is better than no repo).
+    """
+    import time as _time
+
+    last = _last_pull_times.get(project_id, 0)
+    now = _time.monotonic()
+    if (now - last) < max_age_seconds:
+        return
+
+    _last_pull_times[project_id] = now  # set early to prevent concurrent pulls
+
+    project = await db.fetchrow(
+        "SELECT repo_url, default_branch, git_provider_id, workspace_path "
+        "FROM projects WHERE id = $1",
+        project_id,
+    )
+    if not project or not project.get("workspace_path"):
+        return
+
+    repo_dir = os.path.join(project["workspace_path"], "repo")
+    if not os.path.isdir(repo_dir):
+        return
+
+    try:
+        await ensure_authenticated_remote(repo_dir, db)
+        branch = project.get("default_branch") or "main"
+        rc, _ = await run_git_command("pull", "--ff-only", "origin", branch, cwd=repo_dir)
+        if rc == 0:
+            logger.info("[workspace] Project %s repo pulled to latest", project_id[:8])
+        else:
+            logger.debug("[workspace] Project %s pull --ff-only failed (non-fatal)", project_id[:8])
+    except Exception:
+        logger.debug("[workspace] Project %s freshness pull failed (non-fatal)", project_id[:8], exc_info=True)
+
 
 def task_root_from_workspace(workspace_path: str) -> str:
     """Derive task_root from a workspace_path (git working dir).
@@ -257,6 +302,10 @@ class WorkspaceManager:
         if rc != 0:
             raise RuntimeError(f"Failed to clone task workspace: {out}")
 
+        # Set git identity so commits work in worker pods (no global gitconfig)
+        await run_git_command("config", "user.email", "agent@agents-platform.ai", cwd=main_workspace)
+        await run_git_command("config", "user.name", "Agent Platform", cwd=main_workspace)
+
         authenticated_url = build_clone_url(clone_url, token, provider_type)
         await run_git_command(
             "remote", "set-url", "origin", authenticated_url,
@@ -382,7 +431,9 @@ class WorkspaceManager:
         if rc != 0:
             raise RuntimeError(f"git clone failed for '{repo_name}': {out}")
 
-        # Set authenticated remote
+        # Set git identity and authenticated remote
+        await run_git_command("config", "user.email", "agent@agents-platform.ai", cwd=workspace_path)
+        await run_git_command("config", "user.name", "Agent Platform", cwd=workspace_path)
         authenticated_url = build_clone_url(repo_url, token, provider_type)
         await run_git_command(
             "remote", "set-url", "origin", authenticated_url,

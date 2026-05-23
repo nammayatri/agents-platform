@@ -16,6 +16,7 @@ spec:
       labels:
         app: backend
     spec:
+      serviceAccountName: agent-backend
       containers:
         - name: backend
           image: ghcr.io/nammayatri/agents-platform/backend:79b89eb
@@ -59,6 +60,14 @@ spec:
               value: "300"
             - name: WORKSPACE_ROOT
               value: "/data/workspaces"
+            - name: K8S_SPAWN_PODS
+              value: "true"
+            - name: K8S_NAMESPACE
+              value: "atlas-ai"
+            - name: K8S_WORKER_SERVICE_ACCOUNT
+              value: "agent-backend"
+            - name: BACKEND_IMAGE
+              value: "ghcr.io/nammayatri/agents-platform/backend:79b89eb"
           volumeMounts:
             - name: workspace-data
               mountPath: /data/workspaces

@@ -80,6 +80,15 @@ Do NOT create pr_creator or merge_agent sub-tasks — the system handles PR/merg
 REVIEW LOOP: Set review_loop=true for critical changes (core logic, security, API contracts, \
 DB migrations). The system chains coder→reviewer→PR→merge automatically.
 
+VERIFICATION & IMPACT ANALYSIS — for every plan, think through:
+- What could this change break? Which existing features depend on the code being modified?
+- What downstream consumers (APIs, UI, tests, other services) will be affected?
+- Add a **tester** sub-task that verifies BOTH the new functionality AND that existing \
+functionality still works. Include specific test commands and what to check.
+- For risky changes, add a **reviewer** sub-task with explicit review criteria: \
+"verify that X still works, check Y for regressions, confirm Z contract is preserved."
+- The tester/reviewer sub-tasks should depend_on the coder sub-tasks and run AFTER code changes.
+
 ## Sub-Task Quality Standards
 
 Each sub-task description must be a complete brief that an agent can execute without \
@@ -202,10 +211,13 @@ class PlanningPhase:
         if _guidelines:
             planner_prompt += f"\n\n## Project Planning Guidelines\n{_guidelines}\n"
 
+        # planning.tools_only: when true, skip all pre-analyzed project knowledge
+        # and let the LLM explore the codebase purely through tools (like Claude Code).
+        # When false (default), inject project understanding, deps, file tree into prompt.
+        tools_only = read_setting(_proj_settings, "planning.tools_only", None, False)
+
         # Resolve workspace for codebase exploration
-        # setup_task_workspace returns task_root (tasks/{todo_id}/)
-        # The main repo workspace is at task_root/repos/main/
-        workspace_path = None  # git working dir for main repo
+        workspace_path = None
         task_root = None
         try:
             project = await coord.db.fetchrow(
@@ -217,76 +229,82 @@ class PlanningPhase:
                 workspace_path = os.path.join(task_root, MAIN_REPO)
                 logger.info("[%s] Planner workspace ready at %s", coord.todo_id, workspace_path)
         except Exception:
-            logger.exception("[%s] Could not set up planner workspace — planning will proceed without workspace tools",
-                             coord.todo_id)
+            logger.exception("[%s] Could not set up planner workspace", coord.todo_id)
 
-        # ── Inject project knowledge so the planner doesn't re-explore everything ──
-        # This is the most important section — it gives the planner the analysis
-        # results so it can plan with knowledge instead of spending 100K tokens
-        # rediscovering what the project already analyzed.
+        if tools_only:
+            # ── Tools-only mode: no pre-injected knowledge ──
+            # LLM explores the codebase from scratch using tools, like Claude Code.
+            logger.info("[%s] Planning in tools_only mode — skipping project knowledge injection", coord.todo_id)
+            if workspace_path:
+                planner_prompt += (
+                    "\n\nYou have NO pre-analyzed project knowledge. "
+                    "Use the workspace tools (read_file, search_files, list_directory, run_command) "
+                    "to explore the codebase and understand the architecture before planning."
+                )
+        else:
+            # ── Knowledge mode (default): inject pre-analyzed project understanding ──
+            understanding = context.get("project_understanding", {})
+            if understanding and isinstance(understanding, dict):
+                summary = understanding.get("summary", "")
+                arch = understanding.get("architecture", "")
+                tech = understanding.get("tech_stack", [])
+                build_workflow = understanding.get("build_workflow", "")
+                key_patterns = understanding.get("key_patterns", [])
+                api_surface = understanding.get("api_surface", "")
 
-        understanding = context.get("project_understanding", {})
-        if understanding and isinstance(understanding, dict):
-            summary = understanding.get("summary", "")
-            arch = understanding.get("architecture", "")
-            tech = understanding.get("tech_stack", [])
-            build_workflow = understanding.get("build_workflow", "")
-            key_patterns = understanding.get("key_patterns", [])
-            api_surface = understanding.get("api_surface", "")
+                planner_prompt += "\n\n## Project Knowledge (from analysis — use this, don't re-explore)"
+                if summary:
+                    planner_prompt += f"\n{summary}"
+                if tech:
+                    planner_prompt += f"\nTech stack: {', '.join(tech[:10])}"
+                if arch:
+                    planner_prompt += f"\n\nArchitecture:\n{arch[:1000]}"
+                if build_workflow:
+                    planner_prompt += f"\n\nBuild workflow:\n{build_workflow[:500]}"
+                if key_patterns:
+                    planner_prompt += "\n\nKey patterns:\n" + "\n".join(f"- {p}" for p in key_patterns[:8])
+                if api_surface:
+                    planner_prompt += f"\n\nAPI surface:\n{api_surface[:500]}"
 
-            planner_prompt += "\n\n## Project Knowledge (from analysis — use this, don't re-explore)"
-            if summary:
-                planner_prompt += f"\n{summary}"
-            if tech:
-                planner_prompt += f"\nTech stack: {', '.join(tech[:10])}"
-            if arch:
-                planner_prompt += f"\n\nArchitecture:\n{arch[:1000]}"
-            if build_workflow:
-                planner_prompt += f"\n\nBuild workflow:\n{build_workflow[:500]}"
-            if key_patterns:
-                planner_prompt += "\n\nKey patterns:\n" + "\n".join(f"- {p}" for p in key_patterns[:8])
-            if api_surface:
-                planner_prompt += f"\n\nAPI surface:\n{api_surface[:500]}"
+            dep_understandings = context.get("dep_understandings", {})
+            if dep_understandings and isinstance(dep_understandings, dict):
+                planner_prompt += "\n\n## Dependency Repos"
+                for dep_name, dep_u in dep_understandings.items():
+                    if isinstance(dep_u, dict):
+                        purpose = dep_u.get("purpose", "")
+                        api = dep_u.get("api_surface", "")
+                        dep_arch = dep_u.get("architecture", "")
+                        planner_prompt += f"\n\n### {dep_name}"
+                        if purpose:
+                            planner_prompt += f"\n{purpose}"
+                        if dep_arch:
+                            planner_prompt += f"\nArchitecture: {dep_arch[:300]}"
+                        if api:
+                            planner_prompt += f"\nAPI: {api[:400]}"
 
-        dep_understandings = context.get("dep_understandings", {})
-        if dep_understandings and isinstance(dep_understandings, dict):
-            planner_prompt += "\n\n## Dependency Repos"
-            for dep_name, dep_u in dep_understandings.items():
-                if isinstance(dep_u, dict):
-                    purpose = dep_u.get("purpose", "")
-                    api = dep_u.get("api_surface", "")
-                    dep_arch = dep_u.get("architecture", "")
-                    planner_prompt += f"\n\n### {dep_name}"
-                    if purpose:
-                        planner_prompt += f"\n{purpose}"
-                    if dep_arch:
-                        planner_prompt += f"\nArchitecture: {dep_arch[:300]}"
-                    if api:
-                        planner_prompt += f"\nAPI: {api[:400]}"
-
-        linking_doc = context.get("linking_document", {})
-        if linking_doc and isinstance(linking_doc, dict):
-            overview = linking_doc.get("overview", "")
-            if overview:
-                planner_prompt += f"\n\n## Cross-Repo Integration\n{overview[:800]}"
-            integrations = linking_doc.get("integrations", [])
-            if integrations:
-                for intg in integrations[:6]:
-                    src = intg.get("source_repo", "")
-                    tgt = intg.get("target_repo", "")
-                    pattern = intg.get("pattern", "")
-                    if src and tgt:
-                        planner_prompt += f"\n- {src} → {tgt}: {pattern[:150]}"
+            linking_doc = context.get("linking_document", {})
+            if linking_doc and isinstance(linking_doc, dict):
+                overview = linking_doc.get("overview", "")
+                if overview:
+                    planner_prompt += f"\n\n## Cross-Repo Integration\n{overview[:800]}"
+                integrations = linking_doc.get("integrations", [])
+                if integrations:
+                    for intg in integrations[:6]:
+                        src = intg.get("source_repo", "")
+                        tgt = intg.get("target_repo", "")
+                        pattern = intg.get("pattern", "")
+                        if src and tgt:
+                            planner_prompt += f"\n- {src} → {tgt}: {pattern[:150]}"
 
         # ── Workspace tools and file tree ──
         if workspace_path:
-            file_tree = coord.workspace_mgr.get_file_tree(workspace_path, max_depth=3)
-            planner_prompt += f"\n\n## File Structure\n{file_tree}\n"
-
-            planner_prompt += (
-                "\nUse tools to verify specific files ONLY when the project knowledge above "
-                "doesn't have what you need. Don't re-explore what's already documented above."
-            )
+            if not tools_only:
+                file_tree = coord.workspace_mgr.get_file_tree(workspace_path, max_depth=3)
+                planner_prompt += f"\n\n## File Structure\n{file_tree}\n"
+                planner_prompt += (
+                    "\nUse tools to verify specific files ONLY when the project knowledge above "
+                    "doesn't have what you need. Don't re-explore what's already documented above."
+                )
 
             dep_dirs = context.get("dependency_dirs", {})
             deps_list = context.get("dependencies", [])

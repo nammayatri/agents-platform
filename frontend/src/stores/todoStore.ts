@@ -25,6 +25,7 @@ interface TodoState {
   createTodo: (projectId: string, data: { title: string; description?: string; priority?: string; task_type?: string; ai_provider_id?: string; ai_model?: string; scheduled_at?: string }) => Promise<TodoItem>
   clearCreateError: () => void
   cancelTodo: (todoId: string) => Promise<void>
+  deleteTodo: (todoId: string) => Promise<void>
   retryTodo: (todoId: string, withContext?: boolean) => Promise<void>
   triggerSubTask: (todoId: string, subTaskId: string, force?: boolean) => Promise<void>
   acceptDeliverables: (todoId: string) => Promise<void>
@@ -127,6 +128,14 @@ export const useTodoStore = create<TodoState>((set, get) => ({
     if (todos[todoId]) {
       set({ todos: { ...todos, [todoId]: { ...todos[todoId], state: 'cancelled' } } })
     }
+  },
+
+  deleteTodo: async (todoId) => {
+    await todosApi.delete(todoId)
+    const { todos } = get()
+    const updated = { ...todos }
+    delete updated[todoId]
+    set({ todos: updated })
   },
 
   retryTodo: async (todoId, withContext?: boolean) => {
