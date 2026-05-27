@@ -14,6 +14,7 @@ const chatModes: { key: ChatMode; label: string; hint: string }[] = [
   { key: 'plan', label: 'Plan', hint: 'Build a structured execution plan' },
   { key: 'debug', label: 'Debug', hint: 'Investigate bugs and issues' },
   { key: 'create_task', label: 'Create Task', hint: 'Quickly create a task from description' },
+  { key: 'coding', label: 'Coding', hint: 'Interactive coder agent — work on PRs or code live' },
 ]
 
 const modeStyles: Record<ChatMode, string> = {
@@ -22,6 +23,7 @@ const modeStyles: Record<ChatMode, string> = {
   plan: 'text-amber-400 bg-amber-500/10 border border-amber-500/20',
   debug: 'text-orange-400 bg-orange-500/10 border border-orange-500/20',
   create_task: 'text-indigo-400 bg-indigo-500/10 border border-indigo-500/20',
+  coding: 'text-emerald-400 bg-emerald-500/10 border border-emerald-500/20',
 }
 
 const routingModeLabels: Record<string, string> = {
@@ -44,6 +46,7 @@ const sendButtonStyles: Record<ChatMode, string> = {
   plan: 'bg-amber-600 hover:bg-amber-500 disabled:bg-gray-800 disabled:text-gray-600',
   debug: 'bg-orange-600 hover:bg-orange-500 disabled:bg-gray-800 disabled:text-gray-600',
   create_task: 'bg-indigo-600 hover:bg-indigo-500 disabled:bg-gray-800 disabled:text-gray-600',
+  coding: 'bg-emerald-600 hover:bg-emerald-500 disabled:bg-gray-800 disabled:text-gray-600',
 }
 
 const sessionDotColors: Record<ChatMode, string> = {
@@ -52,6 +55,7 @@ const sessionDotColors: Record<ChatMode, string> = {
   plan: 'bg-amber-500',
   debug: 'bg-orange-500',
   create_task: 'bg-indigo-500',
+  coding: 'bg-emerald-500',
 }
 
 /** Ensure metadata_json is always a parsed object (handles double-encoded JSONB strings). */
@@ -304,6 +308,14 @@ export default function ProjectChatPage() {
   // Per-session sending: only blocks the session that initiated the send
   const sending = sendingSessionId != null && sendingSessionId === activeSessionId
   const { activity, activityLog, streamingText, completedStreaming, isStreaming, clearActivity, resetStreaming, incomingMessage, clearIncomingMessage } = useChatSessionWebSocket(activeSessionId)
+  const [codingSetup, setCodingSetup] = useState(false)
+  const [codingTaskId, setCodingTaskId] = useState<string | null>(null)
+
+  // Clear coding setup state once the coder starts producing activity
+  useEffect(() => {
+    if (codingSetup && activity) setCodingSetup(false)
+  }, [codingSetup, activity])
+
   const [deleteDialog, setDeleteDialog] = useState<{
     sessionId: string
     sessionTitle: string
@@ -518,6 +530,27 @@ export default function ProjectChatPage() {
             : s
         )
       )
+
+      // Auto-start coding session when switching to coding mode
+      if (mode === 'coding') {
+        setCodingSetup(true)
+        try {
+          const res = await projectChat.sessions.startCoding(projectId, activeSessionId)
+          setCodingTaskId(res.task_id)
+          if (res.status === 'already_running') {
+            setCodingSetup(false)
+          } else {
+            // Pod takes ~10-30s to start — clear setup after delay
+            // (actual readiness comes via WebSocket activity events)
+            setTimeout(() => setCodingSetup(false), 15000)
+          }
+        } catch {
+          setCodingSetup(false)
+        }
+      } else {
+        setCodingSetup(false)
+        setCodingTaskId(null)
+      }
     } catch {
       // ignore
     }
@@ -1094,6 +1127,7 @@ export default function ProjectChatPage() {
                     chatMode === 'auto' ? 'bg-blue-500/10 text-blue-400'
                     : chatMode === 'plan' ? 'bg-amber-500/10 text-amber-400'
                     : chatMode === 'debug' ? 'bg-orange-500/10 text-orange-400'
+                    : chatMode === 'coding' ? 'bg-emerald-500/10 text-emerald-400'
                     : 'bg-indigo-500/10 text-indigo-400'
                   }`}>
                     {chatMode === 'auto'
@@ -1194,6 +1228,25 @@ export default function ProjectChatPage() {
             </div>
           ) : (
             <div className="px-6 py-4 space-y-4 max-w-3xl mx-auto">
+              {/* Coding mode setup banner */}
+              {codingSetup && (
+                <div className="flex items-center gap-3 px-4 py-3 bg-emerald-500/5 border border-emerald-500/20 rounded-xl">
+                  <Loader2 className="w-4 h-4 text-emerald-400 animate-spin shrink-0" />
+                  <div>
+                    <p className="text-sm text-emerald-300">Setting up coding environment...</p>
+                    <p className="text-[11px] text-gray-500 mt-0.5">Spawning worker pod and cloning repository. You can start typing — messages will be queued.</p>
+                  </div>
+                </div>
+              )}
+
+              {/* Coding mode active indicator */}
+              {chatMode === 'coding' && !codingSetup && codingTaskId && (
+                <div className="flex items-center gap-2 px-3 py-2 bg-emerald-500/5 border border-emerald-500/10 rounded-lg">
+                  <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
+                  <span className="text-[11px] text-emerald-400/70">Coding agent active — messages go directly to the coder</span>
+                </div>
+              )}
+
               {messages.map((msg) => {
                 const meta = parseMeta(msg)
                 const isOtherUserMsg = msg.role === 'user' && currentUser && msg.user_id && msg.user_id !== currentUser.id && msg.user_id !== ''
@@ -1788,6 +1841,7 @@ function ModeIcon({ mode }: { mode: ChatMode }) {
     plan: 'M9 12h3.75M9 15h3.75M9 18h3.75m3 .75H18a2.25 2.25 0 002.25-2.25V6.108c0-1.135-.845-2.098-1.976-2.192a48.424 48.424 0 00-1.123-.08m-5.801 0c-.065.21-.1.433-.1.664 0 .414.336.75.75.75h4.5a.75.75 0 00.75-.75 2.25 2.25 0 00-.1-.664m-5.8 0A2.251 2.251 0 0113.5 2.25H15c1.012 0 1.867.668 2.15 1.586m-5.8 0c-.376.023-.75.05-1.124.08C9.095 4.01 8.25 4.973 8.25 6.108V8.25m0 0H4.875c-.621 0-1.125.504-1.125 1.125v11.25c0 .621.504 1.125 1.125 1.125h9.75c.621 0 1.125-.504 1.125-1.125V9.375c0-.621-.504-1.125-1.125-1.125H8.25z',
     debug: 'M12 12.75c1.148 0 2.278.08 3.383.237 1.037.146 1.866.966 1.866 2.013 0 3.728-2.35 6.75-5.25 6.75S6.75 18.728 6.75 15c0-1.046.83-1.867 1.866-2.013A24.204 24.204 0 0112 12.75zm0 0c2.883 0 5.647.508 8.207 1.44a23.91 23.91 0 01-1.152-6.135c-.078-.759-.633-1.38-1.398-1.43A22.38 22.38 0 0012 6.375c-1.94 0-3.84.158-5.657.46-.764.05-1.32.671-1.398 1.43a23.91 23.91 0 01-1.152 6.135A24.084 24.084 0 0112 12.75zM9.75 8.625a.375.375 0 11-.75 0 .375.375 0 01.75 0zm4.5 0a.375.375 0 11-.75 0 .375.375 0 01.75 0z',
     create_task: 'M12 4.5v15m7.5-7.5h-15',
+    coding: 'M17.25 6.75L22.5 12l-5.25 5.25m-10.5 0L1.5 12l5.25-5.25m7.5-3l-4.5 16.5',
   }
   return (
     <svg className="w-3.5 h-3.5 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>

@@ -261,8 +261,9 @@ class WorkspaceManager:
         if os.path.isdir(main_workspace):
             logger.info("[workspace] Task workspace exists, verifying for todo=%s", todo_id)
             await ensure_authenticated_remote(main_workspace, self.db)
-            # Don't fetch — task workspace doesn't need remote updates.
-            # Fetching on large repos hangs for minutes.
+            # Ensure git identity is set (worker pods have no global gitconfig)
+            await run_git_command("config", "user.email", "agent@agents-platform.ai", cwd=main_workspace)
+            await run_git_command("config", "user.name", "Agent Platform", cwd=main_workspace)
             branch_name = f"task/{short_id}"
             rc, current = await run_git_command(
                 "rev-parse", "--abbrev-ref", "HEAD", cwd=main_workspace,
@@ -322,9 +323,26 @@ class WorkspaceManager:
             )
             logger.info("[workspace] Stored base_commit=%s for todo=%s", base_commit[:12], todo_id)
 
-        branch_name = f"task/{short_id}"
-        logger.info("[workspace] Created task branch=%s for todo=%s", branch_name, todo_id)
-        await run_git_command("checkout", "-b", branch_name, cwd=main_workspace)
+        # Determine which branch to work on:
+        # - If intake_data has pr_branch, fetch and checkout that existing PR branch
+        # - Otherwise, create a fresh task branch
+        intake_data = todo.get("intake_data") or {}
+        if isinstance(intake_data, str):
+            intake_data = json.loads(intake_data) if intake_data else {}
+        pr_branch = intake_data.get("pr_branch") if isinstance(intake_data, dict) else None
+
+        if pr_branch:
+            # Fetch the PR branch from remote and checkout
+            logger.info("[workspace] Checking out PR branch %s for todo=%s", pr_branch, todo_id)
+            await run_git_command("fetch", "origin", pr_branch, cwd=main_workspace)
+            rc, _ = await run_git_command("checkout", pr_branch, cwd=main_workspace)
+            if rc != 0:
+                await run_git_command("checkout", "-b", pr_branch, f"origin/{pr_branch}", cwd=main_workspace)
+            branch_name = pr_branch
+        else:
+            branch_name = f"task/{short_id}"
+            await run_git_command("checkout", "-b", branch_name, cwd=main_workspace)
+        logger.info("[workspace] Working on branch %s for todo=%s", branch_name, todo_id)
 
         # Copy project context docs into task_root/.context/
         project_context = os.path.join(project_workspace, ".context")
@@ -388,10 +406,10 @@ class WorkspaceManager:
 
         if os.path.isdir(workspace_path):
             logger.info("[workspace] Reusing existing repo workspace: %s", workspace_path)
-            # Don't fetch — the repo was cloned for this task and doesn't need
-            # updates. Fetching on large repos can hang for minutes downloading
-            # full ref lists. Just ensure auth is valid and return.
             await ensure_authenticated_remote(workspace_path, self.db)
+            # Ensure git identity is set (worker pods have no global gitconfig)
+            await run_git_command("config", "user.email", "agent@agents-platform.ai", cwd=workspace_path)
+            await run_git_command("config", "user.name", "Agent Platform", cwd=workspace_path)
             return workspace_path
 
         logger.info("[workspace] Cloning repo '%s' → %s", repo_name, workspace_path)

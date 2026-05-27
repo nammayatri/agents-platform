@@ -16,6 +16,7 @@ Both wrap execution with lifecycle management: state transitions
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -440,13 +441,24 @@ def _make_tool_event_handler(
 
 
 def _make_inject_checker(ctx: RunContext, st_id: str):
-    """Build the on_inject_check callback for polling user-injected messages."""
+    """Build the on_inject_check callback for polling user-injected messages.
+
+    Checks both the subtask-specific key (for targeted injection) and the
+    task-level chat_input key (for interactive coding mode messages from chat).
+    """
     inject_key = f"subtask:{st_id}:inject"
+    task_chat_key = f"task:{ctx.todo_id}:chat_input"
 
     async def _check_inject() -> str | None:
-        if ctx.redis:
-            return await ctx.redis.lpop(inject_key)
-        return None
+        if not ctx.redis:
+            return None
+        # Check subtask-specific key first (targeted injection)
+        msg = await ctx.redis.lpop(inject_key)
+        if msg:
+            return msg
+        # Then check task-level chat input (interactive coding mode)
+        msg = await ctx.redis.lpop(task_chat_key)
+        return msg
 
     return _check_inject, inject_key
 
@@ -732,6 +744,13 @@ async def _execute_iterative(
     todo = await ctx.load_todo()
     agent_config = await _resolve_agent_config(ctx, role, str(todo["creator_id"]))
 
+    # Detect interactive coding mode (from chat start-coding endpoint)
+    _intake = todo.get("intake_data") or {}
+    if isinstance(_intake, str):
+        import json as _json2
+        _intake = _json2.loads(_intake) if _intake else {}
+    _interactive_mode = isinstance(_intake, dict) and _intake.get("approach") == "Interactive"
+
     # Role-specific work rules
     role_rules = ContextBuilder.filter_rules_for_role(work_rules or {}, role)
     has_quality_rules = bool(role_rules.get("quality"))
@@ -832,6 +851,17 @@ async def _execute_iterative(
             system_prompt = prompt["system"]
             if skills_ctx:
                 system_prompt += skills_ctx
+
+            if _interactive_mode:
+                system_prompt += (
+                    "\n\n## Interactive Coding Session\n"
+                    "You are in a live interactive session with the user via chat.\n"
+                    "- Read user messages and respond conversationally.\n"
+                    "- Use tools to read, write, edit files and run commands as needed.\n"
+                    "- After completing each request, respond with what you did and ask what's next.\n"
+                    "- Do NOT call task_complete unless the user explicitly says to end the session.\n"
+                    "- Be concise and action-oriented — show code snippets, not essays."
+                )
 
             # 2. Execute single iteration (one LLM call + tool loop)
             messages = [
@@ -1092,8 +1122,37 @@ async def _execute_iterative(
             except Exception:
                 pass
 
-            # 5. Quality checks passed -> validate output then DONE
+            # 5. Quality checks passed
             if qc_result["passed"]:
+                # Interactive coding mode: don't complete — wait for next user message
+                if _interactive_mode and not agent_signaled_done:
+                    await ctx.report_activity(st_id, "Waiting for your next message...")
+                    # Post the coder's response as a chat message so user sees it
+                    if response.content and response.content.strip():
+                        await ctx.post_assistant_message(response.content.strip())
+
+                    # Block until user sends a message (poll Redis)
+                    user_input = None
+                    _inject_check, _ = _make_inject_checker(ctx, st_id)
+                    while not user_input:
+                        if await ctx.is_cancelled():
+                            agent_signaled_done = True
+                            agent_done_summary = "Session cancelled by user"
+                            break
+                        user_input = await _inject_check()
+                        if not user_input:
+                            await asyncio.sleep(1)
+
+                    if agent_signaled_done:
+                        break
+
+                    # Inject user message and continue to next iteration
+                    iteration_log[-1]["interactive_input"] = user_input[:200]
+                    # The user message will be in the prompt context on next iteration
+                    # (via chat history loaded by build_prompt)
+                    await ctx.report_activity(st_id, f"[iter {iteration}] Processing: {user_input[:80]}...")
+                    continue
+
                 validated_output = None
                 for val_attempt in range(MAX_VALIDATION_RETRIES + 1):
                     validated_output, val_errors = validate_agent_output(

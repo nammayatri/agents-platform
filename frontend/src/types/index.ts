@@ -421,7 +421,7 @@ export interface PlanData {
   estimated_tokens?: number
 }
 
-export type ChatMode = 'auto' | 'chat' | 'plan' | 'debug' | 'create_task'
+export type ChatMode = 'auto' | 'chat' | 'plan' | 'debug' | 'create_task' | 'coding'
 
 export interface ChatSession {
   id: string

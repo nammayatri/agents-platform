@@ -140,7 +140,7 @@ async def run_task_loop(todo_id: str, db: asyncpg.Pool, redis_client) -> None:
     logger.info("Task worker running: todo=%s pod_ip=%s", todo_id[:8], pod_ip)
 
     terminal_states = ("completed", "cancelled", "failed", "review")
-    poll_interval = 5  # seconds between checks
+    poll_interval = 2  # seconds between scheduling passes (low for interactive coding)
 
     while True:
         todo = await db.fetchrow(

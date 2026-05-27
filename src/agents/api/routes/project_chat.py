@@ -131,13 +131,130 @@ async def set_chat_mode(
     """Set the chat mode for a session (chat, plan, debug, create_task)."""
     await _load_session(session_id, project_id, user, db)
     mode = (body or {}).get("mode", "chat")
-    if mode not in ("auto", "chat", "plan", "debug", "create_task"):
+    if mode not in ("auto", "chat", "plan", "debug", "create_task", "coding"):
         raise HTTPException(status_code=400, detail="Invalid mode")
     await db.execute(
         "UPDATE project_chat_sessions SET chat_mode = $2, updated_at = NOW() WHERE id = $1",
         session_id, mode,
     )
     return {"mode": mode}
+
+
+@router.post("/projects/{project_id}/chat/sessions/{session_id}/start-coding")
+async def start_coding_session(
+    project_id: str, session_id: str, user: CurrentUser, db: DB,
+    redis: Redis, event_bus: EventBusDep, body: dict = None,
+):
+    """Immediately spawn a coding session with a worker pod.
+
+    Called when user switches to coding mode. Creates a task linked to
+    the session and starts the worker pod. Returns the task_id for tracking.
+    If a coding session already exists for this session, returns it.
+    """
+    session = await _load_session(session_id, project_id, user, db)
+    user_id = str(user["id"])
+
+    # Check if session already has an active task
+    linked = session.get("linked_todo_id")
+    if linked:
+        existing = await db.fetchrow(
+            "SELECT id, state FROM todo_items WHERE id = $1 AND state IN ('in_progress', 'testing')",
+            str(linked),
+        )
+        if existing:
+            return {"status": "already_running", "task_id": str(existing["id"])}
+
+    # Create task directly in in_progress
+    pr_url = (body or {}).get("pr_url", "")
+    pr_branch = None
+    intake_data: dict = {"requirements": "Interactive coding session", "approach": "Interactive"}
+
+    # If PR URL provided, resolve the branch
+    if pr_url:
+        from agents.api.chat_actions import _parse_pr_url
+        pr_info = _parse_pr_url(pr_url)
+        if pr_info:
+            intake_data["pr_url"] = pr_url
+            intake_data["pr_number"] = pr_info["pr_number"]
+            try:
+                project = await db.fetchrow(
+                    "SELECT git_provider_id, repo_url FROM projects WHERE id = $1", project_id,
+                )
+                gp_id = str(project["git_provider_id"]) if project.get("git_provider_id") else None
+                if gp_id:
+                    from agents.infra.crypto import decrypt
+                    from agents.orchestrator.git_providers.factory import create_git_provider
+                    gp = await db.fetchrow(
+                        "SELECT provider_type, api_base_url, token_enc FROM git_provider_configs WHERE id = $1", gp_id,
+                    )
+                    if gp:
+                        git = create_git_provider(
+                            provider_type=gp["provider_type"],
+                            api_base_url=gp.get("api_base_url"),
+                            token=decrypt(gp["token_enc"]) if gp.get("token_enc") else None,
+                            repo_url=project.get("repo_url"),
+                        )
+                        pr_data = await git.get_pull_request(pr_info["owner"], pr_info["repo"], pr_info["pr_number"])
+                        pr_branch = pr_data.get("head_ref") or pr_data.get("head_branch")
+                        intake_data["pr_branch"] = pr_branch
+            except Exception:
+                pass  # proceed without PR branch
+
+    title = f"Coding: PR #{intake_data['pr_number']}" if intake_data.get("pr_number") else "Interactive coding session"
+
+    todo = await db.fetchrow(
+        """
+        INSERT INTO todo_items (
+            project_id, creator_id, title, description, priority, task_type,
+            state, sub_state, intake_data, chat_session_id
+        )
+        VALUES ($1, $2, $3, 'Interactive coding session', 'medium', 'code',
+                'in_progress', 'executing', $4, $5)
+        RETURNING id
+        """,
+        project_id, user_id, title, intake_data, session_id,
+    )
+    todo_id = str(todo["id"])
+
+    # Single coder subtask
+    await db.execute(
+        "INSERT INTO sub_tasks (todo_id, title, description, agent_role, execution_order) "
+        "VALUES ($1, 'Interactive coder', 'Interactive coding session — follow user instructions from chat.', 'coder', 0)",
+        todo_id,
+    )
+
+    # Link session
+    await db.execute(
+        "UPDATE project_chat_sessions SET linked_todo_id = $1, chat_mode = 'coding', updated_at = NOW() WHERE id = $2",
+        todo_id, session_id,
+    )
+
+    # Post system message
+    await db.execute(
+        "INSERT INTO project_chat_messages (project_id, user_id, role, content, session_id, metadata_json) "
+        "VALUES ($1, $2, 'system', $3, $4, $5)",
+        project_id, user_id,
+        "Setting up coding environment...",
+        session_id,
+        {"action": "coding_session_starting", "task_id": todo_id},
+    )
+
+    # Publish to WebSocket so frontend sees the status
+    if redis:
+        await redis.publish(
+            f"chat:session:{session_id}:activity",
+            json.dumps({"type": "chat_message", "message": {
+                "role": "system",
+                "content": "Setting up coding environment...",
+                "metadata_json": {"action": "coding_session_starting", "task_id": todo_id},
+            }}),
+        )
+
+    # Fire event to start the orchestrator
+    from agents.orchestrator.events import TaskEvent
+    await event_bus.publish(TaskEvent(event_type="task_activated", todo_id=todo_id, state="in_progress"))
+
+    return {"status": "started", "task_id": todo_id, "pr_branch": pr_branch}
 
 
 @router.delete("/projects/{project_id}/chat/sessions/{session_id}")
@@ -326,6 +443,14 @@ async def send_session_message(
             assistant_msg = await generate_debug_response(**kw)
         elif routing_mode == "create_task":
             assistant_msg = await generate_create_task_response(**kw)
+        elif routing_mode == "coding":
+            assistant_msg = await _handle_coding_mode(
+                db=db, redis=redis, event_bus=event_bus,
+                session=dict(session), session_id=session_id,
+                project_id=project_id, project=dict(project),
+                user=user, user_message=body.content,
+                placeholder_id=placeholder_id,
+            )
         else:
             kw["intent"] = body.intent
             assistant_msg = await generate_project_response(**kw)
@@ -836,6 +961,103 @@ async def _check_project_access_local(project_id: str, user: dict, db) -> dict:
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
     return dict(project)
+
+
+async def _handle_coding_mode(
+    *, db, redis, event_bus, session: dict, session_id: str,
+    project_id: str, project: dict, user: dict, user_message: str,
+    placeholder_id: str | None = None,
+) -> dict:
+    """Handle coding mode: forward messages directly to the live coder agent.
+
+    The coding session (task + pod) should already be started via the
+    start-coding endpoint when the user switched to coding mode. This
+    handler just forwards each message to the running coder via Redis.
+    """
+    linked_todo_id = session.get("linked_todo_id")
+    user_id = str(user["id"])
+
+    # Find the active coding task
+    active_task = None
+    if linked_todo_id:
+        active_task = await db.fetchrow(
+            "SELECT id, state FROM todo_items WHERE id = $1 AND state IN ('in_progress', 'testing')",
+            str(linked_todo_id),
+        )
+
+    if not active_task:
+        # Session not set up yet — tell user to wait or auto-start
+        return await _auto_start_coding_and_queue(
+            db=db, redis=redis, event_bus=event_bus,
+            project_id=project_id, user_id=user_id, session_id=session_id,
+            user_message=user_message,
+        )
+
+    # Forward message to the running coder agent
+    todo_id = str(active_task["id"])
+    await redis.rpush(f"task:{todo_id}:chat_input", user_message)
+
+    # Persist user message
+    await db.execute(
+        "INSERT INTO project_chat_messages (project_id, user_id, role, content, session_id) "
+        "VALUES ($1, $2, 'user', $3, $4)",
+        project_id, user_id, user_message, session_id,
+    )
+
+    # Lightweight ack — the coder's actual response will stream via WebSocket
+    ack_row = await db.fetchrow(
+        "INSERT INTO project_chat_messages (project_id, user_id, role, content, session_id, metadata_json) "
+        "VALUES ($1, $2, 'system', $3, $4, $5) RETURNING *",
+        project_id, user_id,
+        "Message sent to coder.",
+        session_id,
+        {"action": "coding_message_forwarded", "task_id": todo_id},
+    )
+
+    return dict(ack_row)
+
+
+async def _auto_start_coding_and_queue(
+    *, db, redis, event_bus, project_id, user_id, session_id, user_message,
+) -> dict:
+    """Fallback: auto-start a coding session if user types before pod is ready."""
+    from agents.orchestrator.events import TaskEvent
+
+    todo = await db.fetchrow(
+        """
+        INSERT INTO todo_items (
+            project_id, creator_id, title, description, priority, task_type,
+            state, sub_state, intake_data, chat_session_id
+        )
+        VALUES ($1, $2, 'Interactive coding session', $3, 'medium', 'code',
+                'in_progress', 'executing', $4, $5)
+        RETURNING id
+        """,
+        project_id, user_id, user_message,
+        {"requirements": user_message, "approach": "Interactive"},
+        session_id,
+    )
+    todo_id = str(todo["id"])
+
+    await db.execute(
+        "INSERT INTO sub_tasks (todo_id, title, description, agent_role, execution_order) "
+        "VALUES ($1, 'Interactive coder', $2, 'coder', 0)",
+        todo_id, user_message,
+    )
+    await db.execute(
+        "UPDATE project_chat_sessions SET linked_todo_id = $1, updated_at = NOW() WHERE id = $2",
+        todo_id, session_id,
+    )
+    await redis.rpush(f"task:{todo_id}:chat_input", user_message)
+    await event_bus.publish(TaskEvent(event_type="task_activated", todo_id=todo_id, state="in_progress"))
+
+    msg_row = await db.fetchrow(
+        "INSERT INTO project_chat_messages (project_id, user_id, role, content, session_id, metadata_json) "
+        "VALUES ($1, $2, 'system', 'Starting coding environment...', $3, $4) RETURNING *",
+        project_id, user_id, session_id,
+        {"action": "coding_session_starting", "task_id": todo_id},
+    )
+    return dict(msg_row)
 
 
 async def _load_session(session_id: str, project_id: str, user: dict, db) -> dict:

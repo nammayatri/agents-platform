@@ -631,10 +631,15 @@ You have the following task management actions for the linked task:
 
         tools_doc = f"""
 You have the following actions available:
-- **action__create_task** — Create a new tracked task. Use when the user describes work they want done. \
-You can include sub_tasks to send work directly to execution, or omit them for the intake/planning pipeline. \
-IMPORTANT: Always create ONE task with ALL sub_tasks inside it. Never create multiple separate tasks for related work. \
-Every sub_task MUST have target_repo set — this is required.
+- **action__create_task** — Create a new tracked task with a plan and sub_tasks for execution. \
+Use when the user describes work requiring multiple steps (backend + frontend, tests, review). \
+IMPORTANT: Always create ONE task with ALL sub_tasks inside it. Every sub_task MUST have target_repo set.
+- **action__start_coding_session** — Start an interactive coding session. Spawns a worker pod with a \
+live coder agent that can read, write, and test code. Use when the user wants to:
+  - Work on a specific PR (provide the PR URL)
+  - Do hands-on coding with real-time guidance ("help me implement X", "fix this bug")
+  - Quick single-file changes that don't need a full task plan
+  The user can chat with the running coder to guide it interactively.
 - **action__delete_task** — Delete a task. ALWAYS ask for user confirmation before calling this.
 {repo_context}"""
 

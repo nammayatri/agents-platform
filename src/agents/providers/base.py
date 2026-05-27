@@ -142,22 +142,21 @@ InjectCheckCallback = Callable[[], Awaitable[str | None]]
 
 def _compact_messages_for_overflow(
     messages: list[LLMMessage],
-    keep_recent: int = 6,
+    keep_recent: int = 8,
 ) -> list[LLMMessage]:
     """Replace old tool-round messages with a summary when approaching context limits.
 
     Keeps the initial context (system + first user messages) and the last
-    ``keep_recent`` messages intact.  Everything in between is summarized
-    into a single user message listing tool names and brief result previews.
+    ``keep_recent`` messages intact. Everything in between is summarized
+    with enough detail to avoid re-reading files.
     """
-    # Identify initial context: everything up to the first non-tool user message
     head: list[LLMMessage] = []
     for m in messages:
         head.append(m)
         if m.role == "user" and not m.tool_results:
             break
     if len(messages) <= len(head) + keep_recent:
-        return messages  # nothing to compact
+        return messages
 
     tail = messages[-keep_recent:]
     middle = messages[len(head):-keep_recent]
@@ -169,24 +168,32 @@ def _compact_messages_for_overflow(
             summary_parts.append(f"Called: {', '.join(tools)}")
         elif m.tool_results:
             for tr in m.tool_results:
-                preview = (tr.get("content", "") or "")[:150]
+                content = tr.get("content", "") or ""
+                # Keep up to 500 chars per result — enough for function signatures,
+                # struct definitions, key patterns
+                preview = content[:500]
+                if len(content) > 500:
+                    preview += f"\n... ({len(content)} chars total)"
                 summary_parts.append(f"Result: {preview}")
         elif m.content and m.role == "assistant":
-            summary_parts.append(f"Response: {m.content[:150]}")
+            summary_parts.append(f"Response: {m.content[:300]}")
 
-    # Keep the last 20 summary entries to stay reasonably compact
-    summary = "Previous exploration summary (compacted — re-read files or re-run tools if you need details):\n" + "\n".join(summary_parts[-20:])
+    summary = (
+        "Previous exploration (compacted — re-read files ONLY if you need "
+        "content not shown here):\n" + "\n".join(summary_parts)
+    )
     return [*head, LLMMessage(role="user", content=summary), *tail]
 
 
 async def _compact_messages_with_llm(
     provider: AIProvider,
     messages: list[LLMMessage],
-    keep_recent: int = 6,
+    keep_recent: int = 8,
 ) -> list[LLMMessage]:
     """Use a fast LLM to summarize old tool interactions for context compaction.
 
-    Preserves: what was attempted, files modified, decisions made, errors hit.
+    Preserves key findings, file contents, decisions, and errors in a structured
+    summary so the agent doesn't need to re-read files after compaction.
     Falls back to string-based compaction on any failure.
     """
     head: list[LLMMessage] = []
@@ -203,18 +210,26 @@ async def _compact_messages_with_llm(
     if not middle:
         return messages
 
-    # Build a text representation of what happened in the middle section
+    # Build a text representation — include more of each tool result so the
+    # summarizer has enough material to preserve key content
     middle_text_parts: list[str] = []
     for m in middle:
         if m.role == "assistant" and m.tool_calls:
             for tc in m.tool_calls:
-                middle_text_parts.append(f"Called {tc['name']}({', '.join(f'{k}={repr(v)[:80]}' for k, v in _normalize_tool_args(tc.get('arguments', {})).items())})")
+                args = _normalize_tool_args(tc.get("arguments", {}))
+                brief = ", ".join(f"{k}={repr(v)[:100]}" for k, v in args.items())
+                middle_text_parts.append(f"Called {tc['name']}({brief})")
         elif m.role == "user" and m.tool_results:
             for tr in m.tool_results:
-                preview = tr.get("content", "")[:200]
+                content = tr.get("content", "")
+                # Give the summarizer up to 1500 chars per result — enough to
+                # capture file structure, function signatures, key patterns
+                preview = content[:1500]
+                if len(content) > 1500:
+                    preview += f"\n... ({len(content)} chars total)"
                 middle_text_parts.append(f"Result: {preview}")
         elif m.content:
-            middle_text_parts.append(f"[{m.role}]: {m.content[:200]}")
+            middle_text_parts.append(f"[{m.role}]: {m.content[:300]}")
 
     middle_text = "\n".join(middle_text_parts)
     if not middle_text.strip():
@@ -222,14 +237,19 @@ async def _compact_messages_with_llm(
 
     try:
         summary_prompt = (
-            "Summarize the following agent tool interactions concisely. "
-            "Preserve:\n"
-            "- What was attempted and why\n"
-            "- Files read, created, or modified (with paths)\n"
-            "- Key decisions made\n"
-            "- Errors encountered and how they were resolved\n"
-            "- Current state of the task\n\n"
-            "Be concise but complete. Output only the summary.\n\n"
+            "Summarize the following agent tool interactions into a structured reference. "
+            "This summary REPLACES the original messages, so it must preserve everything "
+            "the agent needs to continue working without re-reading files.\n\n"
+            "You MUST preserve:\n"
+            "1. **File contents**: For each file read, include the key structures — "
+            "function signatures, struct/class definitions, import paths, config values. "
+            "Include exact names and line references.\n"
+            "2. **Changes made**: Exact files written/edited and what was changed.\n"
+            "3. **Errors and fixes**: What failed, what was tried, what resolved it.\n"
+            "4. **Key decisions**: Architectural choices, patterns followed, trade-offs.\n"
+            "5. **Current state**: What's done, what's left, what files are in progress.\n\n"
+            "Format as a structured reference document, NOT a narrative. Use sections.\n"
+            "Output only the summary — no preamble.\n\n"
             f"Tool interactions:\n{middle_text}"
         )
 
@@ -237,7 +257,7 @@ async def _compact_messages_with_llm(
         summary_response = await provider.send_message(
             [LLMMessage(role="user", content=summary_prompt)],
             model=fast_model,
-            max_tokens=1024,
+            max_tokens=2048,
             temperature=0.0,
         )
         summary = summary_response.content
@@ -247,7 +267,12 @@ async def _compact_messages_with_llm(
         compacted = list(head)
         compacted.append(LLMMessage(
             role="user",
-            content=f"[CONTEXT COMPACTED — earlier tool interactions summarized. Re-read files if you need exact content.]\n{summary}",
+            content=(
+                "[CONTEXT COMPACTED — earlier tool interactions summarized into a reference. "
+                "Key file contents, decisions, and state preserved below. "
+                "Re-read files ONLY if you need content not in this summary.]\n\n"
+                + summary
+            ),
         ))
         compacted.extend(tail)
 
@@ -557,13 +582,13 @@ def _truncate_tool_result(text: str) -> str:
     return result
 
 
-def _trim_old_tool_results(messages: list[LLMMessage], keep_full: int = 10) -> None:
-    """Trim tool results in older messages to short previews.
+def _trim_old_tool_results(messages: list[LLMMessage], keep_full: int = 8) -> None:
+    """Soft trim: shorten old tool results while keeping enough to be useful.
 
+    Only called at tier 1 (50% context usage) — NOT every round.
     Keeps the most recent ``keep_full`` tool-result messages at full size.
-    Older ones are trimmed to 800 chars per result with a hint to re-request.
-    This preserves enough context for the LLM to remember what it read
-    without needing to re-read the same files.
+    Older ones are trimmed to first 1500 chars (enough for function signatures,
+    struct definitions, key patterns — avoids needing to re-read).
     """
     tr_indices = [i for i, m in enumerate(messages) if m.tool_results]
     if len(tr_indices) <= keep_full:
@@ -571,12 +596,10 @@ def _trim_old_tool_results(messages: list[LLMMessage], keep_full: int = 10) -> N
     for idx in tr_indices[:-keep_full]:
         for tr in messages[idx].tool_results:
             content = tr.get("content", "")
-            if len(content) > 1000:
-                preview = content[:800]
-                total = len(content)
+            if len(content) > 2000:
                 tr["content"] = (
-                    f"{preview}\n\n"
-                    f"... (trimmed from {total} chars — re-read if you need full content.)"
+                    content[:1500]
+                    + f"\n\n... (trimmed from {len(content)} chars — re-read if you need the rest.)"
                 )
 
 
@@ -1004,8 +1027,9 @@ async def run_tool_loop(
 
         messages.append(LLMMessage(role="user", content="", tool_results=tool_results))
 
-        # Trim older tool results to save memory (keep recent ones full)
-        _trim_old_tool_results(messages, keep_full=6)
+        # NOTE: No per-round trimming. Tool results stay full until compaction
+        # is triggered by the context window threshold. This prevents the LLM
+        # from losing file contents and re-reading the same files in a loop.
 
         # --- Doom loop detection with escalation ---
         doom.record_round(response.tool_calls)
@@ -1120,28 +1144,30 @@ async def run_tool_loop(
                 thinking_event["content"] = response.content.strip()[:500]
             await on_tool_event(thinking_event)
 
-        # Context overflow guard — compact old tool rounds if approaching limit
+        # Context overflow guard — two-tier compaction based on actual usage.
+        # No per-round trimming: tool results stay full until the context
+        # window actually fills. This prevents the read → trim → re-read loop.
         if response.tokens_input > 0:
             ctx_window = provider.get_context_window(response.model or provider.default_model)
-            if ctx_window and response.tokens_input > ctx_window * 0.60:
-                logger.warning(
-                    "tool_loop: context at %.0f%% (%d/%d tokens), compacting",
-                    100 * response.tokens_input / ctx_window,
-                    response.tokens_input, ctx_window,
-                )
-                if compaction_strategy == "llm":
-                    messages[:] = await _compact_messages_with_llm(provider, messages)
-                else:
-                    messages[:] = _compact_messages_for_overflow(messages)
-                if on_activity:
-                    await on_activity("Compacting context (approaching limit)...")
-            # NOTE: No fixed-interval periodic compaction. The old `loop_count % 15`
-            # compaction was destroying tool results too aggressively — the LLM would
-            # lose file contents after 15 rounds and re-read the same files in a loop.
-            # Instead, we rely on:
-            #   1. _trim_old_tool_results() every round (keeps last 6 full, trims older)
-            #   2. The 60% context window check above (compacts when actually needed)
-            # This lets the LLM accumulate context naturally until the window fills.
+            if ctx_window:
+                usage_pct = response.tokens_input / ctx_window
+                if usage_pct > 0.75:
+                    # Tier 2: hard compact — LLM summarizes old interactions
+                    logger.warning(
+                        "tool_loop: context at %.0f%% (%d/%d), LLM compaction",
+                        100 * usage_pct, response.tokens_input, ctx_window,
+                    )
+                    if compaction_strategy == "llm":
+                        messages[:] = await _compact_messages_with_llm(provider, messages)
+                    else:
+                        messages[:] = _compact_messages_for_overflow(messages)
+                    if on_activity:
+                        await on_activity("Compacting context (75% full)...")
+                elif usage_pct > 0.50:
+                    # Tier 1: soft trim — shorten old tool results but keep structure
+                    _trim_old_tool_results(messages, keep_full=8)
+                    if on_activity:
+                        await on_activity("Trimming old results (50% full)...")
 
     truncated = loop_count >= max_rounds and bool(response.tool_calls)
     if truncated:

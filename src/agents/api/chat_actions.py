@@ -99,6 +99,24 @@ async def execute_action(tool_name: str, arguments: dict, context: dict) -> str:
 # ── Built-in actions ──────────────────────────────────────────
 
 
+def _build_subtask_description(st: dict) -> str:
+    """Build a rich description from the structured subtask fields."""
+    parts = []
+    if st.get("scope"):
+        parts.append(f"**Scope:** {st['scope']}")
+    if st.get("requirements"):
+        parts.append(f"**Requirements:** {st['requirements']}")
+    if st.get("approach"):
+        parts.append(f"**Approach:** {st['approach']}")
+    if st.get("goal"):
+        parts.append(f"**Goal:** {st['goal']}")
+    if st.get("context"):
+        parts.append(f"**Context:** {st['context']}")
+    if not parts and st.get("description"):
+        return st["description"]
+    return "\n".join(parts) if parts else st.get("description", st.get("title", ""))
+
+
 @chat_action(
     name="create_task",
     description=(
@@ -177,30 +195,6 @@ async def execute_action(tool_name: str, arguments: dict, context: dict) -> str:
         "required": ["title", "sub_tasks"],
     },
 )
-def _build_subtask_description(st: dict) -> str:
-    """Build a rich description from the structured subtask fields.
-
-    Combines scope, requirements, approach, goal, and context into a
-    single description string that agents can consume. This preserves
-    all the planner's research findings in the execution context.
-    """
-    parts = []
-    if st.get("scope"):
-        parts.append(f"**Scope:** {st['scope']}")
-    if st.get("requirements"):
-        parts.append(f"**Requirements:** {st['requirements']}")
-    if st.get("approach"):
-        parts.append(f"**Approach:** {st['approach']}")
-    if st.get("goal"):
-        parts.append(f"**Goal:** {st['goal']}")
-    if st.get("context"):
-        parts.append(f"**Context:** {st['context']}")
-    # Fallback to plain description if structured fields are absent
-    if not parts and st.get("description"):
-        return st["description"]
-    return "\n".join(parts) if parts else st.get("description", st.get("title", ""))
-
-
 async def _handle_create_task(arguments: dict, context: dict) -> dict:
     """Create a todo item. Context must include db, project_id, user_id, event_bus."""
     db = context["db"]
@@ -815,3 +809,160 @@ async def _handle_save_memory(arguments: dict, context: dict) -> dict:
         "category": category,
         "content": content,
     }
+
+
+# ── Coding session action ────────────────────────────────────────
+
+
+import re as _re
+
+_PR_URL_PATTERN = _re.compile(
+    r"(?:https?://)?(?:www\.)?(?:github\.com|gitlab\.com|bitbucket\.org)"
+    r"/([^/]+)/([^/]+)/(?:pull|merge_requests?|pull-requests?)/(\d+)",
+)
+
+
+def _parse_pr_url(url: str) -> dict | None:
+    """Extract owner, repo, PR number from a PR URL."""
+    m = _PR_URL_PATTERN.search(url)
+    if not m:
+        return None
+    return {"owner": m.group(1), "repo": m.group(2), "pr_number": int(m.group(3))}
+
+
+@chat_action(
+    name="start_coding_session",
+    description=(
+        "Start an interactive coding session. Spawns a worker pod with a coder agent that can "
+        "read, write, and test code. The agent works on the project repo directly.\n"
+        "If a PR URL is provided, the agent checks out that PR's branch and works on it.\n"
+        "Otherwise it creates a fresh feature branch.\n"
+        "Messages in this chat are forwarded to the running coder — use it to guide the agent interactively."
+    ),
+    scope="project",
+    input_schema={
+        "type": "object",
+        "properties": {
+            "title": {"type": "string", "description": "Short description of the coding task"},
+            "instructions": {"type": "string", "description": "What the coder should do"},
+            "pr_url": {
+                "type": "string",
+                "description": "Optional PR URL (GitHub/GitLab/Bitbucket). If provided, works on that PR's branch.",
+            },
+        },
+        "required": ["title", "instructions"],
+    },
+)
+async def _handle_start_coding_session(arguments: dict, context: dict) -> dict:
+    """Create a task with a single interactive coder subtask, optionally on a PR branch."""
+    db = context["db"]
+    project_id = context["project_id"]
+    user_id = context["user_id"]
+    event_bus = context.get("event_bus")
+    session_id = context.get("session_id")
+
+    title = arguments["title"]
+    instructions = arguments["instructions"]
+    pr_url = (arguments.get("pr_url") or "").strip()
+
+    # Parse PR URL if provided
+    pr_info = _parse_pr_url(pr_url) if pr_url else None
+    pr_branch = None
+
+    if pr_info:
+        # Fetch the PR's head branch name from the git provider
+        try:
+            project = await db.fetchrow(
+                "SELECT repo_url, git_provider_id FROM projects WHERE id = $1", project_id,
+            )
+            git_provider_id = str(project["git_provider_id"]) if project.get("git_provider_id") else None
+            if git_provider_id:
+                from agents.infra.crypto import decrypt
+                from agents.orchestrator.git_providers.factory import create_git_provider
+                gp_row = await db.fetchrow(
+                    "SELECT provider_type, api_base_url, token_enc FROM git_provider_configs WHERE id = $1",
+                    git_provider_id,
+                )
+                if gp_row:
+                    token = decrypt(gp_row["token_enc"]) if gp_row.get("token_enc") else None
+                    git = create_git_provider(
+                        provider_type=gp_row["provider_type"],
+                        api_base_url=gp_row.get("api_base_url"),
+                        token=token,
+                        repo_url=project.get("repo_url"),
+                    )
+                    pr_data = await git.get_pull_request(
+                        pr_info["owner"], pr_info["repo"], pr_info["pr_number"],
+                    )
+                    pr_branch = pr_data.get("head_ref") or pr_data.get("head_branch")
+                    logger.info(
+                        "[coding_session] PR #%d branch: %s",
+                        pr_info["pr_number"], pr_branch,
+                    )
+        except Exception as e:
+            logger.warning("[coding_session] Could not fetch PR branch: %s", e)
+
+    # Build intake_data with PR context
+    intake_data: dict = {
+        "requirements": instructions,
+        "approach": "Interactive coding session",
+    }
+    if pr_branch:
+        intake_data["pr_branch"] = pr_branch
+        intake_data["pr_url"] = pr_url
+        intake_data["pr_number"] = pr_info["pr_number"]
+
+    description = instructions
+    if pr_url:
+        description = f"Working on PR: {pr_url}\n\n{instructions}"
+
+    # Create the task directly in in_progress state
+    todo = await db.fetchrow(
+        """
+        INSERT INTO todo_items (
+            project_id, creator_id, title, description, priority, task_type,
+            state, sub_state, intake_data, chat_session_id
+        )
+        VALUES ($1, $2, $3, $4, 'medium', 'code', 'in_progress', 'executing', $5, $6)
+        RETURNING *
+        """,
+        project_id, user_id, title, description, intake_data, session_id,
+    )
+    todo_id = str(todo["id"])
+
+    # Create a single coder subtask
+    await db.fetchrow(
+        """
+        INSERT INTO sub_tasks (
+            todo_id, title, description, agent_role, execution_order
+        )
+        VALUES ($1, $2, $3, 'coder', 0)
+        RETURNING id
+        """,
+        todo_id, title, instructions,
+    )
+
+    # Link session to the task
+    if session_id:
+        await db.execute(
+            "UPDATE project_chat_sessions SET linked_todo_id = $1, updated_at = NOW() WHERE id = $2",
+            todo_id, session_id,
+        )
+
+    # Emit event to start execution
+    if event_bus:
+        from agents.orchestrator.events import TaskEvent
+        await event_bus.publish(TaskEvent(
+            event_type="task_activated", todo_id=todo_id, state="in_progress",
+        ))
+
+    result = {
+        "action": "coding_session_started",
+        "task_id": todo_id,
+        "title": title,
+        "message": "Coding session started. A worker is being spawned to work on this.",
+    }
+    if pr_branch:
+        result["pr_branch"] = pr_branch
+        result["pr_url"] = pr_url
+    return result

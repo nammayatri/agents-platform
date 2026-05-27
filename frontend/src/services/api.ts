@@ -369,6 +369,11 @@ export const projectChat = {
         `/projects/${projectId}/chat/sessions/${sessionId}/mode`,
         { method: 'POST', body: JSON.stringify({ mode }) },
       ),
+    startCoding: (projectId: string, sessionId: string, prUrl?: string) =>
+      request<{ status: string; task_id: string; pr_branch?: string }>(
+        `/projects/${projectId}/chat/sessions/${sessionId}/start-coding`,
+        { method: 'POST', body: JSON.stringify(prUrl ? { pr_url: prUrl } : {}) },
+      ),
     get: (projectId: string, sessionId: string) =>
       request<ChatSession & { messages: ProjectChatMessage[] }>(`/projects/${projectId}/chat/sessions/${sessionId}`),
     update: (projectId: string, sessionId: string, data: { title: string }) =>
